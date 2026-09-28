@@ -1,10 +1,12 @@
 """YAML configuration loading with environment overrides."""
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
 from lecture_slm.schemas.course import CourseProfile
@@ -76,7 +78,12 @@ def load_model_config(path: Path, *, environ: dict[str, str] | None = None) -> M
     """Load model YAML and allow ``OLLAMA_HOST`` to override its host."""
 
     config = _load(path, ModelConfig)
-    environment = os.environ if environ is None else environ
+    environment: Mapping[str, str]
+    if environ is None:
+        load_dotenv()
+        environment = os.environ
+    else:
+        environment = environ
     if host := environment.get("OLLAMA_HOST"):
         config.inference.host = host.rstrip("/")
     return config
