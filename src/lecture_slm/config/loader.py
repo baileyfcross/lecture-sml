@@ -24,6 +24,10 @@ class InferenceConfig(BaseModel):
     temperature: float = Field(default=0.5, ge=0.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
     seed: int = 3407
+    think: bool = True
+    max_output_tokens: int = Field(default=2048, gt=0)
+    keep_alive: str | int = "10m"
+    request_timeout_seconds: float = Field(default=600.0, gt=0.0)
 
 
 class FutureTrainingConfig(BaseModel):

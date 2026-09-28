@@ -9,6 +9,10 @@ inference:
   temperature: 0.5
   top_p: 0.9
   seed: 3407
+  think: true
+  max_output_tokens: 2048
+  keep_alive: 10m
+  request_timeout_seconds: 600
 future_training:
   method: qlora
   enabled: false

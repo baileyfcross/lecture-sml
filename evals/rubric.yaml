@@ -1,0 +1,41 @@
+id: lecture-slm-baseline
+version: "1.0"
+score_anchors:
+  1: Poor
+  2: Weak
+  3: Acceptable
+  4: Good
+  5: Excellent
+criteria:
+  - dimension: factual_accuracy
+    description: Core statements are correct and do not teach misconceptions.
+  - dimension: source_grounding
+    description: Claims stay within supplied material when requested and distinguish unsupported details.
+  - dimension: instruction_following
+    description: The response satisfies the requested task, constraints, audience, and format.
+  - dimension: course_level_appropriateness
+    description: Vocabulary, complexity, and cognitive demand fit the stated learners.
+  - dimension: prerequisite_awareness
+    description: The response notices missing prerequisite knowledge and does not silently assume it.
+  - dimension: pedagogical_sequence
+    description: Ideas progress in a coherent order with manageable conceptual transitions.
+  - dimension: scaffolding
+    description: Support is provided for difficult steps and can decrease as learners gain confidence.
+  - dimension: connection_to_prior_knowledge
+    description: New material explicitly and accurately connects to the supplied prior learning.
+  - dimension: worked_examples
+    description: Examples are correct, relevant, and expose useful reasoning steps.
+  - dimension: practice_opportunities
+    description: Learners have meaningful chances to retrieve, apply, or explain ideas.
+  - dimension: misconception_handling
+    description: Likely misunderstandings are anticipated and addressed constructively.
+  - dimension: learning_objective_alignment
+    description: Objectives, instruction, examples, and checks support the same intended learning.
+  - dimension: slide_density
+    description: Slide text respects requested limits and keeps each slide focused and scannable.
+  - dimension: clarity
+    description: Explanations and directions are understandable, precise, and appropriately concise.
+  - dimension: structural_coherence
+    description: The output is complete, organized, and has a meaningful beginning-to-end shape.
+  - dimension: instructor_style
+    description: Tone and formatting are consistent with the supplied instructor preferences without inventing them.

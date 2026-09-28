@@ -22,7 +22,7 @@ v0 is a repository, schema, evaluation, and Ollama baseline foundation. It does 
 - Ollama
 - A locally available `qwen3.5:9b` Ollama model
 
-Install `uv` using the official instructions for your operating system. On Windows PowerShell, the project memory for this environment recommends using `npm.cmd` when npm is needed because the PowerShell shim may be blocked.
+Install `uv` using the official instructions for your operating system.
 
 ## Setup and checks
 
@@ -56,13 +56,15 @@ $env:OLLAMA_HOST = "http://localhost:11434"
 uv run python scripts/test_ollama.py
 ```
 
-Run the unscored baseline evaluation. Responses are written to the ignored `evaluation-results/` directory:
+Validate the evaluation prompt set and referenced profiles, then run the baseline when ready. Each run is stored in an ignored `evals/results/<run-id>/` directory. Use `--limit 2` for a small smoke evaluation, `--run-dir` to resume, and `--rerun` to explicitly append new attempts for successful prompts.
 
 ```powershell
-uv run python scripts/run_baseline_eval.py
+uv run python scripts/validate_eval.py
+uv run python scripts/run_baseline_eval.py --limit 2
+uv run python scripts/review_eval.py evals/results/<run-id> --reviewer instructor
 ```
 
-Evaluation prompts are intentionally separate from training data. Never automatically include evaluation examples in training data.
+See [docs/EVALUATION.md](docs/EVALUATION.md) for the human-review process and full-run/resume commands. Evaluation prompts remain separate from training data and must never be included automatically.
 
 ## Data privacy
 

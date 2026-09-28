@@ -153,3 +153,33 @@ def test_invalid_json_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with pytest.raises(OllamaResponseError, match="invalid JSON"):
         OllamaClient("http://ollama.example").available_models()
+
+
+def test_chat_parses_ollama_timing_and_token_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    response_payload = {
+        "model": "model-x",
+        "message": {"content": "OK"},
+        "done": True,
+        "total_duration": 1_020_000_000,
+        "load_duration": 6_000_000,
+        "prompt_eval_duration": 690_000_000,
+        "eval_duration": 310_000_000,
+        "prompt_eval_count": 19,
+        "eval_count": 2,
+    }
+    monkeypatch.setattr(
+        "lecture_slm.inference.ollama_client.httpx.request",
+        lambda *args, **kwargs: StubResponse(response_payload),
+    )
+
+    result = OllamaClient("http://ollama.example").chat(
+        model="model-x",
+        user_message="Reply OK.",
+    )
+
+    assert result.total_duration_ns == 1_020_000_000
+    assert result.load_duration_ns == 6_000_000
+    assert result.prompt_eval_duration_ns == 690_000_000
+    assert result.eval_duration_ns == 310_000_000
+    assert result.prompt_tokens == 19
+    assert result.completion_tokens == 2
