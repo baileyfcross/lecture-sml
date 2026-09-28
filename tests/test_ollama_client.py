@@ -183,3 +183,79 @@ def test_chat_parses_ollama_timing_and_token_metadata(monkeypatch: pytest.Monkey
     assert result.eval_duration_ns == 310_000_000
     assert result.prompt_tokens == 19
     assert result.completion_tokens == 2
+
+
+def test_chat_parses_completion_reason_and_thinking_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "lecture_slm.inference.ollama_client.httpx.request",
+        lambda *args, **kwargs: StubResponse(
+            {
+                "model": "model-x",
+                "message": {"content": "Answer", "thinking": "Reasoning trace"},
+                "done": True,
+                "done_reason": "length",
+                "eval_count": 256,
+            }
+        ),
+    )
+
+    result = OllamaClient("http://ollama.example").chat(
+        model="model-x",
+        user_message="Explain DNS.",
+    )
+
+    assert result.completion_reason == "length"
+    assert result.thinking_content == "Reasoning trace"
+
+
+def test_benchmark_can_preserve_empty_final_content_with_thinking_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "lecture_slm.inference.ollama_client.httpx.request",
+        lambda *args, **kwargs: StubResponse(
+            {
+                "model": "model-x",
+                "message": {"content": "", "thinking": "private reasoning"},
+                "done": True,
+                "done_reason": "length",
+                "eval_count": 256,
+                "eval_duration": 10_000_000_000,
+            }
+        ),
+    )
+
+    response = OllamaClient("http://ollama.example").chat(
+        model="model-x",
+        user_message="Benchmark prompt.",
+        think=True,
+        allow_empty_content=True,
+    )
+
+    assert response.content == ""
+    assert response.thinking_content == "private reasoning"
+    assert response.completion_reason == "length"
+    assert response.completion_tokens == 256
+
+
+def test_empty_final_content_is_still_rejected_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "lecture_slm.inference.ollama_client.httpx.request",
+        lambda *args, **kwargs: StubResponse(
+            {
+                "model": "model-x",
+                "message": {"content": ""},
+                "done": True,
+                "done_reason": "stop",
+            }
+        ),
+    )
+    with pytest.raises(OllamaIncompleteResponseError):
+        OllamaClient("http://ollama.example").chat(
+            model="model-x",
+            user_message="Normal request.",
+        )

@@ -11,6 +11,7 @@ inference:
   seed: 3407
   think: true
   max_output_tokens: 2048
+  task_output_tokens: {}
   keep_alive: 10m
   request_timeout_seconds: 600
 future_training:

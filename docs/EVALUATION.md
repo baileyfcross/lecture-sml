@@ -36,7 +36,7 @@ uv run python scripts/run_baseline_eval.py
 
 For a bounded smoke run, use `--limit 2`. Specify `--run-dir` to resume that run; successful prompt IDs are skipped and failed prompts are retried as a new attempt. `--rerun` explicitly appends another attempt for successful prompts instead of replacing them.
 
-The default `--think configured` honors the explicit model setting. Explicit `--think disabled` and `--max-output-tokens` overrides are available for infrastructure-only smoke testing when configured long-form generation is too slow; overrides are recorded separately from the model configuration and must not be treated as a comparable quality baseline. They do not alter model YAML defaults.
+The default `--think configured` honors the explicit model setting. Explicit `--think disabled` and `--max-output-tokens` overrides are available for infrastructure-only smoke testing when configured long-form generation is too slow; overrides are recorded separately from the model configuration and must not be treated as a comparable quality baseline. They do not alter model YAML defaults. The 600-second evaluation timeout is independently configured from context and output-token limits; see [docs/PERFORMANCE.md](PERFORMANCE.md) for measured behavior and task-budget planning.
 
 ```powershell
 uv run python scripts/run_baseline_eval.py --limit 2 --think disabled --max-output-tokens 512 --run-dir evals/results/baseline-smoke

@@ -66,6 +66,8 @@ uv run python scripts/review_eval.py evals/results/<run-id> --reviewer instructo
 
 See [docs/EVALUATION.md](docs/EVALUATION.md) for the human-review process and full-run/resume commands. Evaluation prompts remain separate from training data and must never be included automatically.
 
+To characterize context-size and thinking performance before choosing quality-baseline settings, run `uv run python scripts/benchmark_ollama.py`. This does not launch the 26-prompt baseline; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for metrics and server diagnostics.
+
 ## Data privacy
 
 Do not commit private vault exports, raw course materials, credentials, model weights, generated embeddings, processed training data, logs, or evaluation outputs. Prefer small, reviewed, provenance-preserving examples over bulk vault dumps.

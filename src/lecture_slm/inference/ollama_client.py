@@ -45,6 +45,8 @@ class ChatResponse:
     load_duration_ns: int | None = None
     prompt_eval_duration_ns: int | None = None
     eval_duration_ns: int | None = None
+    completion_reason: str | None = None
+    thinking_content: str | None = None
 
 
 class OllamaClient:
@@ -88,6 +90,7 @@ class OllamaClient:
         options: dict[str, str | int | float | bool] | None = None,
         think: bool | None = None,
         keep_alive: str | int | None = None,
+        allow_empty_content: bool = False,
     ) -> ChatResponse:
         messages: list[dict[str, str]] = []
         if system_message:
@@ -118,7 +121,10 @@ class OllamaClient:
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
             raise OllamaResponseError("Ollama returned an unexpected message response")
         content = message["content"]
-        if not content.strip():
+        thinking_content = message.get("thinking")
+        if thinking_content is not None and not isinstance(thinking_content, str):
+            raise OllamaResponseError("Ollama response field 'message.thinking' must be a string")
+        if not content.strip() and not allow_empty_content and not (thinking_content or "").strip():
             raise OllamaIncompleteResponseError("Ollama completed without generating content")
         return ChatResponse(
             model=self._string_value(data, "model", model),
@@ -129,6 +135,8 @@ class OllamaClient:
             load_duration_ns=self._optional_integer(data, "load_duration"),
             prompt_eval_duration_ns=self._optional_integer(data, "prompt_eval_duration"),
             eval_duration_ns=self._optional_integer(data, "eval_duration"),
+            completion_reason=self._optional_string(data, "done_reason"),
+            thinking_content=thinking_content,
         )
 
     def _request_json(
@@ -184,4 +192,13 @@ class OllamaClient:
             raise OllamaResponseError(
                 f"Ollama response field '{key}' must be a non-negative integer"
             )
+        return value
+
+    @staticmethod
+    def _optional_string(data: dict[str, object], key: str) -> str | None:
+        value = data.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise OllamaResponseError(f"Ollama response field '{key}' must be a string")
         return value

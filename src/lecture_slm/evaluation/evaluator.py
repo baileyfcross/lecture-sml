@@ -96,6 +96,7 @@ class RunManifest(BaseModel):
     server_fingerprint: str = Field(min_length=1)
     model_configuration: dict[str, Any]
     generation_configuration: GenerationConfiguration
+    task_generation_configurations: dict[str, GenerationConfiguration] = Field(default_factory=dict)
     git_commit: str | None = None
     evaluation_dataset_version: str = Field(min_length=1)
     evaluation_dataset_sha256: str = Field(min_length=64, max_length=64)

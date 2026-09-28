@@ -8,6 +8,7 @@ from lecture_slm.evaluation.evaluator import CompletionStatus, EvaluationResult
 from lecture_slm.evaluation.prompts import load_evaluation_prompts
 from lecture_slm.evaluation.runner import create_run_directory, execute_evaluation
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
+from lecture_slm.schemas.dataset import TaskType
 
 ROOT = Path(__file__).parents[1]
 PROMPTS = ROOT / "evals/prompts/baseline.jsonl"
@@ -18,6 +19,7 @@ class FakeOllamaClient:
         self.fail = fail
         self.ensure_calls = 0
         self.chat_calls = 0
+        self.request_options: list[dict[str, str | int | float | bool] | None] = []
 
     def ensure_model_available(self, model: str) -> None:
         self.ensure_calls += 1
@@ -34,6 +36,7 @@ class FakeOllamaClient:
         keep_alive: str | int | None = None,
     ) -> ChatResponse:
         self.chat_calls += 1
+        self.request_options.append(options)
         if self.fail:
             raise OllamaTimeoutError("mock generation timeout")
         return ChatResponse(
@@ -84,6 +87,29 @@ def test_explicit_think_override_is_separate_from_model_config(tmp_path: Path) -
     assert manifest["generation_configuration"]["num_predict"] == 512
     assert result.generation_configuration.think is False
     assert result.generation_configuration.num_predict == 512
+
+
+def test_task_output_budget_is_applied_and_recorded(tmp_path: Path) -> None:
+    config = model_config()
+    config.inference.task_output_tokens = {TaskType.LECTURE: 640}
+    run_dir = create_run_directory(tmp_path, "task-budget")
+    client = FakeOllamaClient()
+    execute_evaluation(
+        prompts_path=PROMPTS,
+        run_dir=run_dir,
+        model_config=config,
+        project_root=ROOT,
+        limit=1,
+        client=client,  # type: ignore[arg-type]
+    )
+    manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    result = EvaluationResult.model_validate_json(
+        (run_dir / "responses.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert client.request_options[0] is not None
+    assert client.request_options[0]["num_predict"] == 640
+    assert manifest["task_generation_configurations"]["lecture"]["num_predict"] == 640
+    assert result.generation_configuration.num_predict == 640
 
 
 def test_resume_skips_successes_and_rerun_appends_attempts(tmp_path: Path) -> None:

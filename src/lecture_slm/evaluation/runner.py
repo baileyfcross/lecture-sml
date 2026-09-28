@@ -26,6 +26,7 @@ from lecture_slm.evaluation.evaluator import (
 )
 from lecture_slm.evaluation.prompts import EvaluationPrompt, load_evaluation_prompts
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
+from lecture_slm.schemas.dataset import TaskType
 
 LOGGER = logging.getLogger(__name__)
 SYSTEM_PROMPT = (
@@ -38,6 +39,7 @@ SYSTEM_PROMPT = (
 def generation_configuration(
     config: ModelConfig,
     *,
+    task: TaskType | None = None,
     think_override: bool | None = None,
     max_output_tokens_override: int | None = None,
 ) -> GenerationConfiguration:
@@ -52,9 +54,11 @@ def generation_configuration(
         seed=inference.seed,
         num_ctx=inference.context_length,
         num_predict=(
-            inference.max_output_tokens
-            if max_output_tokens_override is None
-            else max_output_tokens_override
+            max_output_tokens_override
+            if max_output_tokens_override is not None
+            else inference.max_output_tokens
+            if task is None
+            else inference.output_tokens_for(task)
         ),
         request_timeout_seconds=inference.request_timeout_seconds,
     )
@@ -118,7 +122,7 @@ def _resolve_profile(reference: str, project_root: Path) -> Path:
     return path if path.is_absolute() else project_root / path
 
 
-def _prompt_context(prompt: EvaluationPrompt, project_root: Path) -> str:
+def compose_evaluation_context(prompt: EvaluationPrompt, project_root: Path) -> str:
     sections: list[str] = []
     if prompt.context:
         sections.append(f"Context:\n{prompt.context}")
@@ -138,7 +142,7 @@ def validate_prompt_profiles(prompts: list[EvaluationPrompt], project_root: Path
     """Validate every referenced course and pedagogy profile before generation."""
 
     for prompt in prompts:
-        _prompt_context(prompt, project_root)
+        compose_evaluation_context(prompt, project_root)
 
 
 def _build_manifest(
@@ -146,6 +150,7 @@ def _build_manifest(
     run_id: str,
     model_config: ModelConfig,
     generation: GenerationConfiguration,
+    task_generations: dict[str, GenerationConfiguration],
     prompts: list[EvaluationPrompt],
     prompts_path: Path,
     project_root: Path,
@@ -158,6 +163,7 @@ def _build_manifest(
         server_fingerprint=_server_fingerprint(model_config.inference.host),
         model_configuration=sanitized_config,
         generation_configuration=generation,
+        task_generation_configurations=task_generations,
         git_commit=_git_commit(project_root),
         evaluation_dataset_version=prompts[0].version,
         evaluation_dataset_sha256=hashlib.sha256(prompts_path.read_bytes()).hexdigest(),
@@ -367,7 +373,9 @@ def execute_evaluation(
     if max_output_tokens_override is not None and max_output_tokens_override < 1:
         raise ValueError("max_output_tokens_override must be a positive integer")
     all_prompts = load_evaluation_prompts(prompts_path)
-    all_contexts = {prompt.id: _prompt_context(prompt, project_root) for prompt in all_prompts}
+    all_contexts = {
+        prompt.id: compose_evaluation_context(prompt, project_root) for prompt in all_prompts
+    }
     prompts = all_prompts
     if limit is not None:
         if limit < 1:
@@ -379,6 +387,15 @@ def execute_evaluation(
         think_override=think_override,
         max_output_tokens_override=max_output_tokens_override,
     )
+    task_generations = {
+        task.value: generation_configuration(
+            model_config,
+            task=task,
+            think_override=think_override,
+            max_output_tokens_override=max_output_tokens_override,
+        )
+        for task in {prompt.task for prompt in prompts}
+    }
     run_dir.mkdir(parents=True, exist_ok=True)
     responses_path = run_dir / "responses.jsonl"
     reviews_path = run_dir / "review.jsonl"
@@ -389,6 +406,7 @@ def execute_evaluation(
         run_id=run_id,
         model_config=model_config,
         generation=generation,
+        task_generations=task_generations,
         prompts=prompts,
         prompts_path=prompts_path,
         project_root=project_root,
@@ -419,6 +437,7 @@ def execute_evaluation(
             )
 
     for prompt in pending_prompts:
+        prompt_generation = task_generations[prompt.task.value]
         started = time.perf_counter()
         try:
             if preflight_error is not None:
@@ -428,19 +447,19 @@ def execute_evaluation(
                 system_message=SYSTEM_PROMPT,
                 user_message=contexts[prompt.id],
                 options={
-                    "temperature": generation.temperature,
-                    "top_p": generation.top_p,
-                    "seed": generation.seed,
-                    "num_ctx": generation.num_ctx,
-                    "num_predict": generation.num_predict,
+                    "temperature": prompt_generation.temperature,
+                    "top_p": prompt_generation.top_p,
+                    "seed": prompt_generation.seed,
+                    "num_ctx": prompt_generation.num_ctx,
+                    "num_predict": prompt_generation.num_predict,
                 },
-                think=generation.think,
-                keep_alive=generation.keep_alive,
+                think=prompt_generation.think,
+                keep_alive=prompt_generation.keep_alive,
             )
             record = _make_result(
                 prompt,
                 model=model_config.ollama_name,
-                generation=generation,
+                generation=prompt_generation,
                 attempt=attempts[prompt.id],
                 response=response,
                 host=model_config.inference.host,
@@ -455,7 +474,7 @@ def execute_evaluation(
             record = _make_result(
                 prompt,
                 model=model_config.ollama_name,
-                generation=generation,
+                generation=prompt_generation,
                 attempt=attempts[prompt.id],
                 error=error,
                 host=model_config.inference.host,

@@ -7,9 +7,10 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lecture_slm.schemas.course import CourseProfile
+from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyProfile
 
 
@@ -26,8 +27,21 @@ class InferenceConfig(BaseModel):
     seed: int = 3407
     think: bool = True
     max_output_tokens: int = Field(default=2048, gt=0)
+    task_output_tokens: dict[TaskType, int] = Field(default_factory=dict)
     keep_alive: str | int = "10m"
     request_timeout_seconds: float = Field(default=600.0, gt=0.0)
+
+    @field_validator("task_output_tokens")
+    @classmethod
+    def task_budgets_must_be_positive(cls, budgets: dict[TaskType, int]) -> dict[TaskType, int]:
+        if any(limit <= 0 for limit in budgets.values()):
+            raise ValueError("task-specific output token limits must be positive")
+        return budgets
+
+    def output_tokens_for(self, task: TaskType) -> int:
+        """Return a task-specific budget or the global fallback."""
+
+        return self.task_output_tokens.get(task, self.max_output_tokens)
 
 
 class FutureTrainingConfig(BaseModel):

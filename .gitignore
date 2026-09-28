@@ -45,6 +45,8 @@ data/processed/*
 evaluation-results/
 evals/results/*
 !evals/results/.gitkeep
+evals/performance/*
+!evals/performance/.gitkeep
 logs/*
 !logs/.gitkeep
 artifacts/*

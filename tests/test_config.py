@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from lecture_slm.config.loader import load_model_config
+from lecture_slm.config.loader import InferenceConfig, load_model_config
+from lecture_slm.schemas.dataset import TaskType
 
 ROOT = Path(__file__).parents[1]
 
@@ -12,6 +13,21 @@ def test_model_config_parses() -> None:
     config = load_model_config(ROOT / "configs/models/qwen35-9b.yaml", environ={})
     assert config.ollama_name == "qwen3.5:9b"
     assert config.inference.seed == 3407
+    assert config.inference.output_tokens_for(TaskType.LECTURE) == 2048
+
+
+def test_task_output_budget_overrides_global_fallback() -> None:
+    inference = InferenceConfig(
+        max_output_tokens=2048,
+        task_output_tokens={TaskType.EXPLANATION: 512},
+    )
+    assert inference.output_tokens_for(TaskType.EXPLANATION) == 512
+    assert inference.output_tokens_for(TaskType.LECTURE) == 2048
+
+
+def test_task_output_budget_must_be_positive() -> None:
+    with pytest.raises(ValidationError, match="must be positive"):
+        InferenceConfig(task_output_tokens={TaskType.LECTURE: 0})
 
 
 def test_ollama_host_environment_override() -> None:
