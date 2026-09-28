@@ -1,0 +1,10 @@
+{"id":"intro-lecture","task":"lecture","prompt":"Create an introductory lecture outline on variables for freshman programming students. Include objectives, one worked example, guided practice, and a closing synthesis."}
+{"id":"slides-from-material","task":"slides","prompt":"Convert an explanation of binary search into a concise slide outline for an introductory course. Keep one major idea per slide and include speaker notes separately."}
+{"id":"freshman-explanation","task":"explanation","prompt":"Explain recursion to freshmen who know functions but have not seen recursive calls. Use a concrete analogy and a small worked example."}
+{"id":"lecture-lab","task":"lab","prompt":"Create a 60-minute beginner lab that follows a lecture on Python lists. Include scaffolding, checkpoints, and an independent extension."}
+{"id":"instructor-guide","task":"instructor_guide","prompt":"Create an instructor guide for teaching Boolean logic, including likely misconceptions, questions to ask, and timing suggestions."}
+{"id":"prerequisites","task":"explanation","prompt":"Identify the prerequisite knowledge students need before an introductory lesson on algorithmic complexity, and suggest quick checks for each prerequisite."}
+{"id":"rewrite-intro","task":"explanation","prompt":"Rewrite a technically dense explanation of object-oriented inheritance for an introductory audience without removing the core idea."}
+{"id":"formative-assessment","task":"assessment","prompt":"Add five formative checks for understanding to a lesson on SQL SELECT queries. Include expected answers and the misconception each check reveals."}
+{"id":"misconception","task":"activity","prompt":"Design a short classroom activity that addresses the misconception that a faster-looking algorithm is always faster for every input size."}
+{"id":"sequence-from-prior","task":"lecture","prompt":"Create a lecture sequence on functions that explicitly builds from a prior lesson on variables and includes retrieval, guided practice, and synthesis."}

@@ -1,0 +1,94 @@
+"""YAML configuration loading with environment overrides."""
+
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
+
+from lecture_slm.schemas.course import CourseProfile
+from lecture_slm.schemas.pedagogy import PedagogyProfile
+
+
+class InferenceConfig(BaseModel):
+    """Provider settings for a model request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = "ollama"
+    host: str = "http://localhost:11434"
+    context_length: int = Field(default=32768, gt=0)
+    temperature: float = Field(default=0.5, ge=0.0)
+    top_p: float = Field(default=0.9, gt=0.0, le=1.0)
+    seed: int = 3407
+
+
+class FutureTrainingConfig(BaseModel):
+    """Placeholder for future training metadata; no training is run by v0."""
+
+    method: str = "qlora"
+    enabled: bool = False
+
+
+class ModelIdentity(BaseModel):
+    """Identity and purpose of the configured model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ollama_name: str = Field(min_length=1)
+    family: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+
+
+class ModelConfig(BaseModel):
+    """Model and inference configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: ModelIdentity
+    inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    future_training: FutureTrainingConfig = Field(default_factory=FutureTrainingConfig)
+
+    @property
+    def ollama_name(self) -> str:
+        return self.model.ollama_name
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = yaml.safe_load(file)
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid YAML in {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a YAML mapping in {path}")
+    return data
+
+
+def _load[ModelT: BaseModel](path: Path, schema: type[ModelT]) -> ModelT:
+    return schema.model_validate(_load_yaml(path))
+
+
+def load_model_config(path: Path, *, environ: dict[str, str] | None = None) -> ModelConfig:
+    """Load model YAML and allow ``OLLAMA_HOST`` to override its host."""
+
+    config = _load(path, ModelConfig)
+    environment = os.environ if environ is None else environ
+    if host := environment.get("OLLAMA_HOST"):
+        config.inference.host = host.rstrip("/")
+    return config
+
+
+def load_course_config(path: Path) -> CourseProfile:
+    """Load a course profile from YAML."""
+
+    return _load(path, CourseProfile)
+
+
+def load_pedagogy_config(path: Path) -> PedagogyProfile:
+    """Load a pedagogy profile from YAML."""
+
+    return _load(path, PedagogyProfile)

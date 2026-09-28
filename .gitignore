@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Models and training outputs
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+checkpoints/
+adapters/
+merged/
+/models/
+models--*/
+
+# Caches and generated data
+.huggingface/
+hf_cache/
+huggingface/
+.cache/
+**/.cache/
+embeddings/
+*.faiss
+*.sqlite
+*.db
+
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+evaluation-results/
+logs/*
+!logs/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/*.code-workspace

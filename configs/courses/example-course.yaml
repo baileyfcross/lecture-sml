@@ -1,0 +1,17 @@
+id: example-course
+name: Example Course
+level: freshman
+session:
+  duration_minutes: 70
+audience:
+  technical_depth: introductory
+  assumed_background: minimal
+slides:
+  text_density: low
+  examples: frequent
+  exercises: frequent
+preferences:
+  avoid:
+    - unnecessary abstraction
+    - unexplained jargon
+    - excessive text per slide

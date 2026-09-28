@@ -1,0 +1,14 @@
+model:
+  ollama_name: qwen3.5:9b
+  family: qwen3.5
+  role: lecture_generation
+inference:
+  provider: ollama
+  host: http://localhost:11434
+  context_length: 32768
+  temperature: 0.5
+  top_p: 0.9
+  seed: 3407
+future_training:
+  method: qlora
+  enabled: false

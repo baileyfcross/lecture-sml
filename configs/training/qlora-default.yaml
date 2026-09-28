@@ -1,0 +1,5 @@
+method: qlora
+enabled: false
+base_model: qwen3.5:9b
+seed: 3407
+notes: Training is intentionally deferred; this file records planned experiment defaults.

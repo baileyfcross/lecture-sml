@@ -1,0 +1,54 @@
+id: default-pedagogy
+version: "0.1"
+principles:
+  - id: activate_prior_knowledge
+    name: Activate prior knowledge
+    description: Begin by eliciting or recalling relevant concepts learners already know.
+  - id: measurable_objectives
+    name: State measurable learning objectives
+    description: State objectives that describe observable learner performance.
+  - id: connect_prior_material
+    name: Connect new material to previous material
+    description: Make the relationship to prior lessons explicit.
+  - id: concrete_to_abstract
+    name: Move from concrete examples toward abstraction
+    description: Use examples before introducing a general abstraction where appropriate.
+  - id: one_conceptual_jump
+    name: Introduce one major conceptual jump at a time
+    description: Limit simultaneous novelty so learners can build a usable mental model.
+  - id: scaffold_difficulty
+    name: Scaffold difficult concepts
+    description: Break demanding reasoning into supported, observable steps.
+  - id: worked_examples
+    name: Use worked examples
+    description: Show a complete example and make the reasoning visible.
+  - id: guided_before_independent
+    name: Put guided practice before independent practice
+    description: Give supported practice before asking learners to work alone.
+  - id: formative_checks
+    name: Include formative checks for understanding
+    description: Include low-stakes opportunities to reveal confusion during instruction.
+  - id: retrieval_practice
+    name: Include retrieval practice
+    description: Ask learners to retrieve important ideas rather than only reread them.
+  - id: misconceptions
+    name: Address common misconceptions
+    description: Anticipate likely incorrect mental models and respond to them explicitly.
+  - id: level_appropriate
+    name: Match difficulty to course level
+    description: Keep vocabulary, examples, and cognitive demand appropriate to the audience.
+  - id: concise_slides
+    name: Minimize unnecessary slide text
+    description: Keep slide content concise and reserve detail for narration or handouts.
+  - id: one_idea_per_slide
+    name: Prefer one major idea per slide
+    description: Keep each slide focused on one primary teaching point.
+  - id: synthesis
+    name: End lectures with synthesis
+    description: Close by connecting the lesson's ideas and returning to its objectives.
+  - id: active_learning
+    name: Use active learning where appropriate
+    description: Create meaningful opportunities for learners to think, discuss, or do.
+  - id: explicit_prerequisites
+    name: Do not assume unintroduced prerequisite knowledge
+    description: Identify and teach or provide support for prerequisites that are needed.

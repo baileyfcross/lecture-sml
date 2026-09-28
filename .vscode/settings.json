@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "uv": true,
+        "py": true,
+        "Get-Command": true
+    }
+}
