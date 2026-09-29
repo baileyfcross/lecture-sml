@@ -28,6 +28,8 @@ Validate every prompt, duplicate ID, dimension, expected-characteristic record, 
 uv run python scripts/validate_eval.py
 ```
 
+The model YAML describes model defaults; `configs/evaluation/qwen35-9b-baseline.yaml` is the versioned baseline evaluation profile. It selects 4096 context and `think: false`, preserves the configured sampling values and seed, and defines task-specific evaluation output limits. The profile does not modify production defaults. `prerequisite_reasoning` is represented by the existing `prerequisite-reasoning` prompt tag, not a new task enum.
+
 Run the full baseline only when ready. Calls are sequential; each prompt result is appended as it finishes:
 
 ```powershell
@@ -49,6 +51,31 @@ Review completed outputs interactively. Use `q` at a score prompt to stop; compl
 ```powershell
 uv run python scripts/review_eval.py evals/results/baseline-smoke --reviewer instructor
 ```
+
+Validate a representative profile before the full 26-prompt quality baseline:
+
+```powershell
+uv run python scripts/run_baseline_eval.py --profile configs/evaluation/qwen35-9b-baseline.yaml --run-kind profile_validation --prompt-ids lecture-70-min-intro slides-source-progression explain-recursion-freshman lab-guided-lists activity-60-min-integration guide-exercise-answers assessment-formative-sql prerequisites-complexity --run-dir evals/results/qwen35-9b-profile-validation-v2
+```
+
+This eight-prompt run validates completion budgets, not the final quality baseline. Results distinguish base model configuration from evaluation profile and record effective settings per prompt. Length stops and outputs reaching their token caps are marked potentially truncated. Simple structure checks flag obvious missing slide sections, lab elements, or unfinished endings; they do not assess instructional quality.
+
+### Initial profile-validation observations
+
+The first profile-validation directory (`qwen35-9b-profile-validation-v1`) contains duplicate attempts because two runner invocations overlapped during terminal recovery. Treat its completed outputs as indicative examples, not as one clean controlled run. One completed attempt per task showed:
+
+| Task | Budget | Generated | Generation sec | Total sec | Stop | Truncated | Structure |
+| --- | ---: | ---: | ---: | ---: | --- | :---: | :---: |
+| Lecture | 2048 | 1667 | 616.5 | 750.0 | stop | no | complete |
+| Slides | 1024 | 856 | 292.6 | 574.4 | stop | no | complete |
+| Explanation | 512 | 512 | 173.5 | 489.8 | length | yes | incomplete |
+| Lab | 1536 | 1536 | 567.1 | 869.6 | length | yes | incomplete |
+| Activity | 1024 | 1024 | 372.8 | 707.1 | length | yes | incomplete |
+| Instructor guide | 1024 | 931 | 318.8 | 719.4 | stop | no | complete |
+| Assessment | 1024 | 582 | 197.6 | 540.2 | stop | no | complete |
+| Prerequisite reasoning | 512 | 512 | 173.3 | 396.9 | length | yes | incomplete |
+
+The later clean run (`qwen35-9b-profile-validation-v2`) completed 1 of 8 prompts and failed 7 due to Ollama disconnects, connection failures, HTTP 500, or timeout. Its one completed prerequisite-reasoning output reached 512 tokens and was marked truncated. Consequently, the budget evidence is useful but provisional: explanation, lab, activity, and prerequisite reasoning budgets appear insufficient for their selected prompts; the successful lecture, slides, instructor-guide, and assessment outputs stopped normally. Do not treat either run as the 26-prompt quality baseline, and do not change budgets solely from this small, partly unstable sample.
 
 ## Run records and comparison
 

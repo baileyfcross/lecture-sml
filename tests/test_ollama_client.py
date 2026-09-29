@@ -259,3 +259,28 @@ def test_empty_final_content_is_still_rejected_by_default(
             model="model-x",
             user_message="Normal request.",
         )
+
+
+def test_native_chat_forwards_json_schema_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    response_payload = {
+        "model": "model-x",
+        "message": {"content": "{}"},
+        "done": True,
+    }
+
+    def fake_request(method: str, url: str, **kwargs: object) -> StubResponse:
+        captured.update(kwargs)
+        return StubResponse(response_payload)
+
+    monkeypatch.setattr("lecture_slm.inference.ollama_client.httpx.request", fake_request)
+    response_schema = {"type": "object", "required": ["task"]}
+    OllamaClient("http://ollama.example").chat(
+        model="model-x",
+        user_message="Return a plan.",
+        format=response_schema,
+    )
+
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["format"] == response_schema

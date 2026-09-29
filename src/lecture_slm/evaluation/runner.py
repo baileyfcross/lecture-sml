@@ -24,7 +24,9 @@ from lecture_slm.evaluation.evaluator import (
     GenerationConfiguration,
     RunManifest,
 )
+from lecture_slm.evaluation.profile import BaselineEvaluationProfile
 from lecture_slm.evaluation.prompts import EvaluationPrompt, load_evaluation_prompts
+from lecture_slm.evaluation.structure import inspect_response_structure
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 from lecture_slm.schemas.dataset import TaskType
 
@@ -40,27 +42,38 @@ def generation_configuration(
     config: ModelConfig,
     *,
     task: TaskType | None = None,
+    tags: list[str] | None = None,
+    profile: BaselineEvaluationProfile | None = None,
     think_override: bool | None = None,
     max_output_tokens_override: int | None = None,
 ) -> GenerationConfiguration:
     """Capture every baseline sampling control sent with evaluation requests."""
 
     inference = config.inference
+    task_budget = (
+        profile.output_tokens_for(task, tags or [])
+        if profile is not None and task is not None
+        else profile.max_output_tokens
+        if profile is not None
+        else inference.max_output_tokens
+        if task is None
+        else inference.output_tokens_for(task)
+    )
     return GenerationConfiguration(
-        think=inference.think if think_override is None else think_override,
+        think=(profile.think if profile is not None else inference.think)
+        if think_override is None
+        else think_override,
         keep_alive=inference.keep_alive,
-        temperature=inference.temperature,
-        top_p=inference.top_p,
-        seed=inference.seed,
-        num_ctx=inference.context_length,
-        num_predict=(
-            max_output_tokens_override
-            if max_output_tokens_override is not None
-            else inference.max_output_tokens
-            if task is None
-            else inference.output_tokens_for(task)
+        temperature=profile.temperature if profile is not None else inference.temperature,
+        top_p=profile.top_p if profile is not None else inference.top_p,
+        seed=profile.seed if profile is not None else inference.seed,
+        num_ctx=profile.context_length if profile is not None else inference.context_length,
+        num_predict=max_output_tokens_override or task_budget,
+        request_timeout_seconds=(
+            profile.request_timeout_seconds
+            if profile is not None
+            else inference.request_timeout_seconds
         ),
-        request_timeout_seconds=inference.request_timeout_seconds,
     )
 
 
@@ -151,6 +164,10 @@ def _build_manifest(
     model_config: ModelConfig,
     generation: GenerationConfiguration,
     task_generations: dict[str, GenerationConfiguration],
+    prompt_generations: dict[str, GenerationConfiguration],
+    profile: BaselineEvaluationProfile | None,
+    profile_path: Path | None,
+    run_kind: str,
     prompts: list[EvaluationPrompt],
     prompts_path: Path,
     project_root: Path,
@@ -163,7 +180,14 @@ def _build_manifest(
         server_fingerprint=_server_fingerprint(model_config.inference.host),
         model_configuration=sanitized_config,
         generation_configuration=generation,
+        evaluation_profile=None if profile is None else profile.model_dump(mode="json"),
+        evaluation_profile_path=(None if profile_path is None else profile_path.as_posix()),
+        evaluation_profile_sha256=(
+            None if profile_path is None else hashlib.sha256(profile_path.read_bytes()).hexdigest()
+        ),
+        run_kind=run_kind,
         task_generation_configurations=task_generations,
+        prompt_generation_configurations=prompt_generations,
         git_commit=_git_commit(project_root),
         evaluation_dataset_version=prompts[0].version,
         evaluation_dataset_sha256=hashlib.sha256(prompts_path.read_bytes()).hexdigest(),
@@ -260,6 +284,21 @@ def _make_result(
     elapsed_seconds: float | None = None,
 ) -> EvaluationResult:
     if response is not None:
+        if response.completion_reason == "length":
+            output_limit_reached: bool | None = True
+        elif response.completion_tokens is not None:
+            output_limit_reached = response.completion_tokens >= generation.num_predict
+        elif response.completion_reason in {"stop", "end_turn", "eos"}:
+            output_limit_reached = False
+        else:
+            output_limit_reached = None
+        potentially_truncated = output_limit_reached is True
+        structural_complete, structural_observations = inspect_response_structure(
+            task=prompt.task,
+            instruction=prompt.instruction,
+            response=response.content,
+            potentially_truncated=potentially_truncated,
+        )
         return EvaluationResult(
             prompt_id=prompt.id,
             model=model,
@@ -272,6 +311,11 @@ def _make_result(
             expected_characteristics=prompt.expected_characteristics,
             evaluation_dimensions=prompt.evaluation_dimensions,
             response=response.content,
+            completion_reason=response.completion_reason,
+            output_limit_reached=output_limit_reached,
+            potentially_truncated=potentially_truncated,
+            structural_complete=structural_complete,
+            structural_observations=structural_observations,
             generation_configuration=generation,
             timing=_timing(response, elapsed_seconds or 0.0),
             completion_status=CompletionStatus.COMPLETED,
@@ -312,11 +356,15 @@ def _validate_or_write_manifest(path: Path, manifest: RunManifest) -> None:
         immutable_fields = (
             "model",
             "server_fingerprint",
+            "evaluation_profile_sha256",
+            "run_kind",
             "evaluation_dataset_version",
             "evaluation_dataset_sha256",
             "profile_config_sha256",
             "prompt_count",
             "generation_configuration",
+            "task_generation_configurations",
+            "prompt_generation_configurations",
         )
         for field_name in immutable_fields:
             if getattr(existing, field_name) != getattr(manifest, field_name):
@@ -364,6 +412,10 @@ def execute_evaluation(
     rerun: bool = False,
     think_override: bool | None = None,
     max_output_tokens_override: int | None = None,
+    evaluation_profile: BaselineEvaluationProfile | None = None,
+    evaluation_profile_path: Path | None = None,
+    prompt_ids: list[str] | None = None,
+    run_kind: str = "quality_baseline",
     client: OllamaClient | None = None,
 ) -> EvaluationRunSummary:
     """Validate, execute sequentially, append results, and summarize a baseline run."""
@@ -372,11 +424,26 @@ def execute_evaluation(
         raise ValueError("Baseline evaluation currently supports only the Ollama provider")
     if max_output_tokens_override is not None and max_output_tokens_override < 1:
         raise ValueError("max_output_tokens_override must be a positive integer")
+    if evaluation_profile is not None and evaluation_profile.model != model_config.ollama_name:
+        raise ValueError(
+            f"Evaluation profile targets '{evaluation_profile.model}', "
+            f"but model config selects '{model_config.ollama_name}'"
+        )
     all_prompts = load_evaluation_prompts(prompts_path)
     all_contexts = {
         prompt.id: compose_evaluation_context(prompt, project_root) for prompt in all_prompts
     }
-    prompts = all_prompts
+    if prompt_ids is not None:
+        requested_ids = set(prompt_ids)
+        available_ids = {prompt.id for prompt in all_prompts}
+        missing_ids = requested_ids - available_ids
+        if missing_ids:
+            raise ValueError(f"Unknown evaluation prompt IDs: {', '.join(sorted(missing_ids))}")
+        prompts = [prompt for prompt in all_prompts if prompt.id in requested_ids]
+        if len(prompts) != len(requested_ids):
+            raise ValueError("prompt_ids must not contain duplicates")
+    else:
+        prompts = all_prompts
     if limit is not None:
         if limit < 1:
             raise ValueError("limit must be a positive integer")
@@ -384,6 +451,7 @@ def execute_evaluation(
     contexts = {prompt.id: all_contexts[prompt.id] for prompt in prompts}
     generation = generation_configuration(
         model_config,
+        profile=evaluation_profile,
         think_override=think_override,
         max_output_tokens_override=max_output_tokens_override,
     )
@@ -391,10 +459,22 @@ def execute_evaluation(
         task.value: generation_configuration(
             model_config,
             task=task,
+            profile=evaluation_profile,
             think_override=think_override,
             max_output_tokens_override=max_output_tokens_override,
         )
         for task in {prompt.task for prompt in prompts}
+    }
+    prompt_generations = {
+        prompt.id: generation_configuration(
+            model_config,
+            task=prompt.task,
+            tags=prompt.tags,
+            profile=evaluation_profile,
+            think_override=think_override,
+            max_output_tokens_override=max_output_tokens_override,
+        )
+        for prompt in prompts
     }
     run_dir.mkdir(parents=True, exist_ok=True)
     responses_path = run_dir / "responses.jsonl"
@@ -407,6 +487,10 @@ def execute_evaluation(
         model_config=model_config,
         generation=generation,
         task_generations=task_generations,
+        prompt_generations=prompt_generations,
+        profile=evaluation_profile,
+        profile_path=evaluation_profile_path,
+        run_kind=run_kind,
         prompts=prompts,
         prompts_path=prompts_path,
         project_root=project_root,
@@ -437,7 +521,7 @@ def execute_evaluation(
             )
 
     for prompt in pending_prompts:
-        prompt_generation = task_generations[prompt.task.value]
+        prompt_generation = prompt_generations[prompt.id]
         started = time.perf_counter()
         try:
             if preflight_error is not None:

@@ -1,0 +1,93 @@
+id: lecture-slm-generation
+version: "1.0"
+default_profile: standard
+estimated_fallback_tokens_per_second: 2.9
+context_safety_margin: 1.5
+profiles:
+  quick:
+    name: quick
+    purpose: Simple explanations, rewrites, single slides, and short modifications.
+    planner:
+      enabled: false
+      think: true
+      context_tiers: [4096]
+      max_output_tokens: 256
+      task_output_tokens: {}
+      timeout_seconds: 300
+      retry_count: 0
+    writer:
+      enabled: true
+      think: false
+      context_tiers: [4096]
+      max_output_tokens: 512
+      task_output_tokens:
+        explanation: 512
+        slides: 512
+        activity: 512
+        instructor_guide: 512
+        assessment: 512
+        homework: 512
+        lab: 512
+        lecture: 512
+      timeout_seconds: 300
+      retry_count: 0
+    review_enabled: false
+    fallback_to_writer: false
+  standard:
+    name: standard
+    purpose: Normal educational artifacts including lectures, slides, labs, activities, and guides.
+    planner:
+      enabled: true
+      think: true
+      context_tiers: [4096, 8192]
+      max_output_tokens: 3072
+      task_output_tokens: {}
+      timeout_seconds: 1500
+      retry_count: 0
+    writer:
+      enabled: true
+      think: false
+      context_tiers: [8192]
+      max_output_tokens: 2048
+      task_output_tokens:
+        explanation: 512
+        slides: 1024
+        activity: 1024
+        instructor_guide: 1024
+        assessment: 1024
+        homework: 1024
+        lab: 1536
+        lecture: 2048
+      timeout_seconds: 900
+      retry_count: 0
+    review_enabled: false
+    fallback_to_writer: false
+  deep:
+    name: deep
+    purpose: Full lectures, difficult pedagogical planning, and synthesis of multiple supplied sources.
+    planner:
+      enabled: true
+      think: true
+      context_tiers: [8192]
+      max_output_tokens: 3072
+      task_output_tokens: {}
+      timeout_seconds: 1500
+      retry_count: 0
+    writer:
+      enabled: true
+      think: false
+      context_tiers: [8192, 16384, 32768]
+      max_output_tokens: 4096
+      task_output_tokens:
+        explanation: 1024
+        slides: 2048
+        activity: 2048
+        instructor_guide: 3072
+        assessment: 2048
+        homework: 2048
+        lab: 3072
+        lecture: 4096
+      timeout_seconds: 1800
+      retry_count: 0
+    review_enabled: false
+    fallback_to_writer: false

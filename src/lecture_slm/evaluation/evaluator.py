@@ -66,6 +66,11 @@ class EvaluationResult(BaseModel):
     expected_characteristics: list[ExpectedCharacteristic]
     evaluation_dimensions: list[EvaluationDimension] = Field(min_length=1)
     response: str | None = None
+    completion_reason: str | None = None
+    output_limit_reached: bool | None = None
+    potentially_truncated: bool | None = None
+    structural_complete: bool | None = None
+    structural_observations: list[str] = Field(default_factory=list)
     generation_configuration: GenerationConfiguration
     timing: EvaluationTiming = Field(default_factory=EvaluationTiming)
     completion_status: CompletionStatus
@@ -96,7 +101,14 @@ class RunManifest(BaseModel):
     server_fingerprint: str = Field(min_length=1)
     model_configuration: dict[str, Any]
     generation_configuration: GenerationConfiguration
+    evaluation_profile: dict[str, Any] | None = None
+    evaluation_profile_path: str | None = None
+    evaluation_profile_sha256: str | None = None
+    run_kind: str = "quality_baseline"
     task_generation_configurations: dict[str, GenerationConfiguration] = Field(default_factory=dict)
+    prompt_generation_configurations: dict[str, GenerationConfiguration] = Field(
+        default_factory=dict
+    )
     git_commit: str | None = None
     evaluation_dataset_version: str = Field(min_length=1)
     evaluation_dataset_sha256: str = Field(min_length=64, max_length=64)

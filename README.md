@@ -68,6 +68,20 @@ See [docs/EVALUATION.md](docs/EVALUATION.md) for the human-review process and fu
 
 To characterize context-size and thinking performance before choosing quality-baseline settings, run `uv run python scripts/benchmark_ollama.py`. This does not launch the 26-prompt baseline; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for metrics and server diagnostics.
 
+The separate baseline evaluation profile is [configs/evaluation/qwen35-9b-baseline.yaml](configs/evaluation/qwen35-9b-baseline.yaml). Its evaluation-only overrides do not change the model defaults. The eight-prompt profile validation command and interpretation are documented in [docs/EVALUATION.md](docs/EVALUATION.md); the full 26-prompt quality baseline remains a later, explicit run.
+
+## Generation Runtime
+
+The development generation runner supports Quick (Writer only), Standard (Planner -> Writer), and Deep (larger Planner -> Writer, optional reviewer prepared but disabled):
+
+```powershell
+uv run python scripts/generate.py --profile quick --task explanation --instruction "Explain DNS using one concrete example."
+uv run python scripts/generate.py --profile standard --task lecture --instruction "Create a short introductory lesson on DNS." --course configs/courses/example-course.yaml --pedagogy configs/pedagogy/default.yaml --save-run
+uv run python scripts/generate.py --profile deep --task explanation --instruction "Connect DNS to domain names and IP addresses." --source-file path/to/source.md
+```
+
+Generation accepts explicit source files and previous-course context; it does not retrieve from or connect to the Obsidian vault. See [docs/GENERATION.md](docs/GENERATION.md) for profiles, planning, context selection, timeout, progress, and opt-in run artifacts.
+
 ## Data privacy
 
 Do not commit private vault exports, raw course materials, credentials, model weights, generated embeddings, processed training data, logs, or evaluation outputs. Prefer small, reviewed, provenance-preserving examples over bulk vault dumps.

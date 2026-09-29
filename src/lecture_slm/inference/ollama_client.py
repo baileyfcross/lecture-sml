@@ -91,6 +91,7 @@ class OllamaClient:
         think: bool | None = None,
         keep_alive: str | int | None = None,
         allow_empty_content: bool = False,
+        format: str | dict[str, object] | None = None,
     ) -> ChatResponse:
         messages: list[dict[str, str]] = []
         if system_message:
@@ -109,6 +110,8 @@ class OllamaClient:
             payload["think"] = think
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        if format is not None:
+            payload["format"] = format
 
         data = self._request_json("POST", "/api/chat", payload=payload)
         if not isinstance(data, dict):

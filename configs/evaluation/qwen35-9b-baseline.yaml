@@ -1,0 +1,21 @@
+id: qwen35-9b-baseline
+version: "1.0"
+model: qwen3.5:9b
+context_length: 4096
+think: false
+temperature: 0.5
+top_p: 0.9
+seed: 3407
+request_timeout_seconds: 900
+max_output_tokens: 2048
+task_output_tokens:
+  explanation: 512
+  slides: 1024
+  activity: 1024
+  instructor_guide: 1024
+  assessment: 1024
+  homework: 1024
+  lab: 1536
+  lecture: 2048
+tag_output_tokens:
+  prerequisite-reasoning: 512

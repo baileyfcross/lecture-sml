@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from lecture_slm.config.loader import load_model_config
+from lecture_slm.evaluation.profile import load_baseline_evaluation_profile
 from lecture_slm.evaluation.runner import create_run_directory, execute_evaluation
 
 
@@ -13,6 +14,9 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path("configs/models/qwen35-9b.yaml"))
     parser.add_argument("--prompts", type=Path, default=Path("evals/prompts/baseline.jsonl"))
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--profile", type=Path)
+    parser.add_argument("--run-kind", default="quality_baseline")
+    parser.add_argument("--prompt-ids", nargs="+")
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--max-output-tokens",
@@ -31,6 +35,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = load_model_config(args.config)
+        profile = (
+            load_baseline_evaluation_profile(args.profile) if args.profile is not None else None
+        )
         if args.limit is not None and args.limit < 1:
             raise ValueError("--limit must be a positive integer")
         if args.max_output_tokens is not None and args.max_output_tokens < 1:
@@ -50,6 +57,10 @@ def main() -> int:
             rerun=args.rerun,
             think_override=think_override,
             max_output_tokens_override=args.max_output_tokens,
+            evaluation_profile=profile,
+            evaluation_profile_path=args.profile,
+            prompt_ids=args.prompt_ids,
+            run_kind=args.run_kind,
         )
     except (OSError, ValueError) as error:
         print(f"Baseline evaluation failed: {error}", file=sys.stderr)

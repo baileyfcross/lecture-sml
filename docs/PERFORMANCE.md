@@ -44,13 +44,13 @@ The think-enabled case reached the 256-token cap (`done_reason=length`), emitted
 
 ## Output budgets
 
-The configured global fallback remains 2048 output tokens. `inference.task_output_tokens` is an intentionally empty mapping that can later hold per-task limits; no task-specific values are chosen yet. The quality runner records and applies a task-specific limit when one is configured, otherwise it falls back to the global limit.
+The production model configuration retains the 2048 global fallback and an empty `inference.task_output_tokens` mapping. The separate `configs/evaluation/qwen35-9b-baseline.yaml` profile selects 4096 context, disables thinking, preserves temperature/top-p/seed, and sets task-specific evaluation-only budgets. The global fallback remains 2048 for tasks absent from the profile. These settings do not replace production defaults.
 
 The two infrastructure smoke lectures each generated exactly 512 tokens and ended mid-structure, so both were truncated and are not quality-baseline results. Preliminary planning ranges to test later are approximately 256–512 tokens for short explanations, 512–1024 for concise slides, 1024–2048 for labs, and 2048–4096 for full lectures. These are provisional estimates only; benchmark and human-review evidence should inform actual task budgets.
 
 ## Timeout and generation speed
 
-The evaluation request timeout is configured independently from context and output length. Current quality evaluation uses a 600-second request timeout; the performance benchmark defaults to a separate 300-second timeout. A timeout is a failure guard, not an output budget. Context size affects prompt processing and memory needs; `num_predict` caps generated tokens; generation throughput determines how long that cap takes. At a measured 512 generated tokens in about 172 seconds, approximate decode speed was 3 tokens/second, so a 2048-token response can plausibly approach or exceed the existing 600-second guard once prompt processing and reasoning are included. Larger timeout values do not improve throughput and should not be increased without measured need.
+The evaluation request timeout is configured independently from context and output length. Model defaults remain 600 seconds; the performance benchmark uses a separate 300-second timeout; the baseline evaluation profile uses 900 seconds. At about 2.9 tokens/second, the largest configured 2048-token output takes roughly 706 seconds for generation alone; 900 seconds leaves a limited margin for prompt evaluation and runtime variation. A timeout is a failure guard, not an output budget. Context size affects prompt processing and memory needs; `num_predict` caps generated tokens; generation throughput determines how long that cap takes. Larger timeout values do not improve throughput and should not be increased without measured need.
 
 ## Ubuntu server diagnostics
 
