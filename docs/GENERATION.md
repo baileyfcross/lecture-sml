@@ -13,16 +13,18 @@ Prompt builders keep instruction, course constraints, pedagogy, teaching plan, s
 `configs/generation/profiles.yaml` contains versioned Quick, Standard, and Deep settings. Model defaults remain in `configs/models/qwen35-9b.yaml`; the generation profile selects a workflow and stage-specific settings without mutating those defaults.
 
 - **Quick:** one Writer request, no Planner; useful for short explanations, rewriting, single slides, and small edits.
-- **Standard:** Planner request with thinking enabled and structured JSON output, then a separate Writer request with thinking disabled. This is the default workflow for normal educational artifacts.
+- **Standard:** concise task-specific Planner request with thinking disabled and temperature 0, then a separate Writer request with thinking disabled. This is the recommended workflow for normal educational artifacts.
 - **Deep:** larger Planner budget/context followed by Writer with configurable context tiers. Reviewer support is represented by a protocol, but review is disabled by default and no automatic judge is implemented.
 
 Planner failure is explicit and prevents Writer execution. Writer failure retains the completed plan in `GenerationResult`. No silent Planner-to-Quick fallback occurs. Planner retries are profile-configurable, limited to one retry, and currently configured as zero.
 
 ## Teaching plan
 
-`TeachingPlan` is a Pydantic schema designed to flex across lectures, slides, labs, activities, guides, assessments, and explanations. It includes objectives, prerequisites, prior-knowledge connections, sequence steps, concepts, examples, misconceptions, practice, assessment checks, synthesis, source usage, artifact structure, and writer notes. Ollama's native structured-output `format` is used with the plan JSON schema. Malformed JSON/schema output is returned as a distinct failed Planner stage with its raw text retained; it is not silently repaired.
+Planning uses a shared `TeachingPlanBase` plus task-specific `ExplanationPlan`, `LecturePlan`, `SlidesPlan`, `LabPlan`, `ActivityPlan`, `InstructorGuidePlan`, and `AssessmentPlan` schemas. A typed registry maps canonical task enums to schemas; homework shares `AssessmentPlan` rather than adding a task type. Short explanations therefore require only a concept, assumptions, explanation sequence, example, misconceptions, and check, while lecture plans include objectives, sequence, practice, synthesis, timing, and source coverage. Ollama's native structured-output `format` uses the selected task schema. Malformed JSON/schema output is a distinct failed Planner stage with raw response preserved; missing fields are not silently supplied.
 
-Prompt templates are versioned as `planner-v1` and `writer-v1`, and both versions are saved in result metadata.
+Standard and Deep planning are separate: Standard uses concise plan-only wording, `think: false`, and deterministic Planner temperature 0. Deep uses the model's thinking capability but persists only the validated TeachingPlan. Planner versions are `planner-standard-v2` for concise Standard planning and `planner-v1` for Deep. Ollama thinking character count is captured when available; raw thinking text is never passed to Writer or persisted.
+
+Planner templates are versioned as `planner-standard-v2` for concise Standard planning and `planner-v1` for Deep planning. The Writer template is `writer-v1`. The selected versions are saved in result metadata.
 
 ## Task budgets and context selection
 
@@ -30,7 +32,7 @@ Each generation profile has a global stage output fallback and optional canonica
 
 For each stage, context selection estimates assembled prompt tokens using approximately one token per four characters, multiplies the estimate by the configured safety margin, reserves the stage output budget, then chooses the smallest configured context tier that can fit the result. If no tier can accommodate it, the stage fails explicitly instead of silently sending an undersized context. The estimate and chosen tier are recorded. This is a planning heuristic, not tokenizer integration.
 
-Timeouts are independent from context and output caps. Quick writer: 300 seconds; Standard Planner/Writer: 1500/900 seconds; Deep Planner/Writer: 1500/1800 seconds. The timeout bounds a stage request; it does not imply a completion deadline. Qwen3.5 consumed the earlier 512-, 1024-, and 2048-token Planner caps in its thinking field without returning JSON, while the Deep smoke produced a valid plan within its 3072-token cap. Standard and Deep therefore currently use 3072-token Planner caps as generation-profile experiments, not model defaults. At the configured fallback rate, the CLI can estimate stage duration as output tokens divided by tokens/second. That value is labeled approximate and is not used as a deadline.
+Timeouts are independent from context and output caps. Quick Writer: 300 seconds; Standard Planner/Writer: 480/900 seconds; Deep Planner/Writer: 1500/1800 seconds. Standard task-specific Planner caps are 384 tokens for explanations, 768 for slides, activities, instructor guides, assessments, and homework, 1024 for labs, and 1536 for lectures. Deep keeps larger per-task planning caps up to 3072 for lectures. Standard Writer explanation output is 768 tokens; other Writer budgets remain independently configured. These are generation-profile settings, not model defaults. At the configured fallback rate, the CLI can estimate stage duration as output tokens divided by tokens/second. That value is labeled approximate and is not used as a deadline.
 
 ## Progress and results
 

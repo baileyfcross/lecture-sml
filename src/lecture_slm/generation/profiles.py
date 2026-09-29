@@ -17,6 +17,7 @@ class StageProfile(BaseModel):
 
     enabled: bool = True
     think: bool
+    temperature: float | None = Field(default=None, ge=0.0)
     context_tiers: list[int] = Field(min_length=1)
     max_output_tokens: int = Field(gt=0)
     task_output_tokens: dict[TaskType, int] = Field(default_factory=dict)

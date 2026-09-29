@@ -1,6 +1,6 @@
 """Final-artifact writer prompt construction."""
 
-from lecture_slm.generation.models import GenerationRequest, TeachingPlan
+from lecture_slm.generation.models import GenerationRequest, TeachingPlanBase
 from lecture_slm.generation.prompts.base import PromptPackage, json_block, request_blocks
 
 WRITER_PROMPT_VERSION = "writer-v1"
@@ -14,9 +14,18 @@ WRITER_SYSTEM_PROMPT = (
 )
 
 
-def build_writer_prompt(request: GenerationRequest, plan: TeachingPlan) -> PromptPackage:
+def build_writer_prompt(
+    request: GenerationRequest,
+    plan: TeachingPlanBase | None,
+) -> PromptPackage:
     blocks = request_blocks(request)
-    blocks.insert(1, json_block("Teaching plan to follow", plan))
+    if plan is not None:
+        blocks.insert(1, json_block("Teaching plan to follow", plan))
+    else:
+        blocks.append(
+            "## Writer task\nCreate the requested artifact directly. "
+            "Do not provide a planning discussion."
+        )
     return PromptPackage(
         version=WRITER_PROMPT_VERSION,
         system_message=WRITER_SYSTEM_PROMPT,

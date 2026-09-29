@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from lecture_slm.config.loader import load_model_config
 from lecture_slm.generation.context import select_context_tier
 from lecture_slm.generation.models import (
+    ExplanationPlan,
     GenerationProfileName,
     GenerationRequest,
     GenerationStage,
@@ -17,6 +18,7 @@ from lecture_slm.generation.models import (
     TeachingPlan,
 )
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
+from lecture_slm.generation.plan_schemas import plan_schema_for_task
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
@@ -34,10 +36,12 @@ class FakeOllamaClient:
         planner_failure: str | None = None,
         writer_failure: bool = False,
         writer_tokens: int = 64,
+        planner_tokens: int = 80,
     ) -> None:
         self.planner_failure = planner_failure
         self.writer_failure = writer_failure
         self.writer_tokens = writer_tokens
+        self.planner_tokens = planner_tokens
         self.requests: list[dict[str, Any]] = []
         self.timeouts: list[float] = []
 
@@ -75,14 +79,29 @@ class FakeOllamaClient:
                 content = "not valid JSON"
             elif self.planner_failure == "invalid_schema":
                 content = json.dumps({"task": "lecture", "sequence": [{"unexpected": True}]})
+            elif format.get("title") == "ExplanationPlan":
+                content = json.dumps(
+                    {
+                        "task": "explanation",
+                        "artifact_structure": ["concept", "example", "check"],
+                        "concept": "DNS maps names to IP addresses.",
+                        "assumed_knowledge": ["websites use network addresses"],
+                        "explanation_sequence": ["name", "lookup", "address"],
+                        "example": "example.com resolves to a numeric IP address.",
+                        "misconceptions": ["DNS is the website itself."],
+                        "check_for_understanding": ["What does DNS return?"],
+                        "notes_for_writer": ["Keep it concise."],
+                    }
+                )
             else:
                 content = json.dumps(
                     {
                         "task": "lecture",
+                        "artifact_structure": ["objectives", "example", "practice"],
                         "objectives": ["Explain DNS name resolution."],
                         "prerequisites": ["domain names and IP addresses"],
                         "prior_knowledge_connections": ["URLs contain domain names"],
-                        "sequence": [
+                        "concept_sequence": [
                             {
                                 "title": "Concrete lookup",
                                 "purpose": "Introduce DNS through an example.",
@@ -90,14 +109,14 @@ class FakeOllamaClient:
                                 "learner_action": "Trace a lookup.",
                             }
                         ],
-                        "concepts": ["DNS maps names to addresses."],
-                        "examples": [],
+                        "worked_examples": [],
                         "misconceptions": ["DNS is the website itself."],
-                        "practice": [],
-                        "assessment_checks": ["What does DNS return?"],
+                        "guided_practice": [],
+                        "independent_practice": [],
+                        "formative_checks": ["What does DNS return?"],
                         "synthesis": ["Connect names to network addresses."],
-                        "source_usage": ["Use supplied source only."],
-                        "artifact_structure": ["objectives", "example", "practice"],
+                        "timing": [],
+                        "source_coverage": ["Use supplied source only."],
                         "notes_for_writer": ["Keep this freshman-friendly."],
                     }
                 )
@@ -105,11 +124,12 @@ class FakeOllamaClient:
                 model=model,
                 content=content,
                 prompt_tokens=120,
-                completion_tokens=80,
+                completion_tokens=self.planner_tokens,
                 total_duration_ns=3_000_000_000,
                 prompt_eval_duration_ns=1_000_000_000,
                 eval_duration_ns=2_000_000_000,
                 completion_reason="stop",
+                thinking_content="private planner trace for metadata test",
             )
         if self.writer_failure:
             raise OllamaTimeoutError("writer timed out")
@@ -135,9 +155,12 @@ def configs() -> tuple[Any, Any]:
     return model, profiles
 
 
-def sample_request(profile: GenerationProfileName) -> GenerationRequest:
+def sample_request(
+    profile: GenerationProfileName,
+    task: TaskType = TaskType.LECTURE,
+) -> GenerationRequest:
     return GenerationRequest(
-        task=TaskType.LECTURE,
+        task=task,
         profile=profile,
         instruction="Create a short introduction to DNS.",
         course=CourseProfile(id="cis-intro", name="CIS Intro", level="freshman"),
@@ -214,7 +237,7 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     fake = FakeOllamaClient()
     events = []
     result = make_pipeline(model, profiles, fake).route(
-        sample_request(GenerationProfileName.STANDARD),
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION),
         on_progress=events.append,
     )
 
@@ -223,25 +246,33 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert len(fake.requests) == 2
     planner_request, writer_request = fake.requests
     assert planner_request["format"] is not None
-    assert planner_request["think"] is True
-    assert planner_request["options"]["num_predict"] == 3072
+    assert planner_request["format"]["title"] == "ExplanationPlan"
+    assert planner_request["think"] is False
+    assert planner_request["options"]["temperature"] == 0.0
+    assert "Do not explain your reasoning" in planner_request["system_message"]
+    assert "step by step" not in planner_request["system_message"].lower()
+    assert planner_request["options"]["num_predict"] == 384
     assert profiles.profiles[GenerationProfileName.STANDARD].planner.context_tiers == [
         4096,
         8192,
     ]
     assert writer_request["format"] is None
     assert writer_request["think"] is False
-    assert writer_request["options"]["num_predict"] == 2048
-    assert fake.timeouts == [30.0, 1500.0, 900.0]
+    assert writer_request["options"]["num_predict"] == 768
+    assert fake.timeouts == [30.0, 480.0, 900.0]
     assert "Supplied source material" in planner_request["user_message"]
     assert "Previous course context" in planner_request["user_message"]
     assert "Authoritative user request" in writer_request["user_message"]
     assert "Teaching plan to follow" in writer_request["user_message"]
     assert "Supplied source material" in writer_request["user_message"]
     assert result.planner_result.timing.generated_tokens == 80
+    assert result.planner_result.timing.thinking_enabled is False
+    assert result.planner_result.timing.thinking_characters is None
+    assert result.planner_result.timing.potentially_truncated is False
     assert result.writer_result is not None
     assert result.writer_result.timing.generated_tokens == 64
-    assert result.metadata["planner_prompt_version"] == "planner-v1"
+    assert result.writer_result.timing.potentially_truncated is False
+    assert result.metadata["planner_prompt_version"] == "planner-standard-v2"
     assert result.metadata["writer_prompt_version"] == "writer-v1"
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
@@ -253,16 +284,52 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     ]
 
 
+def test_explanation_uses_compact_task_specific_plan(configs: tuple[Any, Any]) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient()
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    )
+    assert result.status is GenerationStatus.COMPLETED
+    assert isinstance(result.planner_result.plan, ExplanationPlan)
+    assert fake.requests[0]["format"]["title"] == "ExplanationPlan"
+    assert fake.requests[0]["options"]["num_predict"] == 384
+    assert fake.requests[0]["think"] is False
+
+
+def test_task_plan_schema_registry_maps_canonical_tasks() -> None:
+    expected_schema_names = {
+        TaskType.EXPLANATION: "ExplanationPlan",
+        TaskType.LECTURE: "LecturePlan",
+        TaskType.SLIDES: "SlidesPlan",
+        TaskType.LAB: "LabPlan",
+        TaskType.ACTIVITY: "ActivityPlan",
+        TaskType.INSTRUCTOR_GUIDE: "InstructorGuidePlan",
+        TaskType.ASSESSMENT: "AssessmentPlan",
+        TaskType.HOMEWORK: "AssessmentPlan",
+    }
+    assert {task: plan_schema_for_task(task).__name__ for task in TaskType} == expected_schema_names
+
+
 def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) -> None:
     model, profiles = configs
     fake = FakeOllamaClient()
     result = make_pipeline(model, profiles, fake).route(sample_request(GenerationProfileName.DEEP))
 
     assert result.status is GenerationStatus.COMPLETED
+    assert fake.requests[0]["format"]["title"] == "LecturePlan"
     assert fake.requests[0]["think"] is True
     assert fake.requests[0]["options"]["num_predict"] == 3072
+    assert fake.requests[0]["options"]["temperature"] == 0.5
     assert result.planner_result is not None
     assert result.planner_result.timing.selected_context == 8192
+    assert result.planner_result.prompt_version == "planner-v1"
+    assert result.planner_result.timing.thinking_enabled is True
+    assert result.planner_result.timing.thinking_characters == len(
+        "private planner trace for metadata test"
+    )
+    assert result.planner_result.timing.thinking_token_count is None
+    assert "private planner trace" not in result.model_dump_json()
     assert fake.requests[1]["think"] is False
     assert fake.requests[1]["options"]["num_predict"] == 4096
     assert fake.timeouts == [30.0, 1500.0, 1800.0]
@@ -270,6 +337,35 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert result.writer_result.timing.selected_context in {8192, 16384, 32768}
     assert profiles.profiles[GenerationProfileName.DEEP].review_enabled is False
     assert result.reviewer_result is None
+
+
+def test_planner_and_writer_limit_statuses_are_recorded_separately(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    profile = profiles.profiles[GenerationProfileName.STANDARD].model_copy(
+        update={
+            "planner": profiles.profiles[GenerationProfileName.STANDARD].planner.model_copy(
+                update={"task_output_tokens": {TaskType.EXPLANATION: 64}}
+            ),
+            "writer": profiles.profiles[GenerationProfileName.STANDARD].writer.model_copy(
+                update={"task_output_tokens": {TaskType.EXPLANATION: 64}}
+            ),
+        }
+    )
+    profiles = profiles.model_copy(
+        update={"profiles": {**profiles.profiles, GenerationProfileName.STANDARD: profile}}
+    )
+    fake = FakeOllamaClient(writer_tokens=64, planner_tokens=64)
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    )
+    assert result.planner_result is not None
+    assert result.writer_result is not None
+    assert result.planner_result.timing.output_limit_reached is True
+    assert result.planner_result.timing.potentially_truncated is True
+    assert result.writer_result.timing.output_limit_reached is True
+    assert result.writer_result.timing.potentially_truncated is True
 
 
 def test_invalid_planner_json_preserves_raw_output_and_skips_writer(
@@ -397,8 +493,15 @@ def test_profiles_config_has_quick_standard_deep_and_reviewer_disabled(
         GenerationProfileName.DEEP,
     }
     assert profiles.profiles[GenerationProfileName.QUICK].planner.enabled is False
+    assert profiles.profiles[GenerationProfileName.QUICK].planner.think is False
     assert profiles.profiles[GenerationProfileName.STANDARD].planner.enabled is True
     assert profiles.profiles[GenerationProfileName.DEEP].planner.enabled is True
+    assert (
+        profiles.profiles[GenerationProfileName.DEEP].planner.task_output_tokens[
+            TaskType.EXPLANATION
+        ]
+        == 3072
+    )
     assert profiles.profiles[GenerationProfileName.DEEP].review_enabled is False
     assert profiles.profiles[GenerationProfileName.DEEP].fallback_to_writer is False
 

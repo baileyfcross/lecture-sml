@@ -9,7 +9,8 @@ profiles:
     purpose: Simple explanations, rewrites, single slides, and short modifications.
     planner:
       enabled: false
-      think: true
+      think: false
+      temperature: 0.5
       context_tiers: [4096]
       max_output_tokens: 256
       task_output_tokens: {}
@@ -38,11 +39,20 @@ profiles:
     purpose: Normal educational artifacts including lectures, slides, labs, activities, and guides.
     planner:
       enabled: true
-      think: true
+      think: false
+      temperature: 0
       context_tiers: [4096, 8192]
-      max_output_tokens: 3072
-      task_output_tokens: {}
-      timeout_seconds: 1500
+      max_output_tokens: 1536
+      task_output_tokens:
+        explanation: 384
+        slides: 768
+        activity: 768
+        instructor_guide: 768
+        assessment: 768
+        homework: 768
+        lab: 1024
+        lecture: 1536
+      timeout_seconds: 480
       retry_count: 0
     writer:
       enabled: true
@@ -50,7 +60,7 @@ profiles:
       context_tiers: [8192]
       max_output_tokens: 2048
       task_output_tokens:
-        explanation: 512
+        explanation: 768
         slides: 1024
         activity: 1024
         instructor_guide: 1024
@@ -68,9 +78,18 @@ profiles:
     planner:
       enabled: true
       think: true
+      temperature: 0.5
       context_tiers: [8192]
       max_output_tokens: 3072
-      task_output_tokens: {}
+      task_output_tokens:
+        explanation: 3072
+        slides: 1536
+        activity: 1536
+        instructor_guide: 2048
+        assessment: 1536
+        homework: 1536
+        lab: 2048
+        lecture: 3072
       timeout_seconds: 1500
       retry_count: 0
     writer:

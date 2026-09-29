@@ -115,25 +115,109 @@ class PlannedPractice(BaseModel):
     scaffolding: str | None = None
 
 
-class TeachingPlan(BaseModel):
-    """Structured instructional blueprint for the writer, never the final artifact."""
+class TeachingPlanBase(BaseModel):
+    """Small common plan contract shared by task-specific planning schemas."""
 
     model_config = ConfigDict(extra="forbid")
 
     task: TaskType
-    objectives: list[str] = Field(default_factory=list)
-    prerequisites: list[str] = Field(default_factory=list)
-    prior_knowledge_connections: list[str] = Field(default_factory=list)
-    sequence: list[PlanSequenceStep] = Field(default_factory=list)
-    concepts: list[str] = Field(default_factory=list)
-    examples: list[PlannedExample] = Field(default_factory=list)
-    misconceptions: list[str] = Field(default_factory=list)
-    practice: list[PlannedPractice] = Field(default_factory=list)
-    assessment_checks: list[str] = Field(default_factory=list)
-    synthesis: list[str] = Field(default_factory=list)
-    source_usage: list[str] = Field(default_factory=list)
-    artifact_structure: list[str] = Field(default_factory=list)
+    artifact_structure: list[str] = Field(min_length=1)
     notes_for_writer: list[str] = Field(default_factory=list)
+
+
+class ExplanationPlan(TeachingPlanBase):
+    task: Literal[TaskType.EXPLANATION]
+    concept: str = Field(min_length=1)
+    assumed_knowledge: list[str]
+    explanation_sequence: list[str] = Field(min_length=1)
+    example: str = Field(min_length=1)
+    misconceptions: list[str]
+    check_for_understanding: list[str] = Field(min_length=1)
+
+
+class LecturePlan(TeachingPlanBase):
+    task: Literal[TaskType.LECTURE]
+    objectives: list[str] = Field(min_length=1)
+    prerequisites: list[str]
+    prior_knowledge_connections: list[str]
+    concept_sequence: list[PlanSequenceStep] = Field(min_length=1)
+    worked_examples: list[PlannedExample]
+    misconceptions: list[str]
+    guided_practice: list[PlannedPractice]
+    independent_practice: list[PlannedPractice]
+    formative_checks: list[str]
+    synthesis: list[str] = Field(min_length=1)
+    timing: list[str]
+    source_coverage: list[str]
+
+
+class SlidesPlan(TeachingPlanBase):
+    task: Literal[TaskType.SLIDES]
+    objectives: list[str]
+    prior_knowledge: list[str]
+    slide_sequence: list[PlanSequenceStep] = Field(min_length=2)
+    examples: list[PlannedExample]
+    exercises: list[str]
+    synthesis: list[str]
+    source_coverage: list[str]
+
+
+class LabPlan(TeachingPlanBase):
+    task: Literal[TaskType.LAB]
+    objectives: list[str] = Field(min_length=1)
+    prerequisites: list[str]
+    prior_work: list[str]
+    steps: list[PlanSequenceStep] = Field(min_length=1)
+    application_tasks: list[str] = Field(min_length=1)
+    checkpoints: list[str] = Field(min_length=1)
+    deliverables: list[str] = Field(min_length=1)
+    common_problems: list[str]
+
+
+class ActivityPlan(TeachingPlanBase):
+    task: Literal[TaskType.ACTIVITY]
+    objectives: list[str] = Field(min_length=1)
+    prior_knowledge: list[str]
+    stages: list[PlanSequenceStep] = Field(min_length=1)
+    timing: list[str]
+    student_actions: list[str] = Field(min_length=1)
+    instructor_actions: list[str]
+    synthesis: list[str] = Field(min_length=1)
+
+
+class InstructorGuidePlan(TeachingPlanBase):
+    task: Literal[TaskType.INSTRUCTOR_GUIDE]
+    objectives: list[str]
+    key_explanations: list[str] = Field(min_length=1)
+    misconceptions: list[str]
+    worked_solutions: list[str]
+    alternate_examples: list[str]
+    instructor_questions: list[str]
+    source_coverage: list[str]
+
+
+class AssessmentPlan(TeachingPlanBase):
+    task: Literal[TaskType.ASSESSMENT, TaskType.HOMEWORK]
+    objectives: list[str] = Field(min_length=1)
+    prerequisites: list[str]
+    questions: list[str] = Field(min_length=1)
+    answer_guidance: list[str]
+    misconception_signals: list[str]
+    scope_limits: list[str]
+
+
+type TaskTeachingPlan = (
+    ExplanationPlan
+    | LecturePlan
+    | SlidesPlan
+    | LabPlan
+    | ActivityPlan
+    | InstructorGuidePlan
+    | AssessmentPlan
+)
+
+# Compatibility name for code that only needs the shared plan fields.
+TeachingPlan = TeachingPlanBase
 
 
 class StageTiming(BaseModel):
@@ -142,6 +226,11 @@ class StageTiming(BaseModel):
     generated_tokens: int | None = Field(default=None, ge=0)
     tokens_per_second: float | None = Field(default=None, ge=0.0)
     stop_reason: str | None = None
+    output_limit_reached: bool | None = None
+    potentially_truncated: bool | None = None
+    thinking_enabled: bool | None = None
+    thinking_characters: int | None = Field(default=None, ge=0)
+    thinking_token_count: int | None = Field(default=None, ge=0)
     selected_context: int | None = Field(default=None, gt=0)
     estimated_input_tokens: int | None = Field(default=None, ge=0)
     output_budget: int | None = Field(default=None, ge=0)
@@ -151,7 +240,8 @@ class StageRecord(BaseModel):
     status: GenerationStatus
     timing: StageTiming | None = None
     raw_response: str | None = None
-    plan: TeachingPlan | None = None
+    plan: TaskTeachingPlan | None = None
+    prompt_version: str | None = None
     error_type: str | None = None
     error_message: str | None = None
 
@@ -194,6 +284,6 @@ class GenerationResult(BaseModel):
     timing: StageTiming
     errors: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    planner_prompt_version: str
+    planner_prompt_version: str | None
     writer_prompt_version: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

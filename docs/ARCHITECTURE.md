@@ -4,9 +4,17 @@
 
 This repository trains and evaluates instructional behavior. The separate Obsidian vault/indexing application remains responsible for retrieval and private knowledge. A vault dump is not a training corpus by default.
 
+## Teaching material path
+
+Explicit source path -> deterministic file discovery -> type-specific extraction -> normalized document -> conservative structural classification -> pending candidate -> human review -> approved model-independent dataset record.
+
+The ingestion subsystem is local and separate from runtime generation. It preserves source hashes, source versions, section/page/slide locations, extraction warnings, authorship metadata, and review history. Imported instructor material starts unapproved at Tier B. Evaluation prompts, benchmark outputs, and generated runtime artifacts are excluded from discovery/export.
+
+See `docs/INGESTION.md` for commands and the manifest/candidate contracts.
+
 ## Training path
 
-Teaching materials -> dataset processing -> dataset validation -> QLoRA -> evaluation -> merge -> GGUF -> Ollama.
+Approved teaching candidates -> dataset processing -> dataset validation -> QLoRA -> evaluation -> merge -> GGUF -> Ollama.
 
 Training is not implemented in v0. The schemas preserve task, provenance, quality tier, and split information so a later pipeline can be reproducible.
 

@@ -40,6 +40,8 @@ embeddings/
 
 data/raw/*
 !data/raw/.gitkeep
+data/ingestion/*
+!data/ingestion/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 evaluation-results/

@@ -9,11 +9,11 @@ from lecture_slm.generation.models import (
     GenerationStatus,
     StageRecord,
     StageTiming,
-    TeachingPlan,
+    TeachingPlanBase,
 )
 from lecture_slm.generation.profiles import GenerationProfiles, StageProfile
-from lecture_slm.generation.prompts.base import PromptPackage, request_blocks
 from lecture_slm.generation.prompts.writer import build_writer_prompt
+from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
 
@@ -39,6 +39,16 @@ def _stage_timing(
         generated_tokens=response.completion_tokens,
         tokens_per_second=rate,
         stop_reason=response.completion_reason,
+        output_limit_reached=detect_output_limit(
+            stop_reason=response.completion_reason,
+            generated_tokens=response.completion_tokens,
+            output_budget=budget,
+        ),
+        potentially_truncated=detect_output_limit(
+            stop_reason=response.completion_reason,
+            generated_tokens=response.completion_tokens,
+            output_budget=budget,
+        ),
         selected_context=selected_context,
         estimated_input_tokens=estimated_input_tokens,
         output_budget=budget,
@@ -66,7 +76,7 @@ class Writer:
         request: GenerationRequest,
         settings: StageProfile,
         *,
-        plan: TeachingPlan | None,
+        plan: TeachingPlanBase | None,
     ) -> StageRecord:
         if settings.think:
             return StageRecord(
@@ -74,9 +84,7 @@ class Writer:
                 error_type="InvalidWriterConfiguration",
                 error_message="Writer requests must have thinking disabled",
             )
-        prompt = (
-            build_writer_prompt(request, plan) if plan is not None else self._quick_prompt(request)
-        )
+        prompt = build_writer_prompt(request, plan)
         assembled = f"{prompt.system_message}\n\n{prompt.user_message}"
         selection = select_context_tier(
             assembled,
@@ -126,21 +134,4 @@ class Writer:
                 budget=output_budget,
             ),
             raw_response=response.content,
-        )
-
-    @staticmethod
-    def _quick_prompt(request: GenerationRequest) -> PromptPackage:
-        blocks = request_blocks(request)
-        blocks.append(
-            "## Writer task\nCreate the requested artifact directly. "
-            "Do not provide a planning discussion."
-        )
-        return PromptPackage(
-            version="writer-v1",
-            system_message=(
-                "You are the artifact writer for Lecture SLM. Follow the user's request, "
-                "course and pedagogy constraints, and supplied context. "
-                "Produce the artifact directly."
-            ),
-            user_message="\n\n".join(blocks),
         )

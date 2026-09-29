@@ -89,3 +89,16 @@ Do not commit private vault exports, raw course materials, credentials, model we
 ## Roadmap
 
 See [docs/ROADMAP.md](docs/ROADMAP.md). Training is deferred until the schemas, data review process, and baseline evaluation are trustworthy.
+
+## Teaching Material Ingestion
+
+The deterministic ingestion pipeline turns explicitly supplied `.pptx`, `.docx`, `.pdf`, `.md`, and `.txt` files into private, reviewable candidates. It does not scan the vault, call Ollama, rewrite source text, or approve material automatically. See [docs/INGESTION.md](docs/INGESTION.md) for the full contract.
+
+```powershell
+uv run python scripts/import_teaching_materials.py "C:\Teaching Materials" --dry-run
+uv run python scripts/import_teaching_materials.py "C:\Teaching Materials"
+uv run python scripts/validate_candidates.py
+uv run python scripts/review_dataset.py --status pending
+uv run python scripts/dataset_stats.py
+uv run python scripts/export_dataset.py --version 0.1.0
+```

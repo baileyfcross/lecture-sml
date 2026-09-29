@@ -18,8 +18,11 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.planner import Planner
 from lecture_slm.generation.profiles import GenerationProfile, GenerationProfiles
-from lecture_slm.generation.prompts.planner import PLANNER_PROMPT_VERSION, build_planner_prompt
-from lecture_slm.generation.prompts.writer import WRITER_PROMPT_VERSION, build_writer_prompt
+from lecture_slm.generation.prompts.planner import build_planner_prompt
+from lecture_slm.generation.prompts.writer import (
+    WRITER_PROMPT_VERSION,
+    build_writer_prompt,
+)
 from lecture_slm.generation.reviewer import GenerationReviewer
 from lecture_slm.generation.writer import Writer
 from lecture_slm.inference.ollama_client import OllamaClient, OllamaError
@@ -114,10 +117,15 @@ class GenerationPipeline:
                     error_message=str(error),
                 )
             else:
+                planning_message = (
+                    "Deep planning: creating a structured teaching plan"
+                    if request.profile.value == "deep"
+                    else "Planning: creating a concise structured teaching plan"
+                )
                 self._emit_stage_start(
                     progress,
                     GenerationStage.PLANNING,
-                    "Planner is creating a structured teaching plan",
+                    planning_message,
                     profile.planner.max_output_tokens,
                 )
                 planner = Planner(
@@ -165,11 +173,7 @@ class GenerationPipeline:
                     final_output=None,
                 )
 
-        writer_prompt = (
-            build_writer_prompt(request, plan)
-            if plan is not None
-            else Writer._quick_prompt(request)
-        )
+        writer_prompt = build_writer_prompt(request, plan)
         writer_input = f"{writer_prompt.system_message}\n\n{writer_prompt.user_message}"
         try:
             writer_selection = select_context_tier(
@@ -362,7 +366,9 @@ class GenerationPipeline:
             metadata={
                 "generation_profiles_id": self.profiles.id,
                 "generation_profiles_version": self.profiles.version,
-                "planner_prompt_version": PLANNER_PROMPT_VERSION,
+                "planner_prompt_version": (
+                    None if planner_record is None else planner_record.prompt_version
+                ),
                 "writer_prompt_version": WRITER_PROMPT_VERSION,
                 "planner_duration_seconds": planner_seconds,
                 "writer_duration_seconds": writer_seconds,
@@ -370,6 +376,8 @@ class GenerationPipeline:
                     self.profiles.model_dump_json().encode("utf-8")
                 ).hexdigest(),
             },
-            planner_prompt_version=PLANNER_PROMPT_VERSION,
+            planner_prompt_version=(
+                None if planner_record is None else planner_record.prompt_version
+            ),
             writer_prompt_version=WRITER_PROMPT_VERSION,
         )
