@@ -15,7 +15,7 @@ from lecture_slm.inference.ollama_client import (
     OllamaTimeoutError,
 )
 
-SMOKE_TEST_TIMEOUT_SECONDS = 30.0
+SMOKE_TEST_TIMEOUT_SECONDS = 120.0
 
 
 def _format_duration(duration_ns: int | None) -> str:

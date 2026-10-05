@@ -73,7 +73,11 @@ def case_metrics(case: RetrievalEvalCase, result: RetrievalResult, *, top_k: int
         if expected_sections
         else None
     )
-    missing_expected = case.category.casefold() in {"missing_source", "missing source"}
+    missing_expected = case.category.casefold() in {
+        "missing_source",
+        "missing source",
+        "missing_explicit_source",
+    }
     ambiguous_expected = case.category.casefold() in {
         "ambiguous_source",
         "ambiguous source",

@@ -71,13 +71,15 @@ class SourceResolver:
             scored = [
                 (
                     max(
-                        SequenceMatcher(
-                            None, query_norm, normalize_title(str(row["title"]))
-                        ).ratio(),
-                        *[
-                            SequenceMatcher(None, query_norm, normalize_title(alias)).ratio()
-                            for alias in _aliases(str(row["metadata_json"]))
-                        ],
+                        [
+                            SequenceMatcher(
+                                None, query_norm, normalize_title(str(row["title"]))
+                            ).ratio(),
+                            *[
+                                SequenceMatcher(None, query_norm, normalize_title(alias)).ratio()
+                                for alias in _aliases(str(row["metadata_json"]))
+                            ],
+                        ]
                     ),
                     row,
                 )

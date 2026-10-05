@@ -57,6 +57,7 @@ logs/*
 !logs/.gitkeep
 artifacts/*
 !artifacts/.gitkeep
+output.txt
 
 # OS and editor
 .DS_Store

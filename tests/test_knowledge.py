@@ -32,6 +32,7 @@ from lecture_slm.knowledge.config import (
     ChunkingConfig,
     KnowledgeConfig,
     RetrievalConfig,
+    SourceFocusConfig,
     load_knowledge_config,
 )
 from lecture_slm.knowledge.embeddings import EmbeddingProvider
@@ -51,8 +52,16 @@ from lecture_slm.knowledge.models import RetrievalMatch, RetrievalRequest, Retri
 from lecture_slm.knowledge.obsidian import parse_obsidian_markdown
 from lecture_slm.knowledge.ranking import reciprocal_rank_fusion
 from lecture_slm.knowledge.resolution import SourceResolver
-from lecture_slm.knowledge.retrieval import KnowledgeRetriever
+from lecture_slm.knowledge.retrieval import (
+    KnowledgeRetriever,
+    _candidate_term_coverage,
+    _query_term_coverage_boost,
+    _query_terms,
+    _term_coverage,
+    normalize_coverage_term,
+)
 from lecture_slm.knowledge.roles import ChunkRole, classify_chunk_role
+from lecture_slm.knowledge.source_focus import SourceFocusKind, classify_source_focus
 from lecture_slm.knowledge.stats import knowledge_stats
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vault import dry_run_report
@@ -161,12 +170,103 @@ def test_knowledge_config_environment_override_and_validation(tmp_path: Path) ->
         environ={"LECTURE_SLM_VAULT_PATH": str(tmp_path / "vault")},
     )
     assert config.vault_path == tmp_path / "vault"
+    assert config.retrieval.source_focus.enabled is False
     with pytest.raises(ValidationError, match="overlap_tokens"):
         ChunkingConfig(target_tokens=5, max_tokens=8, overlap_tokens=5)
     with pytest.raises(ValidationError, match="final_results"):
         RetrievalConfig(fused_candidates=4, final_results=5)
     assert _is_repository_generated_path(ROOT / "data/knowledge/test.sqlite")
     assert _is_repository_generated_path(ROOT / "data/processed/train.jsonl")
+    assert RetrievalConfig().source_focus.enabled is False
+    assert RetrievalConfig().source_focus.focused_note_boost == 0.01
+    assert RetrievalConfig().source_focus.overview_tag_adjustment == -0.005
+
+
+def test_coverage_term_normalization_and_nonlinear_boost() -> None:
+    plural_pairs = (
+        ("quantifier", "quantifiers"),
+        ("variable", "variables"),
+        ("predicate", "predicates"),
+        ("relation", "relations"),
+        ("statement", "statements"),
+        ("proposition", "propositions"),
+    )
+    for singular, plural in plural_pairs:
+        assert normalize_coverage_term(singular) == singular
+        assert normalize_coverage_term(plural) == singular
+        assert _term_coverage([plural], singular)["coverage"] == 1.0
+        assert _term_coverage([singular], plural)["coverage"] == 1.0
+
+    assert normalize_coverage_term("  (Quantifiers), ") == "quantifier"
+    assert normalize_coverage_term("categories") == "category"
+    assert normalize_coverage_term("species") == "species"
+    assert normalize_coverage_term("series") == "series"
+    assert normalize_coverage_term("movies") == "movie"
+    assert normalize_coverage_term("status") == "status"
+    assert normalize_coverage_term("analysis") == "analysis"
+    assert normalize_coverage_term("class") == "class"
+
+    query_terms = _query_terms("quantifiers and variables")
+    assert query_terms == ["quantifiers", "variables"]
+    candidate_a = _term_coverage(
+        query_terms, "The universal quantifier binds a variable in a predicate."
+    )
+    candidate_b = _term_coverage(
+        query_terms, "Variables represent values in an algebraic expression."
+    )
+    assert candidate_a["normalized_query_terms"] == ["quantifier", "variable"]
+    assert candidate_a["matched_terms"] == ["quantifier", "variable"]
+    assert candidate_a["matched_original_terms"] == ["quantifiers", "variables"]
+    assert candidate_a["coverage"] == 1.0
+    assert candidate_b["coverage"] == 0.5
+    assert _query_term_coverage_boost(candidate_a["coverage"], 0.05) == pytest.approx(0.05)
+    assert _query_term_coverage_boost(candidate_b["coverage"], 0.05) == pytest.approx(0.0125)
+    assert _query_term_coverage_boost(0.75, 0.05) == pytest.approx(0.028125)
+    assert _query_term_coverage_boost(0.25, 0.05) == pytest.approx(0.003125)
+    assert _query_term_coverage_boost(0.0, 0.05) == 0.0
+
+    repeated = _query_terms("variables variables quantifiers")
+    assert repeated == ["variables", "quantifiers"]
+    assert len(repeated) == 2
+    assert _query_terms("variable variables") == ["variable"]
+
+
+def test_candidate_coverage_includes_title_and_section_only() -> None:
+    coverage = _candidate_term_coverage(
+        ["quantifiers", "variables"],
+        {
+            "title": "Universal Quantifier",
+            "section_title": "Bound Variables",
+            "text": "A concise factual definition.",
+        },
+    )
+    assert coverage["coverage"] == 1.0
+    assert coverage["matched_terms"] == ["quantifier", "variable"]
+
+
+def test_source_focus_classification_is_component_based() -> None:
+    categories = {
+        "6 - Full Notes/Universal Quantifier.md": SourceFocusKind.FOCUSED_NOTE,
+        "3 - Tags/Formal Logic.md": SourceFocusKind.OVERVIEW_TAG,
+        "lecture-notes/Logic.md": SourceFocusKind.NEUTRAL,
+    }
+    for path, expected in categories.items():
+        assert (
+            classify_source_focus(
+                path,
+                focused_note_directories=["6 - Full Notes"],
+                overview_tag_directories=["3 - Tags"],
+            )
+            is expected
+        )
+    assert (
+        classify_source_focus(
+            "/private/vault/6 - Full Notes/Universal Quantifier.md",
+            focused_note_directories=["6 - Full Notes"],
+            overview_tag_directories=["3 - Tags"],
+        )
+        is SourceFocusKind.FOCUSED_NOTE
+    )
 
 
 def test_obsidian_metadata_and_malformed_frontmatter_are_safe() -> None:
@@ -490,6 +590,23 @@ Variables can be renamed during substitution in an algebraic expression.
             topical_title_mention.diagnostics["source_resolution"]["hard_constraint_source_id"]
             is None
         )
+        assert topical_title_mention.diagnostics["source_resolution"]["strength"] == "inferred"
+        assert topical_title_mention.diagnostics["query_terms"] == [
+            "predicate",
+            "logic",
+            "quantifiers",
+            "variables",
+        ]
+        assert topical_title_mention.diagnostics["normalized_query_terms"] == [
+            "predicate",
+            "logic",
+            "quantifier",
+            "variable",
+        ]
+        assert all(
+            "normalized_query_terms" in candidate["query_term_coverage"]
+            for candidate in topical_title_mention.diagnostics["fused_candidates"]
+        )
         assert len({match.source_title for match in topical_title_mention.matches}) > 1
         named_source_id = next(
             str(row["source_id"])
@@ -507,6 +624,95 @@ Variables can be renamed during substitution in an algebraic expression.
             document_lookup.diagnostics["source_resolution"]["hard_constraint_source_id"]
             == named_source_id
         )
+        assert document_lookup.diagnostics["source_resolution"]["strength"] == "explicit"
+        assert document_lookup.matches
+        assert all(match.source_id == named_source_id for match in document_lookup.matches)
+        assert all(match.role is ChunkRole.CONTENT for match in document_lookup.matches)
+
+
+def test_source_focus_is_a_tiebreaker_not_a_filter(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    focused = vault / "6 - Full Notes" / "Focused Concept.md"
+    overview = vault / "3 - Tags" / "Tag Overview.md"
+    strong_overview = vault / "3 - Tags" / "Broad Evidence.md"
+    for path in (focused, overview, strong_overview):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    focused.write_text(
+        "# Focused Concept\n\nQuantifiers bind variables.\n",
+        encoding="utf-8",
+    )
+    overview.write_text(
+        "# Tag Overview\n\nQuantifiers bind variables. Overview.\n",
+        encoding="utf-8",
+    )
+    strong_overview.write_text(
+        "# Broad Evidence\n\n"
+        "Quantifiers variables predicates relations. "
+        "Quantifiers variables predicates relations.\n",
+        encoding="utf-8",
+    )
+
+    config = knowledge_config(vault, tmp_path / "index")
+    embeddings = FakeEmbeddings()
+    KnowledgeIndexer(config, embeddings).index()
+    with KnowledgeStore(
+        config.data_dir,
+        embedding_model=embeddings.model_name,
+        embedding_version=embeddings.provider_version,
+        chunking_version=CHUNKING_VERSION,
+    ) as store:
+        retriever = KnowledgeRetriever(store, embeddings, config.retrieval)
+        tied = retriever.retrieve(
+            RetrievalRequest(query="quantifiers variables", mode="lexical", top_k=8)
+        )
+        assert tied.matches
+        by_title = {
+            candidate["source_title"]: candidate
+            for candidate in tied.diagnostics["fused_candidates"]
+        }
+        assert by_title["Focused Concept"]["source_focus_kind"] == "focused_note"
+        assert by_title["Focused Concept"]["source_focus_enabled"] is False
+        assert by_title["Focused Concept"]["source_focus_boost"] == 0.0
+        assert by_title["Tag Overview"]["source_focus_kind"] == "overview_tag"
+        assert by_title["Tag Overview"]["source_focus_enabled"] is False
+        assert by_title["Tag Overview"]["source_focus_boost"] == 0.0
+        assert (
+            by_title["Focused Concept"]["boost_details"]["source_focus_boost"]
+            == by_title["Tag Overview"]["boost_details"]["source_focus_boost"]
+            == 0.0
+        )
+
+        experimental_config = config.retrieval.model_copy(
+            update={"source_focus": SourceFocusConfig(enabled=True)}
+        )
+        experimental = KnowledgeRetriever(store, embeddings, experimental_config).retrieve(
+            RetrievalRequest(query="quantifiers variables", mode="lexical", top_k=8)
+        )
+        experimental_by_title = {
+            candidate["source_title"]: candidate
+            for candidate in experimental.diagnostics["fused_candidates"]
+        }
+        assert experimental_by_title["Focused Concept"]["source_focus_enabled"] is True
+        assert experimental_by_title["Focused Concept"]["source_focus_boost"] == pytest.approx(0.01)
+        assert experimental_by_title["Tag Overview"]["source_focus_enabled"] is True
+        assert experimental_by_title["Tag Overview"]["source_focus_boost"] == pytest.approx(-0.005)
+        assert experimental_by_title["Focused Concept"]["fused_score"] - by_title[
+            "Focused Concept"
+        ]["fused_score"] == pytest.approx(0.01)
+        assert experimental_by_title["Tag Overview"]["fused_score"] - by_title["Tag Overview"][
+            "fused_score"
+        ] == pytest.approx(-0.005)
+
+        stronger_tag = retriever.retrieve(
+            RetrievalRequest(
+                query="quantifiers variables predicates relations",
+                mode="lexical",
+                top_k=8,
+            )
+        )
+        assert stronger_tag.matches
+        assert stronger_tag.matches[0].source_title == "Broad Evidence"
+        assert any(match.source_title == "Focused Concept" for match in stronger_tag.matches)
 
 
 def test_source_resolution_methods_and_ambiguity_are_explicit(tmp_path: Path) -> None:
@@ -534,6 +740,11 @@ def test_source_resolution_methods_and_ambiguity_are_explicit(tmp_path: Path) ->
             assert source is not None
             assert source["resolution_reason"] == reason
             assert not warnings
+        missing_source, missing_warnings = resolver.resolve_source(
+            "explain quantifiers", "Definitely Missing Lecture SLM Source XYZ"
+        )
+        assert missing_source is None
+        assert missing_warnings and "No indexed source matched" in missing_warnings[0]
 
     write_note(vault / "duplicate-title.md", first_section="A changed source version.")
     KnowledgeIndexer(config, embeddings).index()
@@ -907,6 +1118,13 @@ def test_retrieval_modes_and_all_mode_evaluation_are_private(tmp_path: Path) -> 
     assert results[0]["metrics"]["source_resolution_accuracy"] is True
     assert results[0]["metrics"]["section_resolution_accuracy"] is True
     assert results[0]["context_assembly"]["configured_budget"] > 0
+    assert "normalized_query_terms" in results[0]["resolution"]
+    assert results[0]["retrieval_configuration"]["query_term_coverage_exponent"] == 2
+    assert any(
+        "query_term_coverage_boost" in candidate["boost_details"]
+        and "source_focus_boost" in candidate["boost_details"]
+        for candidate in results[0]["resolution"]["fused_candidates"]
+    )
     assert summary["mode_comparison"]["lexical"]["mrr"] is not None
     assert str(vault) not in json.dumps(run_metadata)
     assert (run_dir / "reviews.jsonl").read_text(encoding="utf-8") == ""
@@ -928,6 +1146,14 @@ def test_retrieval_metrics_handle_unknown_truth_and_fail_closed_categories() -> 
     assert metrics["fail_closed_accuracy"] is True
     assert classify_resolution_failures(result) == ["source_not_found"]
     assert aggregate_metrics([{"metrics": metrics}])["fail_closed_accuracy"] == 1.0
+    explicit_missing = RetrievalEvalCase(
+        id="explicit-missing",
+        query="explain quantifiers",
+        category="missing_explicit_source",
+        source_title="Definitely Missing Lecture SLM Source XYZ",
+    )
+    explicit_missing_metrics = case_metrics(explicit_missing, result, top_k=5)
+    assert explicit_missing_metrics["fail_closed_accuracy"] is True
 
     ambiguous = RetrievalEvalCase(
         id="ambiguous",

@@ -49,6 +49,14 @@ knowledge:
     neighbor_roles:
       - content
     query_term_coverage_weight: 0.05
+    source_focus:
+      enabled: false
+      focused_note_boost: 0.01
+      overview_tag_adjustment: -0.005
+      focused_note_directories:
+        - 6 - Full Notes
+      overview_tag_directories:
+        - 3 - Tags
     context_budgets:
       quick: 1500
       standard: 3500

@@ -53,7 +53,16 @@ ollama create lecture-slm-baseline -f ollama/Modelfile.baseline
 Set `OLLAMA_HOST` when the Ollama server is not local:
 
 ```powershell
+on Windows:
 $env:OLLAMA_HOST = "http://localhost:11434"
+
+on Mac:
+export OLLAMA_HOST="http://localhost:11434"
+
+For Persistance on Mac:
+echo 'export OLLAMA_HOST="http://localhost:11434"' >> ~/.zshrc
+
+Test with script:
 uv run python scripts/test_ollama.py
 ```
 
@@ -115,4 +124,13 @@ uv run python scripts/validate_candidates.py
 uv run python scripts/review_dataset.py --status pending
 uv run python scripts/dataset_stats.py
 uv run python scripts/export_dataset.py --version 0.1.0
+```
+
+
+## Example Retrieval CLI Prompts
+
+```bash
+uv run python scripts/retrieve.py "predicate logic" --explain
+
+uv run python scripts/retrieve.py "rules of inference" --explain
 ```

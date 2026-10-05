@@ -2,6 +2,7 @@
 
 import json
 import re
+import string
 import time
 from collections import Counter
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from lecture_slm.knowledge.models import (
 from lecture_slm.knowledge.ranking import reciprocal_rank_fusion
 from lecture_slm.knowledge.resolution import SourceResolver, normalize_title
 from lecture_slm.knowledge.roles import ChunkRole
+from lecture_slm.knowledge.source_focus import SourceFocusKind, classify_source_focus
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vector import SQLiteCosineSearch, VectorSearch
 
@@ -290,6 +292,7 @@ class KnowledgeRetriever:
         }
         rrf_constant = request.rrf_constant or self.config.rrf_constant
         query_terms = _query_terms(retrieval_query)
+        normalized_query_terms = [normalize_coverage_term(term) for term in query_terms]
         if request.mode == "hybrid":
             fused_scores = reciprocal_rank_fusion(
                 lexical_ranks, semantic_ranks, constant=rrf_constant
@@ -327,9 +330,17 @@ class KnowledgeRetriever:
                 score += self.config.exact_section_boost
                 boosts.append("exact_section")
             resolution_reason = str((source or {}).get("resolution_reason", ""))
-            coverage = _term_coverage(query_terms, str(row["text"]))
-            coverage_boost = self.config.query_term_coverage_weight * coverage["coverage"]
+            coverage = _candidate_term_coverage(query_terms, row)
+            coverage_boost = self.config.query_term_coverage_weight * coverage["coverage"] ** 2
             score += coverage_boost
+            relative_path = str(row["active_path"] or row["note_path"])
+            focus_kind = classify_source_focus(
+                relative_path,
+                focused_note_directories=self.config.source_focus.focused_note_directories,
+                overview_tag_directories=self.config.source_focus.overview_tag_directories,
+            )
+            focus_boost = _source_focus_boost(focus_kind, self.config)
+            score += focus_boost
             boost_diagnostics[chunk_id] = {
                 "source_resolution_boost": source_boost,
                 "source_resolution_strength": source_strength.value if source else None,
@@ -346,7 +357,12 @@ class KnowledgeRetriever:
                 "folder": False,
                 "query_term_coverage": coverage,
                 "query_term_coverage_boost": coverage_boost,
+                "source_focus_kind": focus_kind.value,
+                "source_focus_enabled": self.config.source_focus.enabled,
+                "source_focus_boost": focus_boost,
             }
+            if focus_boost:
+                boosts.append("source_focus")
             candidate["fused_score"] = score
             fused.append((score, chunk_id, candidate))
         fused.sort(key=lambda item: (-item[0], item[1]))
@@ -361,6 +377,9 @@ class KnowledgeRetriever:
                 ),
                 "section": candidate["row"]["section_title"],
                 "role": candidate["row"]["role"],
+                "source_focus_kind": boost_diagnostics[chunk_id]["source_focus_kind"],
+                "source_focus_enabled": boost_diagnostics[chunk_id]["source_focus_enabled"],
+                "source_focus_boost": boost_diagnostics[chunk_id]["source_focus_boost"],
                 "page_number": candidate["row"]["page_number"],
                 "slide_number": candidate["row"]["slide_number"],
                 "lexical_rank": candidate["lexical_rank"],
@@ -370,7 +389,7 @@ class KnowledgeRetriever:
                 "boosts": [
                     name
                     for name, applied in boost_diagnostics[chunk_id].items()
-                    if isinstance(applied, bool) and applied
+                    if name != "source_focus_enabled" and isinstance(applied, bool) and applied
                 ],
                 "boost_details": boost_diagnostics[chunk_id],
                 "query_term_coverage": boost_diagnostics[chunk_id]["query_term_coverage"],
@@ -443,6 +462,8 @@ class KnowledgeRetriever:
                 "passage_roles": [role.value for role in passage_roles],
                 "neighbor_roles": [role.value for role in self.config.neighbor_roles],
                 "query_term_coverage_weight": self.config.query_term_coverage_weight,
+                "query_term_coverage_exponent": 2,
+                "source_focus": self.config.source_focus.model_dump(mode="json"),
                 "exact_title_boost": self.config.exact_title_boost,
                 "exact_section_boost": self.config.exact_section_boost,
                 "neighbor_expansion": expansion,
@@ -471,6 +492,7 @@ class KnowledgeRetriever:
                 "neighbor_additions": neighbor_additions,
                 "final_chunk_ids": [match.chunk_id for match in matches],
                 "query_terms": query_terms,
+                "normalized_query_terms": normalized_query_terms,
                 "effective_query": retrieval_query,
                 "eligible_passage_roles": [role.value for role in passage_roles],
                 "role_counts_in_index": self.store.role_stats(),
@@ -649,7 +671,7 @@ def _candidate_diagnostic(
         "score": (
             candidate["lexical_score"] if source == "lexical" else candidate["semantic_score"]
         ),
-        "query_term_coverage": _term_coverage(query_terms, str(row["text"])),
+        "query_term_coverage": _candidate_term_coverage(query_terms, row),
     }
 
 
@@ -677,23 +699,90 @@ _STOP_WORDS = {
 
 
 def _query_terms(value: str) -> list[str]:
-    return list(
-        dict.fromkeys(
-            term
-            for term in re.findall(r"[a-z0-9]+", value.casefold())
-            if term not in _STOP_WORDS and len(term) > 1
-        )
-    )
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", value.casefold()):
+        normalized = normalize_coverage_term(term)
+        if term in _STOP_WORDS or len(normalized) <= 1 or normalized in seen:
+            continue
+        terms.append(term)
+        seen.add(normalized)
+    return terms
+
+
+def normalize_coverage_term(term: str) -> str:
+    """Normalize punctuation and common plural endings for ranking diagnostics only."""
+
+    normalized = term.casefold().strip().strip(string.punctuation)
+    if normalized in {"news", "series", "species"}:
+        return normalized
+    if (
+        len(normalized) > 4
+        and normalized.endswith("ies")
+        and normalized
+        not in {
+            "brownies",
+            "cookies",
+            "movies",
+            "newbies",
+            "rookies",
+            "series",
+            "smoothies",
+            "species",
+            "zombies",
+        }
+    ):
+        return normalized[:-3] + "y"
+    if (
+        len(normalized) > 3
+        and normalized.endswith("s")
+        and not normalized.endswith(("ss", "us", "is"))
+    ):
+        return normalized[:-1]
+    return normalized
 
 
 def _term_coverage(query_terms: list[str], text: str) -> dict[str, Any]:
-    text_terms = set(re.findall(r"[a-z0-9]+", text.casefold()))
-    matched_terms = [term for term in query_terms if term in text_terms]
+    normalized_query_terms = [normalize_coverage_term(term) for term in query_terms]
+    text_terms = {
+        normalize_coverage_term(term)
+        for term in re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", text.casefold())
+    }
+    matched_pairs = [
+        (original, normalized)
+        for original, normalized in zip(query_terms, normalized_query_terms, strict=True)
+        if normalized in text_terms
+    ]
     return {
         "query_terms": query_terms,
-        "matched_terms": matched_terms,
-        "coverage": len(matched_terms) / len(query_terms) if query_terms else 0.0,
+        "normalized_query_terms": normalized_query_terms,
+        "matched_terms": [normalized for _, normalized in matched_pairs],
+        "matched_original_terms": [original for original, _ in matched_pairs],
+        "coverage": len(matched_pairs) / len(query_terms) if query_terms else 0.0,
     }
+
+
+def _candidate_term_coverage(query_terms: list[str], row: Any) -> dict[str, Any]:
+    return _term_coverage(
+        query_terms,
+        " ".join(
+            str(value) for value in (row["title"], row["section_title"], row["text"]) if value
+        ),
+    )
+
+
+def _source_focus_boost(kind: SourceFocusKind, config: RetrievalConfig) -> float:
+    if not config.source_focus.enabled:
+        return 0.0
+    if kind is SourceFocusKind.FOCUSED_NOTE:
+        return config.source_focus.focused_note_boost
+    if kind is SourceFocusKind.OVERVIEW_TAG:
+        return config.source_focus.overview_tag_adjustment
+    return 0.0
+
+
+def _query_term_coverage_boost(coverage: float, weight: float) -> float:
+    return weight * coverage**2
 
 
 def _residual_query(

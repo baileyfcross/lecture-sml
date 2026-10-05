@@ -11,15 +11,15 @@ profiles:
       enabled: false
       think: false
       temperature: 0.5
-      context_tiers: [4096]
+      context_tiers: [4096, 8192]
       max_output_tokens: 256
       task_output_tokens: {}
-      timeout_seconds: 300
+      timeout_seconds: 900
       retry_count: 0
     writer:
       enabled: true
       think: false
-      context_tiers: [4096]
+      context_tiers: [4096, 8192]
       max_output_tokens: 512
       task_output_tokens:
         explanation: 512
@@ -30,7 +30,7 @@ profiles:
         homework: 512
         lab: 512
         lecture: 512
-      timeout_seconds: 300
+      timeout_seconds: 900
       retry_count: 0
     review_enabled: false
     fallback_to_writer: false
@@ -52,7 +52,7 @@ profiles:
         homework: 768
         lab: 1024
         lecture: 1536
-      timeout_seconds: 480
+      timeout_seconds: 900
       retry_count: 0
     writer:
       enabled: true

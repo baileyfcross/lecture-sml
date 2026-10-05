@@ -79,7 +79,9 @@ def test_health_cli_sends_bounded_native_request_and_reports_timings(
         ("GET", "http://ollama.example:11434/api/tags"),
         ("POST", "http://ollama.example:11434/api/chat"),
     ]
-    assert all(request[2]["timeout"] == 30.0 for request in requests)
+    assert all(
+        request[2]["timeout"] == namespace["SMOKE_TEST_TIMEOUT_SECONDS"] for request in requests
+    )
     chat_payload = requests[1][2]["json"]
     assert isinstance(chat_payload, dict)
     assert chat_payload["model"] == "qwen3.5:9b"
@@ -113,8 +115,11 @@ def test_timeout_has_a_distinct_error(monkeypatch: pytest.MonkeyPatch) -> None:
         raise httpx.ReadTimeout("slow response")
 
     monkeypatch.setattr("lecture_slm.inference.ollama_client.httpx.request", timeout_request)
+    smoke_test_timeout = runpy.run_path(str(ROOT / "scripts/test_ollama.py"))[
+        "SMOKE_TEST_TIMEOUT_SECONDS"
+    ]
     with pytest.raises(OllamaTimeoutError, match="timed out"):
-        OllamaClient("http://ollama.example", timeout=30).available_models()
+        OllamaClient("http://ollama.example", timeout=smoke_test_timeout).available_models()
 
 
 def test_http_error_has_a_distinct_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -78,6 +78,16 @@ class EmbeddingsConfig(BaseModel):
         return self
 
 
+class SourceFocusConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    focused_note_boost: float = Field(default=0.01, ge=0.0, le=0.05)
+    overview_tag_adjustment: float = Field(default=-0.005, ge=-0.05, le=0.0)
+    focused_note_directories: list[str] = Field(default_factory=lambda: ["6 - Full Notes"])
+    overview_tag_directories: list[str] = Field(default_factory=lambda: ["3 - Tags"])
+
+
 class RetrievalConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -93,6 +103,7 @@ class RetrievalConfig(BaseModel):
     default_passage_roles: list[ChunkRole] = Field(default_factory=lambda: [ChunkRole.CONTENT])
     neighbor_roles: list[ChunkRole] = Field(default_factory=lambda: [ChunkRole.CONTENT])
     query_term_coverage_weight: float = Field(default=0.05, ge=0.0, le=0.1)
+    source_focus: SourceFocusConfig = Field(default_factory=SourceFocusConfig)
     context_budgets: dict[str, int] = Field(
         default_factory=lambda: {"quick": 1500, "standard": 3500, "deep": 7000}
     )
