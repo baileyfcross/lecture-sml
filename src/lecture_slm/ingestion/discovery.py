@@ -16,6 +16,19 @@ DEFAULT_IGNORED_DIRECTORIES = {
     "evals",
 }
 
+REPOSITORY_GENERATED_PATHS = {
+    ("data", "knowledge"),
+    ("data", "processed"),
+    ("data", "ingestion"),
+    ("evals",),
+    ("artifacts",),
+    ("logs",),
+    ("models",),
+    ("checkpoints",),
+    ("outputs",),
+    ("generated",),
+}
+
 
 @dataclass(frozen=True)
 class DiscoveredFile:
@@ -51,7 +64,7 @@ def discover_sources(
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_file():
-        if any(part in ignored for part in path.parts):
+        if any(part in ignored for part in path.parts) or _is_repository_generated_path(path):
             raise ValueError(f"Refusing generated or evaluation path: {path}")
         root = path.parent
         files = [path]
@@ -60,7 +73,11 @@ def discover_sources(
         iterator = path.rglob("*") if recursive else path.glob("*")
         files = []
         for candidate in iterator:
-            if not candidate.is_file() or any(part in ignored for part in candidate.parts):
+            if (
+                not candidate.is_file()
+                or any(part in ignored for part in candidate.parts)
+                or _is_repository_generated_path(candidate)
+            ):
                 continue
             if candidate.name.startswith("~$") or candidate.name in {".DS_Store", "Thumbs.db"}:
                 continue
@@ -76,3 +93,14 @@ def discover_sources(
         for file in sorted(files, key=lambda item: item.as_posix().lower())
     ]
     return DiscoveryResult(root=root, files=discovered)
+
+
+def _is_repository_generated_path(path: Path) -> bool:
+    """Exclude local index/training/evaluation outputs when scanning this repository."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    try:
+        parts = tuple(part.casefold() for part in path.resolve().relative_to(repository_root).parts)
+    except ValueError:
+        return False
+    return any(parts[: len(protected)] == protected for protected in REPOSITORY_GENERATED_PATHS)

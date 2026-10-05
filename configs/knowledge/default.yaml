@@ -1,0 +1,50 @@
+knowledge:
+  vault_path: null
+  data_dir: data/knowledge
+
+  indexing:
+    recursive: true
+    include_extensions:
+      - .md
+      #- .pdf
+      #- .txt
+      #- .docx
+      # - .pptx
+    ignore_directories:
+      - .obsidian
+      - .git
+      - .trash
+      - node_modules
+      - evals
+      - artifacts
+      - logs
+      - generated
+      - outputs
+      - data
+
+  chunking:
+    target_tokens: 450
+    max_tokens: 650
+    overlap_tokens: 60
+    preserve_sections: true
+
+  embeddings:
+    provider: fastembed
+    model: BAAI/bge-small-en-v1.5
+    batch_size: 64
+    cache_dir: null
+
+  retrieval:
+    lexical_candidates: 30
+    semantic_candidates: 30
+    fused_candidates: 20
+    final_results: 8
+    neighbor_expansion: 1
+    reranker_enabled: false
+    rrf_constant: 60
+    exact_title_boost: 0.15
+    exact_section_boost: 0.15
+    context_budgets:
+      quick: 1500
+      standard: 3500
+      deep: 7000

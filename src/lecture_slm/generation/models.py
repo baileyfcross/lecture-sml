@@ -35,7 +35,7 @@ class GenerationStatus(StrEnum):
 
 
 class SourceMaterial(BaseModel):
-    """Source chunk/material prepared by a caller; retrieval is out of scope."""
+    """Factual source material assembled by the caller for generation."""
 
     model_config = ConfigDict(extra="forbid")
 

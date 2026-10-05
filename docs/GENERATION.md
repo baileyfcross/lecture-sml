@@ -1,10 +1,10 @@
 # Generation Architecture
 
-Generation is runtime orchestration over the current Ollama model. It is separate from training, evaluation scoring, and the Obsidian/RAG application. The same runtime can later target an Ollama fine-tuned tag such as `lecture-slm:v1` by changing model configuration only; it has no Hugging Face or training-stack dependency.
+Generation is runtime orchestration over the current Ollama model. It is separate from training and evaluation scoring. Optional local knowledge retrieval is performed by the CLI before the existing generation router; the router and stage implementations do not access the vault. The same runtime can later target an Ollama fine-tuned tag such as `lecture-slm:v1` by changing model configuration only; it has no Hugging Face or training-stack dependency.
 
 ## Request inputs
 
-`GenerationRequest` contains a canonical educational task, profile name, authoritative instruction, optional typed course and pedagogy profiles, structured source records, prior topics/course history, output preferences, and metadata. `SourceMaterial` includes source ID, title, section, text, and metadata. Callers provide retrieved materials later; this package does not retrieve, index, embed, or access the Obsidian vault.
+`GenerationRequest` contains a canonical educational task, profile name, authoritative instruction, optional typed course and pedagogy profiles, structured source records, prior topics/course history, output preferences, and metadata. `SourceMaterial` includes source ID, title, section, text, and metadata. Explicit source files and opt-in retrieved materials are both appended to the same source list; retrieval provenance is retained in source metadata. See `docs/KNOWLEDGE.md` for the retrieval implementation.
 
 Prompt builders keep instruction, course constraints, pedagogy, teaching plan, sources, and prior-course context in separate labeled JSON blocks. The writer is explicitly asked to ground claims in supplied sources and follow, rather than redo, the teaching plan.
 
@@ -50,4 +50,4 @@ Saved development artifacts go under ignored `artifacts/generations/<run-id>/`: 
 
 ## Training boundary
 
-This runtime does not train models, create adapters, ingest vault content, build embeddings, or implement RAG. Fine-tuning will teach how the instructor teaches; course profiles/context define who is being taught; retrieved sources and course history will supply what is known and where the class currently is. Runtime generation and the later training pipeline remain separate systems.
+This runtime does not train models or create adapters. Fine-tuning teaches how the instructor teaches; course profiles/context define who is being taught; retrieved sources supply factual knowledge; and caller-provided previous-course context describes where the class currently is. Knowledge indexing/retrieval and the later training pipeline remain separate systems. Retrieval is opt-in with `--retrieve`; existing commands and explicit `--source-file` behavior remain available without it.

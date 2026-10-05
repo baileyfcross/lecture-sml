@@ -44,6 +44,10 @@ data/ingestion/*
 !data/ingestion/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+data/knowledge/*
+!data/knowledge/.gitkeep
+# Includes private real-vault evaluation cases, passages, and human reviews.
+data/knowledge/evaluation/
 evaluation-results/
 evals/results/*
 !evals/results/.gitkeep

@@ -1,6 +1,6 @@
 # Roadmap
 
-Implemented: repository/environment, Ollama baseline client and Modelfile, dataset schemas, explicit pedagogy configuration, versioned human-review rubric, 26 validated evaluation prompts, resumable result runner and terminal review, two-prompt infrastructure smoke, inference performance characterization, task-specific Quick/Standard/Deep planner-writer runtime, and deterministic teaching-material ingestion with human review/export. The full baseline quality evaluation is not yet complete.
+Implemented: repository/environment, Ollama baseline client and Modelfile, dataset schemas, explicit pedagogy configuration, versioned human-review rubric, 26 validated evaluation prompts, resumable result runner and terminal review, two-prompt infrastructure smoke, inference performance characterization, task-specific Quick/Standard/Deep planner-writer runtime, deterministic teaching-material ingestion with human review/export, and local knowledge indexing/retrieval plus offline retrieval-evaluation tooling. Retrieval quality has not been established; the explicit real-vault pilot remains pending. The full baseline quality evaluation is not yet complete.
 
 1. Phase 0 - Repository/environment (implemented)
 2. Phase 1 - Ollama baseline (implemented)
@@ -16,10 +16,11 @@ Implemented: repository/environment, Ollama baseline client and Modelfile, datas
 	- Full baseline quality evaluation - not complete
 8. Phase 7 - Generation architecture (implemented: Quick/Standard/Deep routing, task-specific plans, progress, context selection, and stage metadata; Quick and final Standard smokes passed; Deep current routing covered by mocks after the live cap check)
 9. Phase 8 - Baseline generation comparison (Quick vs Standard vs Deep)
-10. Phase 9 - Build and analyze the initial approved dataset
-11. Phase 10 - Training environment and QLoRA supervised fine-tuning
-12. Phase 11 - Evaluate fine-tuned model against baseline
-13. Phase 12 - Merge and GGUF export
-14. Phase 13 - Ollama deployment
-15. Phase 14 - Vault RAG integration
-16. Phase 15 - Preference collection and optimization experiments
+10. Phase 9 - Vault knowledge ingestion, local hybrid retrieval, and generation context integration (implementation complete; real-vault integration smoke pending)
+11. Phase 10 - Retrieval quality evaluation and source-grounding review (offline infrastructure complete; real-vault retrieval evaluation and human review pending)
+12. Phase 11 - Build and analyze the initial approved teaching dataset
+13. Phase 12 - Training environment and QLoRA supervised fine-tuning
+14. Phase 13 - Evaluate fine-tuned model against baseline
+15. Phase 14 - Merge and GGUF export
+16. Phase 15 - Ollama deployment
+17. Phase 16 - Preference collection and optimization experiments

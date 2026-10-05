@@ -9,6 +9,7 @@ from lecture_slm.config.loader import (
     load_model_config,
     load_pedagogy_config,
 )
+from lecture_slm.generation.context import estimate_tokens_from_characters
 from lecture_slm.generation.models import (
     GenerationProfileName,
     GenerationRequest,
@@ -20,6 +21,13 @@ from lecture_slm.generation.models import (
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.router import GenerationRouter
+from lecture_slm.knowledge.assembler import KnowledgeContextAssembler
+from lecture_slm.knowledge.config import load_knowledge_config
+from lecture_slm.knowledge.embeddings import FastEmbedProvider, fastembed_provider_version
+from lecture_slm.knowledge.models import RetrievalRequest
+from lecture_slm.knowledge.retrieval import KnowledgeRetriever
+from lecture_slm.knowledge.storage import KnowledgeStore
+from lecture_slm.knowledge.vault import validate_knowledge_paths
 from lecture_slm.schemas.dataset import TaskType
 
 
@@ -55,6 +63,15 @@ def main() -> int:
     parser.add_argument("--source-file", type=Path)
     parser.add_argument("--source-id")
     parser.add_argument("--source-title")
+    parser.add_argument("--retrieve", action="store_true")
+    parser.add_argument(
+        "--knowledge-config", type=Path, default=Path("configs/knowledge/default.yaml")
+    )
+    parser.add_argument("--section")
+    parser.add_argument("--knowledge-course")
+    parser.add_argument("--tag", action="append", default=[])
+    parser.add_argument("--knowledge-folder")
+    parser.add_argument("--retrieval-top-k", type=int)
     parser.add_argument("--previous-topic", action="append", default=[])
     parser.add_argument("--previous-lecture-summary")
     parser.add_argument("--previous-lab-summary")
@@ -80,8 +97,76 @@ def main() -> int:
                     source_id=args.source_id or args.source_file.stem,
                     title=args.source_title or args.source_file.name,
                     text=args.source_file.read_text(encoding="utf-8"),
+                    metadata={"source_origin": "explicit_file"},
                 )
             )
+        retrieval_result = None
+        if args.retrieve:
+            knowledge_config = load_knowledge_config(args.knowledge_config)
+            database = knowledge_config.data_dir / "knowledge.sqlite"
+            if not database.exists():
+                raise FileNotFoundError(
+                    f"No knowledge index at {database}; run scripts/index_knowledge.py first."
+                )
+            validate_knowledge_paths(
+                knowledge_config.data_dir,
+                knowledge_config.embeddings.cache_dir or knowledge_config.data_dir / "models",
+                KnowledgeStore.indexed_vault_root(knowledge_config.data_dir),
+            )
+            with KnowledgeStore(
+                knowledge_config.data_dir,
+                embedding_model=knowledge_config.embeddings.model,
+                embedding_version=fastembed_provider_version(),
+                chunking_version="1",
+            ):
+                pass
+            embedding_provider = FastEmbedProvider(
+                knowledge_config.embeddings.model,
+                cache_dir=str(
+                    knowledge_config.embeddings.cache_dir or knowledge_config.data_dir / "models"
+                ),
+            )
+            with KnowledgeStore(
+                knowledge_config.data_dir,
+                embedding_model=embedding_provider.model_name,
+                embedding_version=embedding_provider.provider_version,
+                chunking_version="1",
+            ) as store:
+                retrieval_result = KnowledgeRetriever(
+                    store,
+                    embedding_provider,
+                    knowledge_config.retrieval,
+                ).retrieve(
+                    RetrievalRequest(
+                        query=args.instruction,
+                        source_title=args.source_title,
+                        section=args.section,
+                        course=args.knowledge_course,
+                        tags=args.tag,
+                        folder=args.knowledge_folder,
+                        top_k=args.retrieval_top_k,
+                    )
+                )
+            source_context_budget = knowledge_config.retrieval.context_budgets[profile.value]
+            explicit_source_tokens = sum(
+                estimate_tokens_from_characters(
+                    f"{material.title}\n{material.section or ''}\n{material.text}"
+                )
+                for material in source_material
+            )
+            remaining_source_budget = source_context_budget - explicit_source_tokens
+            if remaining_source_budget > 0:
+                source_material.extend(
+                    KnowledgeContextAssembler().assemble(
+                        retrieval_result,
+                        source_context_budget=remaining_source_budget,
+                    )
+                )
+            elif retrieval_result.matches:
+                retrieval_result.warnings.append(
+                    "Explicit source material used the configured source-context budget; "
+                    "no retrieved material was added."
+                )
         previous_context = None
         if (
             args.previous_lecture_summary
@@ -110,6 +195,11 @@ def main() -> int:
                 tone=args.tone,
                 duration_minutes=args.duration_minutes,
                 constraints=args.constraint,
+            ),
+            metadata=(
+                {"knowledge_retrieval": retrieval_result.model_dump(mode="json")}
+                if retrieval_result is not None
+                else {}
             ),
         )
         router = GenerationRouter(

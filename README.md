@@ -5,15 +5,15 @@ Lecture SLM is a local foundation for fine-tuning a relatively small language mo
 The architecture keeps four concerns separate:
 
 - **Fine-tuning** teaches how the instructor teaches.
-- **RAG and the Obsidian vault** provide what the instructor knows.
+- **Local knowledge retrieval** provides what the instructor knows.
 - **Course profiles** describe who is being taught.
 - **Course history** describes where the class currently is.
 
-The vault/indexing application and its private content remain outside this repository.
+The vault content remains external and private. Knowledge indexing code lives in this repository, while the generated local index is kept in ignored `data/knowledge/` state. Obsidian is an optional editor only; indexing and inference read the vault as a read-only filesystem directory and do not require the Obsidian application.
 
 ## Status
 
-v0 is a repository, schema, evaluation, and Ollama baseline foundation. It does not train a model, ingest a vault, run a vector database, or provide an automatic pedagogy judge.
+The project includes a local SQLite/FTS5 and FastEmbed knowledge-indexing and retrieval path. A real-vault pilot and retrieval-quality evaluation are still pending. It does not train a model or provide an automatic pedagogy judge.
 
 ## Prerequisites
 
@@ -21,6 +21,7 @@ v0 is a repository, schema, evaluation, and Ollama baseline foundation. It does 
 - [`uv`](https://docs.astral.sh/uv/)
 - Ollama
 - A locally available `qwen3.5:9b` Ollama model
+- FastEmbed downloads its embedding model locally on the first explicit index/retrieval operation; normal tests do not download models.
 
 Install `uv` using the official instructions for your operating system.
 
@@ -80,7 +81,20 @@ uv run python scripts/generate.py --profile standard --task lecture --instructio
 uv run python scripts/generate.py --profile deep --task explanation --instruction "Connect DNS to domain names and IP addresses." --source-file path/to/source.md
 ```
 
-Generation accepts explicit source files and previous-course context; it does not retrieve from or connect to the Obsidian vault. See [docs/GENERATION.md](docs/GENERATION.md) for profiles, planning, context selection, timeout, progress, and opt-in run artifacts.
+Generation accepts explicit source files and previous-course context. Knowledge retrieval remains opt-in; when enabled, retrieved material is converted to the same `SourceMaterial` contract and joined with any explicit source file. See [docs/GENERATION.md](docs/GENERATION.md) for generation details and [docs/KNOWLEDGE.md](docs/KNOWLEDGE.md) for indexing/retrieval operations.
+
+## Local Knowledge
+
+Configure `LECTURE_SLM_VAULT_PATH` or provide a vault path explicitly. The default YAML contains no private path. Indexing is never automatic:
+
+```powershell
+uv run python scripts/index_knowledge.py "D:\Obsidian Vault" --dry-run
+uv run python scripts/index_knowledge.py "D:\Obsidian Vault"
+uv run python scripts/retrieve.py "rules of inference" --source-title "Foundations of Computation" --section "1.6"
+uv run python scripts/generate.py --profile standard --task lecture --instruction "Create a lecture on rules of inference" --retrieve --source-title "Foundations of Computation" --section "1.6"
+```
+
+All generated state stays outside the vault in `data/knowledge/` by default. The indexer never writes to source files. See [docs/KNOWLEDGE.md](docs/KNOWLEDGE.md) for the read-only and privacy guarantees, supported files, configuration, rebuilds, and limitations.
 
 ## Data privacy
 
