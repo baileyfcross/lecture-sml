@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from lecture_slm.knowledge.roles import ChunkRole
+
 RelevanceLabel = Literal["highly_relevant", "relevant", "partially_relevant", "irrelevant"]
 SufficiencyLabel = Literal["sufficient", "partially_sufficient", "insufficient"]
 FailureCategory = Literal[
@@ -36,6 +38,7 @@ class RetrievalEvalCase(BaseModel):
     course: str | None = None
     tags: list[str] = Field(default_factory=list)
     document_types: list[str] = Field(default_factory=list)
+    passage_roles: list[ChunkRole] | None = None
     folder: str | None = None
     page: int | None = Field(default=None, ge=1)
     expected_source_ids: list[str] = Field(default_factory=list)

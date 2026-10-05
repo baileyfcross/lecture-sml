@@ -28,7 +28,7 @@ PDF extraction retains page provenance and current extractor warnings. Image-onl
 
 Indexing is incremental. An unchanged path/hash skips extraction and embedding; changed bytes are extracted and chunked again; existing content-addressed embeddings are reused when their cache key matches model, FastEmbed version, and normalized chunk text. New, changed, unchanged, deleted, failed, reused-chunk, and embedding counts are reported. Failed sources are recorded and retried by a later indexing run. Per-source SQLite transactions ensure a failure does not discard already indexed sources.
 
-The index records schema version, embedding model/provider version, and chunking-strategy version. Incompatible settings fail clearly; `--rebuild` is explicit and resets only the generated index, never source files. Use separate data directories for different vault roots.
+The index records schema version, embedding model/provider version, and chunking-strategy version. Schema version 2 adds deterministic chunk roles; chunking version 2 assigns those roles during extraction. Existing schema-version-1 indexes must be rebuilt rather than migrated in place. Incompatible settings fail clearly; `--rebuild` is explicit and resets only the generated index, never source files. Use separate data directories for different vault roots.
 
 ## Chunking, embeddings, and search
 
@@ -37,6 +37,8 @@ Chunks are made from existing normalized sections, not arbitrary whole-document 
 FastEmbed is behind an embedding-provider protocol. The default model is `BAAI/bge-small-en-v1.5`; query and passage APIs are used separately. Vectors are float32 data in SQLite and cosine similarity is computed locally with NumPy. The vector dimension comes from FastEmbed's model metadata rather than a hard-coded constant.
 
 SQLite FTS5/BM25 provides exact lexical matching over title, section, text, tags, and path. Dense candidates and lexical candidates are fused with Reciprocal Rank Fusion; raw BM25 and cosine scores are not added together. Exact source and section resolution happens before ranking, and transparent title/section boosts are recorded with rank diagnostics. Filters support source, title, section, course, tags, document type, folder, and page. Optional neighbor expansion is bounded. A reranker interface is prepared, but no reranker model is enabled by default.
+
+Each chunk is classified deterministically as `content`, `reference`, `metadata`, or `navigation`. Only content chunks are embedded and eligible for factual retrieval by default; reference lists, administrative blocks, and Obsidian navigation remain indexed for inspection and can be requested explicitly with `scripts/retrieve.py --include-role`. Inferred document-title mentions are soft signals unless the query is a high-confidence document lookup; explicitly supplied source filters remain hard constraints. A small query-term-coverage boost is reported alongside the unchanged RRF ranking signals. Neighbor expansion is content-only by default and remains within the same page or slide.
 
 ## Retrieval quality evaluation
 
@@ -55,11 +57,14 @@ The dry run counts supported/unsupported files, reports ignored directories and 
 After reviewing the report, explicitly index and inspect status:
 
 ```powershell
+# Only for an existing schema-version-1 index:
+uv run python scripts/index_knowledge.py "D:\Obsidian Vault" --rebuild
+# For a new index or a normal incremental update:
 uv run python scripts/index_knowledge.py "D:\Obsidian Vault"
 uv run python scripts/index_knowledge.py --status
 ```
 
-Index output combines run counters with active format counts, approximate chunk-size distribution, warnings, and failed sources. Successful indexing alone says nothing about retrieval quality.
+Use `--rebuild` once after upgrading a schema-version-1 index to schema version 2; it recreates only the generated local index and embeds content-role chunks. Index output combines run counters with active format and role counts, approximate chunk-size distribution, warnings, and failed sources. Successful indexing alone says nothing about retrieval quality.
 
 Create the private case file at `data/knowledge/evaluation/real-vault.jsonl`. Example shape (replace the query with one you selected manually; fill expected values only after checking the indexed source):
 

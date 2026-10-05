@@ -1,7 +1,9 @@
 """Lexical, dense, and deterministic hybrid knowledge retrieval."""
 
 import json
+import re
 import time
+from collections import Counter
 from typing import Any, Protocol
 
 from lecture_slm.knowledge.config import RetrievalConfig
@@ -11,9 +13,11 @@ from lecture_slm.knowledge.models import (
     RetrievalRequest,
     RetrievalResult,
     RetrievalTimings,
+    SourceResolutionStrength,
 )
 from lecture_slm.knowledge.ranking import reciprocal_rank_fusion
 from lecture_slm.knowledge.resolution import SourceResolver, normalize_title
+from lecture_slm.knowledge.roles import ChunkRole
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vector import SQLiteCosineSearch, VectorSearch
 
@@ -114,8 +118,20 @@ class KnowledgeRetriever:
                     "neighbor_additions": [],
                 },
             )
+        explicit_source = bool(request.source_id or request.source_title)
+        strong_lookup = not explicit_source and self.resolver.is_high_confidence_lookup(
+            request.query, source
+        )
+        source_strength = (
+            SourceResolutionStrength.EXPLICIT
+            if explicit_source or strong_lookup
+            else SourceResolutionStrength.INFERRED
+        )
+        hard_source_id = request.source_id or (
+            resolved_source_id if source_strength is SourceResolutionStrength.EXPLICIT else None
+        )
         section, section_ids, section_warning = self.resolver.resolve_section(
-            resolved_source_id, request.section, request.query
+            hard_source_id, request.section, request.query
         )
         if section_warning:
             warnings.append(section_warning)
@@ -169,7 +185,7 @@ class KnowledgeRetriever:
         resolution_seconds = time.perf_counter() - resolution_started
 
         filters = {
-            "source_id": request.source_id or resolved_source_id,
+            "source_id": hard_source_id,
             "source_title": request.source_title,
             "section": request.section or section,
             "course": request.course,
@@ -178,14 +194,28 @@ class KnowledgeRetriever:
             "folder": request.folder,
             "page": request.page,
         }
-        filter_source_id = request.source_id or resolved_source_id
+        filter_source_id = hard_source_id
+        passage_roles = (
+            request.passage_roles
+            if request.passage_roles is not None
+            else self.config.default_passage_roles
+        )
+        if not passage_roles:
+            raise ValueError("At least one passage role must be eligible for retrieval")
+        retrieval_query = _residual_query(
+            request.query,
+            explicit_title=request.source_title if explicit_source else None,
+            resolved_title=(str((source or {}).get("title", "")) if strong_lookup else None),
+            section=request.section if explicit_source else None,
+        )
 
         lexical_started = time.perf_counter()
         lexical_rows = (
             self.store.search_lexical(
-                request.query,
+                retrieval_query,
                 limit=request.lexical_k or self.config.lexical_candidates,
                 source_id=filter_source_id,
+                roles=passage_roles,
             )
             if request.mode in {"lexical", "hybrid"}
             else []
@@ -197,7 +227,7 @@ class KnowledgeRetriever:
         semantic_rows: list[tuple[Any, float]] = []
         if request.mode in {"semantic", "hybrid"}:
             embedding_started = time.perf_counter()
-            query_vector = self.embeddings.embed_query(request.query)
+            query_vector = self.embeddings.embed_query(retrieval_query)
             if query_vector.size != self.embeddings.dimension:
                 raise ValueError(
                     f"Query embedding dimension mismatch: expected {self.embeddings.dimension}, "
@@ -209,6 +239,7 @@ class KnowledgeRetriever:
             semantic_rows = self.vector_search.search(
                 query_vector,
                 source_id=filter_source_id,
+                roles=passage_roles,
                 limit=request.semantic_k or self.config.semantic_candidates,
             )
             semantic_seconds = time.perf_counter() - semantic_started
@@ -258,6 +289,7 @@ class KnowledgeRetriever:
             if candidate["semantic_rank"] is not None
         }
         rrf_constant = request.rrf_constant or self.config.rrf_constant
+        query_terms = _query_terms(retrieval_query)
         if request.mode == "hybrid":
             fused_scores = reciprocal_rank_fusion(
                 lexical_ranks, semantic_ranks, constant=rrf_constant
@@ -267,13 +299,13 @@ class KnowledgeRetriever:
         else:
             fused_scores = {chunk_id: 1.0 / rank for chunk_id, rank in semantic_ranks.items()}
         lexical_diagnostics = [
-            _candidate_diagnostic(chunk_id, candidates[chunk_id], rank, "lexical")
+            _candidate_diagnostic(chunk_id, candidates[chunk_id], rank, "lexical", query_terms)
             for rank, chunk_id in enumerate(
                 sorted(lexical_ranks, key=lambda item: (lexical_ranks[item], item)), start=1
             )
         ]
         semantic_diagnostics = [
-            _candidate_diagnostic(chunk_id, candidates[chunk_id], rank, "semantic")
+            _candidate_diagnostic(chunk_id, candidates[chunk_id], rank, "semantic", query_terms)
             for rank, chunk_id in enumerate(
                 sorted(semantic_ranks, key=lambda item: (semantic_ranks[item], item)), start=1
             )
@@ -295,8 +327,12 @@ class KnowledgeRetriever:
                 score += self.config.exact_section_boost
                 boosts.append("exact_section")
             resolution_reason = str((source or {}).get("resolution_reason", ""))
+            coverage = _term_coverage(query_terms, str(row["text"]))
+            coverage_boost = self.config.query_term_coverage_weight * coverage["coverage"]
+            score += coverage_boost
             boost_diagnostics[chunk_id] = {
                 "source_resolution_boost": source_boost,
+                "source_resolution_strength": source_strength.value if source else None,
                 "resolution_method": resolution_reason or None,
                 "exact_title": source_boost
                 and resolution_reason
@@ -308,6 +344,8 @@ class KnowledgeRetriever:
                 "course": False,
                 "tag": False,
                 "folder": False,
+                "query_term_coverage": coverage,
+                "query_term_coverage_boost": coverage_boost,
             }
             candidate["fused_score"] = score
             fused.append((score, chunk_id, candidate))
@@ -322,6 +360,7 @@ class KnowledgeRetriever:
                     candidate["row"]["active_path"] or candidate["row"]["note_path"]
                 ),
                 "section": candidate["row"]["section_title"],
+                "role": candidate["row"]["role"],
                 "page_number": candidate["row"]["page_number"],
                 "slide_number": candidate["row"]["slide_number"],
                 "lexical_rank": candidate["lexical_rank"],
@@ -334,6 +373,7 @@ class KnowledgeRetriever:
                     if isinstance(applied, bool) and applied
                 ],
                 "boost_details": boost_diagnostics[chunk_id],
+                "query_term_coverage": boost_diagnostics[chunk_id]["query_term_coverage"],
             }
             for rank, (score, chunk_id, candidate) in enumerate(shortlist, start=1)
         ]
@@ -400,6 +440,9 @@ class KnowledgeRetriever:
                 "semantic_candidates": request.semantic_k or self.config.semantic_candidates,
                 "fused_candidates": self.config.fused_candidates,
                 "rrf_constant": rrf_constant,
+                "passage_roles": [role.value for role in passage_roles],
+                "neighbor_roles": [role.value for role in self.config.neighbor_roles],
+                "query_term_coverage_weight": self.config.query_term_coverage_weight,
                 "exact_title_boost": self.config.exact_title_boost,
                 "exact_section_boost": self.config.exact_section_boost,
                 "neighbor_expansion": expansion,
@@ -411,6 +454,8 @@ class KnowledgeRetriever:
                     "requested_title": request.source_title,
                     "requested_id": request.source_id,
                     "resolved": source,
+                    "strength": source_strength.value if source else None,
+                    "hard_constraint_source_id": hard_source_id,
                     "warnings": resolution_warnings,
                 },
                 "section_resolution": {
@@ -425,6 +470,13 @@ class KnowledgeRetriever:
                 "metadata_boosts": boost_diagnostics,
                 "neighbor_additions": neighbor_additions,
                 "final_chunk_ids": [match.chunk_id for match in matches],
+                "query_terms": query_terms,
+                "effective_query": retrieval_query,
+                "eligible_passage_roles": [role.value for role in passage_roles],
+                "role_counts_in_index": self.store.role_stats(),
+                "excluded_non_content_lexical_candidates": self._excluded_lexical_roles(
+                    retrieval_query, filter_source_id, passage_roles, request
+                ),
             },
         )
 
@@ -448,6 +500,10 @@ class KnowledgeRetriever:
         metadata = json.loads(row["metadata_json"])
         if any(metadata.get(key) != value for key, value in request.metadata.items()):
             return False
+        if request.passage_roles and row["role"] not in {
+            role.value for role in request.passage_roles
+        }:
+            return False
         return True
 
     @staticmethod
@@ -467,6 +523,7 @@ class KnowledgeRetriever:
             page_number=row["page_number"],
             slide_number=row["slide_number"],
             text=str(row["text"]),
+            role=ChunkRole(str(row["role"])),
             lexical_rank=candidate["lexical_rank"],
             lexical_score=candidate["lexical_score"],
             semantic_rank=candidate["semantic_rank"],
@@ -490,15 +547,38 @@ class KnowledgeRetriever:
     ) -> list[RetrievalMatch]:
         existing = {match.chunk_id for match in matches}
         additions: list[RetrievalMatch] = []
+        eligible_neighbor_roles = self.config.neighbor_roles
+        if not eligible_neighbor_roles:
+            return matches
         for match in matches:
+            if match.role not in eligible_neighbor_roles:
+                continue
             chunk_index = int(match.metadata["chunk_index"])
+            selected_roles = set(eligible_neighbor_roles)
             neighbor_ids = self.store.connection.execute(
                 """
                 SELECT chunk_id FROM chunks
                 WHERE source_id=? AND chunk_index BETWEEN ? AND ?
+                  AND (
+                    (role='content' AND ?=1)
+                    OR (role='reference' AND ?=1)
+                    OR (role='metadata' AND ?=1)
+                    OR (role='navigation' AND ?=1)
+                  )
+                  AND (? IS NULL OR page_number=?)
+                  AND (? IS NULL OR slide_number=?)
                 ORDER BY chunk_index
                 """,
-                (match.source_id, max(0, chunk_index - expansion), chunk_index + expansion),
+                (
+                    match.source_id,
+                    max(0, chunk_index - expansion),
+                    chunk_index + expansion,
+                    *(int(role in selected_roles) for role in ChunkRole),
+                    match.page_number,
+                    match.page_number,
+                    match.slide_number,
+                    match.slide_number,
+                ),
             ).fetchall()
             wanted = [
                 str(row["chunk_id"])
@@ -524,12 +604,36 @@ class KnowledgeRetriever:
                 existing.add(neighbor.chunk_id)
         return [*matches, *additions]
 
+    def _excluded_lexical_roles(
+        self,
+        query: str,
+        source_id: str | None,
+        eligible_roles: list[ChunkRole],
+        request: RetrievalRequest,
+    ) -> dict[str, int]:
+        if request.mode not in {"lexical", "hybrid"} or set(eligible_roles) == set(ChunkRole):
+            return {}
+        rows = self.store.search_lexical(
+            query,
+            limit=request.lexical_k or self.config.lexical_candidates,
+            source_id=source_id,
+        )
+        eligible = {role.value for role in eligible_roles}
+        return dict(
+            Counter(
+                str(row["role"])
+                for row in rows
+                if str(row["role"]) not in eligible and self._matches_filters(row, request)
+            )
+        )
+
 
 def _candidate_diagnostic(
     chunk_id: str,
     candidate: dict[str, Any],
     rank: int,
     source: str,
+    query_terms: list[str],
 ) -> dict[str, Any]:
     row = candidate["row"]
     return {
@@ -540,8 +644,78 @@ def _candidate_diagnostic(
         "section": row["section_title"],
         "page_number": row["page_number"],
         "slide_number": row["slide_number"],
+        "role": str(row["role"]),
         "rank": rank,
         "score": (
             candidate["lexical_score"] if source == "lexical" else candidate["semantic_score"]
         ),
+        "query_term_coverage": _term_coverage(query_terms, str(row["text"])),
     }
+
+
+_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+
+def _query_terms(value: str) -> list[str]:
+    return list(
+        dict.fromkeys(
+            term
+            for term in re.findall(r"[a-z0-9]+", value.casefold())
+            if term not in _STOP_WORDS and len(term) > 1
+        )
+    )
+
+
+def _term_coverage(query_terms: list[str], text: str) -> dict[str, Any]:
+    text_terms = set(re.findall(r"[a-z0-9]+", text.casefold()))
+    matched_terms = [term for term in query_terms if term in text_terms]
+    return {
+        "query_terms": query_terms,
+        "matched_terms": matched_terms,
+        "coverage": len(matched_terms) / len(query_terms) if query_terms else 0.0,
+    }
+
+
+def _residual_query(
+    query: str,
+    *,
+    explicit_title: str | None,
+    resolved_title: str | None,
+    section: str | None,
+) -> str:
+    source_title = explicit_title or resolved_title
+    if not source_title and not section:
+        return query
+    removed = set(_query_terms(source_title or ""))
+    if resolved_title:
+        removed.update(
+            term
+            for term in re.findall(r"[a-z0-9]+", query.casefold())
+            if term in {"lecture", "chapter", "week", "unit", "lesson", "notes", "document", "pdf"}
+            or term.isdigit()
+        )
+    if section:
+        removed.update(_query_terms(section))
+        removed.add("section")
+    residual = [term for term in re.findall(r"[a-z0-9]+", query.casefold()) if term not in removed]
+    return " ".join(residual) or query

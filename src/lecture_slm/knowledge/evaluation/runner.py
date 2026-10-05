@@ -99,6 +99,7 @@ def run_evaluation(
                 course=case.course,
                 tags=case.tags,
                 document_types=case.document_types,
+                passage_roles=case.passage_roles,
                 folder=case.folder,
                 page=case.page,
                 top_k=top_k,
@@ -140,6 +141,11 @@ def run_evaluation(
                         "course": case.course,
                         "tags": case.tags,
                         "document_types": case.document_types,
+                        "passage_roles": (
+                            [role.value for role in case.passage_roles]
+                            if case.passage_roles is not None
+                            else None
+                        ),
                         "folder": case.folder,
                         "page": case.page,
                         "metadata": case.metadata,
@@ -165,6 +171,18 @@ def run_evaluation(
                     ],
                     "context_assembly": {
                         "candidate_chunks": len(result.matches),
+                        "content_candidates": sum(
+                            match.role.value == "content" for match in result.matches
+                        ),
+                        "excluded_reference": result.diagnostics.get(
+                            "excluded_non_content_lexical_candidates", {}
+                        ).get("reference", 0),
+                        "excluded_metadata": result.diagnostics.get(
+                            "excluded_non_content_lexical_candidates", {}
+                        ).get("metadata", 0),
+                        "excluded_navigation": result.diagnostics.get(
+                            "excluded_non_content_lexical_candidates", {}
+                        ).get("navigation", 0),
                         "selected_chunk_ids": sorted(selected_ids),
                         "selected_chunks": len(selected_ids),
                         "merged_source_materials": len(assembled),
@@ -182,6 +200,9 @@ def run_evaluation(
                             for match in result.matches
                             if match.chunk_id not in selected_ids
                         ],
+                        "role_based_exclusions": result.diagnostics.get(
+                            "excluded_non_content_lexical_candidates", {}
+                        ),
                     },
                 }
             )

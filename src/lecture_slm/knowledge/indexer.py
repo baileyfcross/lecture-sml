@@ -22,6 +22,7 @@ from lecture_slm.knowledge.config import KnowledgeConfig
 from lecture_slm.knowledge.embeddings import EmbeddingProvider, normalize_vectors
 from lecture_slm.knowledge.models import IndexMetrics, KnowledgeChunk
 from lecture_slm.knowledge.obsidian import parse_obsidian_markdown
+from lecture_slm.knowledge.roles import ChunkRole
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vault import (
     VaultFile,
@@ -198,17 +199,18 @@ class KnowledgeIndexer:
     def _embed_missing(
         self, chunks: list[KnowledgeChunk], store: KnowledgeStore
     ) -> tuple[dict[str, str], int, int]:
+        content_chunks = [chunk for chunk in chunks if chunk.role is ChunkRole.CONTENT]
         keys = {
             chunk.chunk_id: embedding_cache_key(
                 self.embeddings.model_name,
                 self.embeddings.provider_version,
                 chunk.text,
             )
-            for chunk in chunks
+            for chunk in content_chunks
         }
         missing: list[KnowledgeChunk] = []
         reused = 0
-        for chunk in chunks:
+        for chunk in content_chunks:
             if store.cache_embedding(keys[chunk.chunk_id]) is None:
                 missing.append(chunk)
             else:

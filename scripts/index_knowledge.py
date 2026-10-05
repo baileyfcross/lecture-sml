@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
+from lecture_slm.knowledge.chunking import CHUNKING_VERSION
 from lecture_slm.knowledge.config import load_knowledge_config
 from lecture_slm.knowledge.embeddings import (
     EmbeddingProvider,
@@ -68,7 +69,7 @@ def main() -> int:
                     config.data_dir,
                     embedding_model=config.embeddings.model,
                     embedding_version=fastembed_provider_version(),
-                    chunking_version="1",
+                    chunking_version=CHUNKING_VERSION,
                 ):
                     pass
             provider = FastEmbedProvider(

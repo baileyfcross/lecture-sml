@@ -10,8 +10,9 @@ from lecture_slm.ingestion.models import NormalizedDocument, NormalizedSection
 from lecture_slm.knowledge.config import ChunkingConfig
 from lecture_slm.knowledge.models import KnowledgeChunk
 from lecture_slm.knowledge.obsidian import remove_frontmatter
+from lecture_slm.knowledge.roles import classify_chunk_role
 
-CHUNKING_VERSION = "1"
+CHUNKING_VERSION = "2"
 _WORD = re.compile(r"\S+")
 
 
@@ -128,6 +129,11 @@ def chunk_document(
                     slide_number=section.slide_number,
                     note_path=relative_path,
                     document_type=document.document_type.value,
+                    role=classify_chunk_role(
+                        " > ".join(section_path) or section_title,
+                        part,
+                        document_type=document.document_type.value,
+                    ),
                     tags=tags,
                     aliases=aliases,
                     outgoing_links=links,

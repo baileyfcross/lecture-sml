@@ -52,6 +52,7 @@ from lecture_slm.knowledge.obsidian import parse_obsidian_markdown
 from lecture_slm.knowledge.ranking import reciprocal_rank_fusion
 from lecture_slm.knowledge.resolution import SourceResolver
 from lecture_slm.knowledge.retrieval import KnowledgeRetriever
+from lecture_slm.knowledge.roles import ChunkRole, classify_chunk_role
 from lecture_slm.knowledge.stats import knowledge_stats
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vault import dry_run_report
@@ -335,9 +336,177 @@ def test_status_is_read_only_and_reports_index_features(tmp_path: Path) -> None:
     assert status["indexed_sources"] == 1
     assert status["indexed_chunks"] > 0
     assert status["fts_available"] is True
-    assert status["schema_version"] == "1"
+    assert status["schema_version"] == "2"
     assert status["chunk_size_tokens"]["minimum"] > 0
     assert status["chunk_size_tokens"]["maximum"] >= status["chunk_size_tokens"]["median"]
+
+
+def test_chunk_roles_exclude_vault_scaffolding_from_factual_retrieval(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "Predicate Logic.md").write_text(
+        """---
+title: Predicate Logic
+aliases: [First Order Logic]
+tags: [logic]
+course: CSC220
+---
+
+# Predicate Logic
+
+## Semantics
+Predicate logic uses quantifiers and variables to express properties and relations.
+
+## Metadata
+2025-06-18 22:54
+Status: #seed
+Tags: [[logic]]
+
+## References
+[[Universal Quantifier.pdf]]
+[[Predicate Calculus.pdf]]
+
+## Linked Full Notes
+```query
+LIST FROM #logic
+```
+[[Universal Quantifier]]
+""",
+        encoding="utf-8",
+    )
+    (vault / "Universal Quantifier.md").write_text(
+        """# Universal Quantifier
+
+## Definition
+Quantifiers and variables allow a predicate to express a property for every object.
+""",
+        encoding="utf-8",
+    )
+    (vault / "Change of Variables.md").write_text(
+        """# Change of Variables
+
+## Substitution
+Variables can be renamed during substitution in an algebraic expression.
+""",
+        encoding="utf-8",
+    )
+    config = knowledge_config(vault, tmp_path / "index")
+    embeddings = FakeEmbeddings()
+    KnowledgeIndexer(config, embeddings).index()
+
+    assert classify_chunk_role("References", "An informative reference paragraph.") == (
+        ChunkRole.REFERENCE
+    )
+    assert classify_chunk_role("Semantics", "A concise factual definition.") == (ChunkRole.CONTENT)
+    assert classify_chunk_role("Metadata", "Status: #seed\nTags: [[logic]]") == (ChunkRole.METADATA)
+    assert classify_chunk_role("Linked Full Notes", "[[One]]") == ChunkRole.NAVIGATION
+
+    with KnowledgeStore(
+        config.data_dir,
+        embedding_model=embeddings.model_name,
+        embedding_version=embeddings.provider_version,
+        chunking_version=CHUNKING_VERSION,
+    ) as store:
+        rows = store.connection.execute(
+            "SELECT title, section_title, role, embedding_key, outgoing_links_json FROM chunks"
+        ).fetchall()
+        roles_by_section = {
+            str(row["section_title"]): str(row["role"])
+            for row in rows
+            if str(row["title"]) == "Predicate Logic"
+        }
+        assert roles_by_section["Semantics"] == ChunkRole.CONTENT.value
+        assert roles_by_section["Metadata"] == ChunkRole.METADATA.value
+        assert roles_by_section["References"] == ChunkRole.REFERENCE.value
+        assert roles_by_section["Linked Full Notes"] == ChunkRole.NAVIGATION.value
+        assert all(
+            row["embedding_key"] is None
+            for row in rows
+            if str(row["role"]) != ChunkRole.CONTENT.value
+        )
+        assert {
+            "Universal Quantifier.pdf",
+            "Predicate Calculus.pdf",
+            "Universal Quantifier",
+        }.issubset(
+            json.loads(
+                next(
+                    row["outgoing_links_json"]
+                    for row in rows
+                    if row["section_title"] == "References"
+                )
+            )
+        )
+        assert store.role_stats()["reference"]["embedded_chunks"] == 0
+
+        retriever = KnowledgeRetriever(store, embeddings, config.retrieval)
+        default_result = retriever.retrieve(
+            RetrievalRequest(
+                query="quantifiers and variables",
+                mode="lexical",
+                top_k=8,
+                neighbor_expansion=2,
+            )
+        )
+        assert default_result.matches
+        assert all(match.role is ChunkRole.CONTENT for match in default_result.matches)
+        assert any(match.source_title == "Universal Quantifier" for match in default_result.matches)
+        assert any(
+            candidate["query_term_coverage"]["coverage"] == 1.0
+            for candidate in default_result.diagnostics["fused_candidates"]
+        )
+        scaffolding_match = retriever.retrieve(
+            RetrievalRequest(
+                query="Predicate Logic",
+                source_title="Predicate Logic",
+                mode="lexical",
+                top_k=8,
+            )
+        )
+        assert scaffolding_match.diagnostics["excluded_non_content_lexical_candidates"]
+
+        reference_result = retriever.retrieve(
+            RetrievalRequest(
+                query="References",
+                source_title="Predicate Logic",
+                passage_roles=[ChunkRole.REFERENCE],
+                mode="lexical",
+                top_k=4,
+            )
+        )
+        assert reference_result.matches
+        assert all(match.role is ChunkRole.REFERENCE for match in reference_result.matches)
+
+        topical_title_mention = retriever.retrieve(
+            RetrievalRequest(
+                query="Predicate Logic quantifiers variables",
+                mode="lexical",
+                top_k=8,
+            )
+        )
+        assert (
+            topical_title_mention.diagnostics["source_resolution"]["hard_constraint_source_id"]
+            is None
+        )
+        assert len({match.source_title for match in topical_title_mention.matches}) > 1
+        named_source_id = next(
+            str(row["source_id"])
+            for row in store.source_records()
+            if str(row["title"]) == "Predicate Logic"
+        )
+        document_lookup = retriever.retrieve(
+            RetrievalRequest(
+                query="Lecture 5 Predicate Logic",
+                mode="lexical",
+                top_k=8,
+            )
+        )
+        assert (
+            document_lookup.diagnostics["source_resolution"]["hard_constraint_source_id"]
+            == named_source_id
+        )
 
 
 def test_source_resolution_methods_and_ambiguity_are_explicit(tmp_path: Path) -> None:
@@ -500,7 +669,7 @@ def test_version_mismatch_and_vault_boundary_fail_clearly(tmp_path: Path) -> Non
         KnowledgeIndexer(knowledge_config(vault, vault / "index"), embeddings)
     connection = sqlite3.connect(data / "knowledge.sqlite")
     try:
-        connection.execute("UPDATE index_metadata SET value='999' WHERE key='schema_version'")
+        connection.execute("UPDATE index_metadata SET value='1' WHERE key='schema_version'")
         connection.commit()
     finally:
         connection.close()

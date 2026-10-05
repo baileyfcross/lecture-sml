@@ -22,6 +22,7 @@ from lecture_slm.generation.persistence import create_generation_run_directory, 
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.knowledge.assembler import KnowledgeContextAssembler
+from lecture_slm.knowledge.chunking import CHUNKING_VERSION
 from lecture_slm.knowledge.config import load_knowledge_config
 from lecture_slm.knowledge.embeddings import FastEmbedProvider, fastembed_provider_version
 from lecture_slm.knowledge.models import RetrievalRequest
@@ -117,7 +118,7 @@ def main() -> int:
                 knowledge_config.data_dir,
                 embedding_model=knowledge_config.embeddings.model,
                 embedding_version=fastembed_provider_version(),
-                chunking_version="1",
+                chunking_version=CHUNKING_VERSION,
             ):
                 pass
             embedding_provider = FastEmbedProvider(
@@ -130,7 +131,7 @@ def main() -> int:
                 knowledge_config.data_dir,
                 embedding_model=embedding_provider.model_name,
                 embedding_version=embedding_provider.provider_version,
-                chunking_version="1",
+                chunking_version=CHUNKING_VERSION,
             ) as store:
                 retrieval_result = KnowledgeRetriever(
                     store,

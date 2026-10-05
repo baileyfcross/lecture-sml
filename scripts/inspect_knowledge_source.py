@@ -66,6 +66,7 @@ def main() -> int:
             f"section={section_path!r} page={chunk['page_number']} "
             f"slide={chunk['slide_number']} tokens~{chunk['approximate_token_count']}"
         )
+        print(f"Role: {str(chunk['role']).upper()}; embedded: {chunk['embedding_key'] is not None}")
         text = str(chunk["text"])
         if not args.full:
             text = _preview(text, max(80, args.preview_characters))

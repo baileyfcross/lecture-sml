@@ -44,6 +44,11 @@ knowledge:
     rrf_constant: 60
     exact_title_boost: 0.15
     exact_section_boost: 0.15
+    default_passage_roles:
+      - content
+    neighbor_roles:
+      - content
+    query_term_coverage_weight: 0.05
     context_budgets:
       quick: 1500
       standard: 3500

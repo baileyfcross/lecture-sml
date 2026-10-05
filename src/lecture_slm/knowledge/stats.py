@@ -2,8 +2,12 @@
 
 import json
 import sqlite3
+import statistics
 from pathlib import Path
 from typing import Any
+
+from lecture_slm.knowledge.roles import ChunkRole
+from lecture_slm.knowledge.storage import SCHEMA_VERSION
 
 
 def knowledge_stats(data_dir: Path) -> dict[str, Any]:
@@ -26,7 +30,7 @@ def knowledge_stats(data_dir: Path) -> dict[str, Any]:
     connection.row_factory = sqlite3.Row
     try:
         schema_version = _metadata(connection, "schema_version")
-        if schema_version != "1":
+        if schema_version != str(SCHEMA_VERSION):
             raise ValueError(
                 f"Unsupported knowledge schema version {schema_version!r}; "
                 "run index_knowledge.py --rebuild."
@@ -80,6 +84,28 @@ def knowledge_stats(data_dir: Path) -> dict[str, Any]:
                 """
             )
         }
+        role_statistics: dict[str, dict[str, Any]] = {}
+        for role in ChunkRole:
+            rows = connection.execute(
+                """
+                SELECT c.approximate_token_count, c.embedding_key
+                FROM chunks c JOIN sources s USING(source_id)
+                WHERE s.deleted=0 AND s.extraction_status='success' AND c.role=?
+                ORDER BY c.approximate_token_count
+                """,
+                (role.value,),
+            ).fetchall()
+            token_counts = [int(row["approximate_token_count"]) for row in rows]
+            embedded = sum(row["embedding_key"] is not None for row in rows)
+            role_statistics[role.value] = {
+                "count": len(rows),
+                "average_tokens": round(statistics.mean(token_counts), 2) if rows else 0,
+                "median_tokens": statistics.median(token_counts) if rows else 0,
+                "minimum_tokens": min(token_counts, default=0),
+                "maximum_tokens": max(token_counts, default=0),
+                "embedded_chunks": embedded,
+                "non_embedded_chunks": len(rows) - embedded,
+            }
         try:
             connection.execute("SELECT count(*) FROM chunks_fts").fetchone()
             fts_available = True
@@ -119,6 +145,8 @@ def knowledge_stats(data_dir: Path) -> dict[str, Any]:
                 connection.execute("SELECT COUNT(*) FROM sources WHERE deleted=1").fetchone()[0]
             ),
             "formats": formats,
+            "total_chunks": int(indexed_chunks),
+            "role_statistics": role_statistics,
             "schema_version": schema_version,
             "embedding_model": _metadata(connection, "embedding_model"),
             "embedding_dimension": int(dimension_row[0]) if dimension_row else None,

@@ -133,6 +133,36 @@ class SourceResolver:
             return None, set(), f"No extracted heading matched section {section_query}"
         return None, set(), f"No extracted heading matched section '{section_query}'"
 
+    @staticmethod
+    def is_high_confidence_lookup(query: str, source: dict[str, Any] | None) -> bool:
+        """Recognize exact document lookups without treating topical mentions as constraints."""
+
+        if source is None:
+            return False
+        query_terms = normalize_title(query).split()
+        if not query_terms:
+            return False
+        source_names = [
+            str(source.get("title", "")),
+            *(str(path) for path in source.get("paths", [])),
+        ]
+        lookup_terms = {"lecture", "chapter", "week", "unit", "lesson", "notes", "document", "pdf"}
+        for name in source_names:
+            normalized_name = normalize_title(PurePosixPath(name).stem).split()
+            if not normalized_name:
+                continue
+            if query_terms == normalized_name:
+                return True
+            remaining = list(query_terms)
+            for term in normalized_name:
+                if term in remaining:
+                    remaining.remove(term)
+            if len(remaining) <= 2 and all(
+                term in lookup_terms or term.isdigit() for term in remaining
+            ):
+                return True
+        return False
+
 
 def normalize_title(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))

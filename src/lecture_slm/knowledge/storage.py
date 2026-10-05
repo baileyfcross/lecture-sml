@@ -10,8 +10,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from lecture_slm.knowledge.models import KnowledgeChunk
+from lecture_slm.knowledge.roles import ChunkRole
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class KnowledgeStore:
@@ -40,6 +41,7 @@ class KnowledgeStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         try:
+            self._preflight_schema_version()
             self._create_schema()
             self._validate_schema()
             self._validate_index_versions(embedding_model, embedding_version, chunking_version)
@@ -125,6 +127,7 @@ class KnowledgeStore:
                 slide_number INTEGER,
                 note_path TEXT NOT NULL,
                 document_type TEXT NOT NULL,
+                role TEXT NOT NULL,
                 tags_json TEXT NOT NULL,
                 aliases_json TEXT NOT NULL,
                 outgoing_links_json TEXT NOT NULL,
@@ -133,9 +136,10 @@ class KnowledgeStore:
                 approximate_token_count INTEGER NOT NULL,
                 embedding_model TEXT NOT NULL,
                 embedding_version TEXT NOT NULL,
-                embedding_key TEXT NOT NULL REFERENCES embedding_cache(embedding_key)
+                embedding_key TEXT REFERENCES embedding_cache(embedding_key)
             );
             CREATE INDEX IF NOT EXISTS chunks_source_id ON chunks(source_id);
+            CREATE INDEX IF NOT EXISTS chunks_role ON chunks(role);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 chunk_id UNINDEXED,
                 source_id UNINDEXED,
@@ -153,6 +157,21 @@ class KnowledgeStore:
             (str(SCHEMA_VERSION),),
         )
         self.connection.commit()
+
+    def _preflight_schema_version(self) -> None:
+        existing = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_metadata'"
+        ).fetchone()
+        if not existing:
+            return
+        row = self.connection.execute(
+            "SELECT value FROM index_metadata WHERE key='schema_version'"
+        ).fetchone()
+        if row is not None and str(row[0]) != str(SCHEMA_VERSION):
+            raise ValueError(
+                f"Unsupported knowledge schema version {row[0]!r}; expected {SCHEMA_VERSION}. "
+                "Run index_knowledge.py --rebuild."
+            )
 
     def _validate_schema(self) -> None:
         version = self.get_metadata("schema_version")
@@ -418,20 +437,20 @@ class KnowledgeStore:
                 serialized["aliases_json"] = json.dumps(chunk.aliases)
                 serialized["outgoing_links_json"] = json.dumps(chunk.outgoing_links)
                 serialized["metadata_json"] = json.dumps(chunk.metadata, ensure_ascii=False)
-                serialized["embedding_key"] = embedding_keys[chunk.chunk_id]
+                serialized["embedding_key"] = embedding_keys.get(chunk.chunk_id)
                 self.connection.execute(
                     """
                     INSERT INTO chunks(
                         chunk_id, source_id, source_hash, source_version, title, section_title,
                         section_path_json, text, chunk_index, previous_chunk_id, next_chunk_id,
-                        page_number, slide_number, note_path, document_type, tags_json,
+                        page_number, slide_number, note_path, document_type, role, tags_json,
                         aliases_json, outgoing_links_json, course, metadata_json,
                         approximate_token_count, embedding_model, embedding_version, embedding_key
                     ) VALUES (
                         :chunk_id, :source_id, :source_hash, :source_version, :title,
                         :section_title,
                         :section_path_json, :text, :chunk_index, :previous_chunk_id, :next_chunk_id,
-                        :page_number, :slide_number, :note_path, :document_type, :tags_json,
+                        :page_number, :slide_number, :note_path, :document_type, :role, :tags_json,
                         :aliases_json, :outgoing_links_json, :course, :metadata_json,
                         :approximate_token_count, :embedding_model, :embedding_version,
                         :embedding_key
@@ -596,7 +615,10 @@ class KnowledgeStore:
             return False
         return True
 
-    def active_chunk_rows(self) -> list[sqlite3.Row]:
+    def active_chunk_rows(self, *, roles: list[ChunkRole] | None = None) -> list[sqlite3.Row]:
+        selected_roles = set(roles or [])
+        parameters: list[Any] = [int(bool(roles))]
+        parameters.extend(int(role in selected_roles) for role in ChunkRole)
         return self.connection.execute(
             """
             SELECT c.*, s.metadata_json AS source_metadata_json,
@@ -604,8 +626,17 @@ class KnowledgeStore:
                     WHERE p.source_id=c.source_id) AS active_path
             FROM chunks c JOIN sources s USING(source_id)
             WHERE s.deleted=0 AND s.extraction_status='success'
+              AND c.embedding_key IS NOT NULL
+              AND (
+                ?=0
+                OR (c.role='content' AND ?=1)
+                OR (c.role='reference' AND ?=1)
+                OR (c.role='metadata' AND ?=1)
+                OR (c.role='navigation' AND ?=1)
+              )
             ORDER BY c.source_id, c.chunk_index
-            """
+            """,
+            parameters,
         ).fetchall()
 
     def stats(self) -> dict[str, Any]:
@@ -635,6 +666,7 @@ class KnowledgeStore:
                 "WHERE deleted=0 AND extraction_status='success' GROUP BY document_type"
             )
         }
+        result["roles"] = self.role_stats()
         result["schema_version"] = self.get_metadata("schema_version")
         result["embedding_model"] = self.get_metadata("embedding_model")
         result["embedding_dimension"] = self.connection.execute(
@@ -669,14 +701,66 @@ class KnowledgeStore:
         ]
         return result
 
+    def role_stats(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for role in ChunkRole:
+            aggregate = self.connection.execute(
+                """
+                SELECT COUNT(*) AS count, AVG(approximate_token_count) AS average,
+                       MIN(approximate_token_count) AS minimum,
+                       MAX(approximate_token_count) AS maximum,
+                       SUM(CASE WHEN embedding_key IS NOT NULL THEN 1 ELSE 0 END) AS embedded
+                FROM chunks c JOIN sources s USING(source_id)
+                WHERE s.deleted=0 AND s.extraction_status='success' AND c.role=?
+                """,
+                (role.value,),
+            ).fetchone()
+            count = int(aggregate["count"])
+            median = 0.0
+            if count:
+                offsets = sorted({(count - 1) // 2, count // 2})
+                values = [
+                    int(
+                        self.connection.execute(
+                            """
+                            SELECT approximate_token_count FROM chunks c
+                            JOIN sources s USING(source_id)
+                            WHERE s.deleted=0 AND s.extraction_status='success' AND c.role=?
+                            ORDER BY c.approximate_token_count LIMIT 1 OFFSET ?
+                            """,
+                            (role.value, offset),
+                        ).fetchone()[0]
+                    )
+                    for offset in offsets
+                ]
+                median = sum(values) / len(values)
+            result[role.value] = {
+                "count": count,
+                "average_tokens": round(float(aggregate["average"] or 0), 2),
+                "median_tokens": median,
+                "minimum_tokens": int(aggregate["minimum"] or 0),
+                "maximum_tokens": int(aggregate["maximum"] or 0),
+                "embedded_chunks": int(aggregate["embedded"] or 0),
+                "non_embedded_chunks": count - int(aggregate["embedded"] or 0),
+            }
+        return result
+
     def search_lexical(
-        self, query: str, *, limit: int, source_id: str | None = None
+        self,
+        query: str,
+        *,
+        limit: int,
+        source_id: str | None = None,
+        roles: list[ChunkRole] | None = None,
     ) -> list[sqlite3.Row]:
         terms = [term.replace('"', '""') for term in query.split() if term.strip()]
         if not terms:
             return []
         match_query = " OR ".join(f'"{term}"' for term in terms)
         parameters: list[Any] = [match_query, source_id, source_id]
+        selected_roles = set(roles or [])
+        parameters.append(int(bool(roles)))
+        parameters.extend(int(role in selected_roles) for role in ChunkRole)
         parameters.append(limit)
         try:
             return self.connection.execute(
@@ -688,6 +772,13 @@ class KnowledgeStore:
                 JOIN sources s USING(source_id)
                 WHERE chunks_fts MATCH ? AND s.deleted=0 AND s.extraction_status='success'
                   AND (? IS NULL OR c.source_id = ?)
+                  AND (
+                    ?=0
+                    OR (c.role='content' AND ?=1)
+                    OR (c.role='reference' AND ?=1)
+                    OR (c.role='metadata' AND ?=1)
+                    OR (c.role='navigation' AND ?=1)
+                  )
                 ORDER BY score ASC, c.chunk_id ASC LIMIT ?
                 """,
                 parameters,

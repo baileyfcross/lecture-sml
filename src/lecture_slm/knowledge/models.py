@@ -1,9 +1,17 @@
 """Typed records for the local knowledge index and retrieval pipeline."""
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from lecture_slm.knowledge.roles import ChunkRole
+
+
+class SourceResolutionStrength(StrEnum):
+    EXPLICIT = "explicit"
+    INFERRED = "inferred"
 
 
 class KnowledgeChunk(BaseModel):
@@ -24,6 +32,7 @@ class KnowledgeChunk(BaseModel):
     slide_number: int | None = Field(default=None, ge=1)
     note_path: str = Field(min_length=1)
     document_type: str = Field(min_length=1)
+    role: ChunkRole = ChunkRole.CONTENT
     tags: list[str] = Field(default_factory=list)
     aliases: list[str] = Field(default_factory=list)
     outgoing_links: list[str] = Field(default_factory=list)
@@ -39,6 +48,7 @@ class RetrievalRequest(BaseModel):
 
     query: str = Field(min_length=1)
     mode: Literal["lexical", "semantic", "hybrid"] = "hybrid"
+    passage_roles: list[ChunkRole] | None = None
     source_title: str | None = None
     source_id: str | None = None
     section: str | None = None
@@ -68,6 +78,7 @@ class RetrievalMatch(BaseModel):
     page_number: int | None = None
     slide_number: int | None = None
     text: str
+    role: ChunkRole = ChunkRole.CONTENT
     lexical_rank: int | None = None
     lexical_score: float | None = None
     semantic_rank: int | None = None

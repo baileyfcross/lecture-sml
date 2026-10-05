@@ -7,10 +7,12 @@ from pathlib import Path
 
 from lecture_slm.generation.context import estimate_tokens_from_characters
 from lecture_slm.knowledge.assembler import KnowledgeContextAssembler
+from lecture_slm.knowledge.chunking import CHUNKING_VERSION
 from lecture_slm.knowledge.config import load_knowledge_config
 from lecture_slm.knowledge.embeddings import FastEmbedProvider, fastembed_provider_version
 from lecture_slm.knowledge.models import RetrievalRequest
 from lecture_slm.knowledge.retrieval import KnowledgeRetriever
+from lecture_slm.knowledge.roles import ChunkRole
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vault import validate_knowledge_paths
 
@@ -30,6 +32,12 @@ def main() -> int:
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--neighbor-expansion", type=int)
     parser.add_argument("--explain", action="store_true")
+    parser.add_argument(
+        "--include-role",
+        action="append",
+        choices=[role.value for role in ChunkRole],
+        help="Also include a non-default role in factual passage retrieval.",
+    )
     parser.add_argument("--full", action="store_true")
     args = parser.parse_args()
     try:
@@ -48,7 +56,7 @@ def main() -> int:
             config.data_dir,
             embedding_model=config.embeddings.model,
             embedding_version=fastembed_provider_version(),
-            chunking_version="1",
+            chunking_version=CHUNKING_VERSION,
         ):
             pass
         provider = FastEmbedProvider(
@@ -59,8 +67,13 @@ def main() -> int:
             config.data_dir,
             embedding_model=provider.model_name,
             embedding_version=provider.provider_version,
-            chunking_version="1",
+            chunking_version=CHUNKING_VERSION,
         ) as store:
+            passage_roles = list(config.retrieval.default_passage_roles)
+            for role in args.include_role or []:
+                selected_role = ChunkRole(role)
+                if selected_role not in passage_roles:
+                    passage_roles.append(selected_role)
             result = KnowledgeRetriever(store, provider, config.retrieval).retrieve(
                 RetrievalRequest(
                     query=args.query,
@@ -74,6 +87,7 @@ def main() -> int:
                     page=args.page,
                     top_k=args.top_k,
                     neighbor_expansion=args.neighbor_expansion,
+                    passage_roles=passage_roles,
                 )
             )
     except (OSError, ValueError) as error:

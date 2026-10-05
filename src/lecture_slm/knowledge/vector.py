@@ -6,6 +6,7 @@ from typing import Any, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
+from lecture_slm.knowledge.roles import ChunkRole
 from lecture_slm.knowledge.storage import KnowledgeStore
 
 
@@ -17,6 +18,7 @@ class VectorSearch(Protocol):
         query_vector: NDArray[np.floating[Any]],
         *,
         source_id: str | None,
+        roles: list[ChunkRole],
         limit: int,
     ) -> list[tuple[Any, float]]: ...
 
@@ -32,9 +34,10 @@ class SQLiteCosineSearch:
         query_vector: NDArray[np.floating[Any]],
         *,
         source_id: str | None,
+        roles: list[ChunkRole],
         limit: int,
     ) -> list[tuple[Any, float]]:
-        rows: Sequence[Any] = self.store.active_chunk_rows()
+        rows: Sequence[Any] = self.store.active_chunk_rows(roles=roles)
         if source_id:
             rows = [row for row in rows if row["source_id"] == source_id]
         scored: list[tuple[Any, float]] = []
@@ -43,6 +46,8 @@ class SQLiteCosineSearch:
         if query_norm == 0:
             raise ValueError("Query embedding has zero magnitude")
         for row in rows:
+            if row["embedding_key"] is None:
+                continue
             vector = self.store.cache_embedding(str(row["embedding_key"]))
             if vector is None:
                 raise ValueError(f"Embedding is missing for indexed chunk {row['chunk_id']}")

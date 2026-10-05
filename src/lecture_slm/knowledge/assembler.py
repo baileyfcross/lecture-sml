@@ -1,11 +1,12 @@
 """Convert retrieval results into the existing generation SourceMaterial contract."""
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from lecture_slm.generation.context import estimate_tokens_from_characters
 from lecture_slm.generation.models import SourceMaterial
 from lecture_slm.knowledge.models import RetrievalMatch, RetrievalResult
+from lecture_slm.knowledge.roles import ChunkRole
 
 
 class KnowledgeContextAssembler:
@@ -16,9 +17,19 @@ class KnowledgeContextAssembler:
     ) -> list[SourceMaterial]:
         if source_context_budget <= 0:
             raise ValueError("source_context_budget must be positive")
-        groups = self._ordered_groups(result.matches)
+        eligible_roles = {
+            str(role)
+            for role in result.diagnostics.get("eligible_passage_roles", [ChunkRole.CONTENT.value])
+        }
+        excluded_roles = Counter(
+            match.role.value for match in result.matches if match.role.value not in eligible_roles
+        )
+        eligible_matches = [match for match in result.matches if match.role.value in eligible_roles]
+        groups = self._ordered_groups(eligible_matches)
         output: list[SourceMaterial] = []
         used_tokens = 0
+        selected_chunk_ids: list[str] = []
+        excluded_budget: list[str] = []
         for group in groups:
             text = _merge_overlap([match.text for match in group])
             if not text.strip():
@@ -31,9 +42,11 @@ class KnowledgeContextAssembler:
             )
             token_count = estimate_tokens_from_characters(rendered)
             if used_tokens + token_count > source_context_budget:
+                excluded_budget.extend(match.chunk_id for match in group)
                 continue
             used_tokens += token_count
             first = group[0]
+            selected_chunk_ids.extend(match.chunk_id for match in group)
             output.append(
                 SourceMaterial(
                     source_id=first.source_id,
@@ -42,6 +55,7 @@ class KnowledgeContextAssembler:
                     text=text,
                     metadata={
                         "source_origin": "retrieved_knowledge",
+                        "chunk_role": first.role.value,
                         "chunk_ids": [match.chunk_id for match in group],
                         "relative_path": first.source_path,
                         "page_numbers": list(
@@ -76,12 +90,24 @@ class KnowledgeContextAssembler:
                     },
                 )
             )
+        result.diagnostics["context_assembly"] = {
+            "candidate_chunks": len(result.matches),
+            "eligible_chunks": len(eligible_matches),
+            "excluded_by_role": dict(excluded_roles),
+            "selected_chunk_ids": selected_chunk_ids,
+            "selected_chunks": len(selected_chunk_ids),
+            "source_material_count": len(output),
+            "estimated_tokens": used_tokens,
+            "configured_budget": source_context_budget,
+            "unused_budget": max(0, source_context_budget - used_tokens),
+            "excluded_by_budget": excluded_budget,
+        }
         return output
 
     @staticmethod
     def _ordered_groups(matches: list[RetrievalMatch]) -> list[list[RetrievalMatch]]:
         by_source_section: dict[
-            tuple[str, str, str, int | None, int | None], list[RetrievalMatch]
+            tuple[str, str, str, int | None, int | None, str], list[RetrievalMatch]
         ] = defaultdict(list)
         for match in matches:
             key = (
@@ -90,6 +116,7 @@ class KnowledgeContextAssembler:
                 " > ".join(match.section_path),
                 match.page_number,
                 match.slide_number,
+                match.role.value,
             )
             by_source_section[key].append(match)
         groups: list[list[RetrievalMatch]] = []

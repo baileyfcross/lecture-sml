@@ -9,6 +9,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from lecture_slm.knowledge.roles import ChunkRole
+
 
 class IndexingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -88,6 +90,9 @@ class RetrievalConfig(BaseModel):
     rrf_constant: int = Field(default=60, gt=0)
     exact_title_boost: float = Field(default=0.15, ge=0.0)
     exact_section_boost: float = Field(default=0.15, ge=0.0)
+    default_passage_roles: list[ChunkRole] = Field(default_factory=lambda: [ChunkRole.CONTENT])
+    neighbor_roles: list[ChunkRole] = Field(default_factory=lambda: [ChunkRole.CONTENT])
+    query_term_coverage_weight: float = Field(default=0.05, ge=0.0, le=0.1)
     context_budgets: dict[str, int] = Field(
         default_factory=lambda: {"quick": 1500, "standard": 3500, "deep": 7000}
     )
