@@ -13,6 +13,8 @@ from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationStage,
     GenerationStatus,
+    GroundingDecision,
+    GroundingReview,
     PreviousCourseContext,
     SourceMaterial,
     TeachingPlan,
@@ -22,6 +24,7 @@ from lecture_slm.generation.plan_schemas import plan_schema_for_task
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.prompts.planner import build_planner_prompt
 from lecture_slm.generation.prompts.writer import build_writer_prompt
+from lecture_slm.generation.reviewer import _factual_sentence_excerpts, _validate_claim_coverage
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
 from lecture_slm.schemas.course import CourseProfile
@@ -29,6 +32,22 @@ from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyPrinciple, PedagogyProfile
 
 ROOT = Path(__file__).parents[1]
+
+
+def _passing_review() -> str:
+    return json.dumps(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": "DNS maps a human-readable domain name to an IP address.",
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                }
+            ],
+            "issues": [],
+        }
+    )
 
 
 class FakeOllamaClient:
@@ -40,12 +59,26 @@ class FakeOllamaClient:
         writer_tokens: int = 64,
         planner_tokens: int = 80,
         planner_eval_duration_ns: int | None = 2_000_000_000,
+        grounding_responses: list[str] | None = None,
+        grounding_failure_at: int | None = None,
+        revision_output: str = "# DNS: revised explanation\n\nA domain name maps to an IP address.",
+        revision_failure: bool = False,
+        writer_output: str = (
+            "# DNS: a concise explanation\n\n"
+            "DNS maps a human-readable domain name to an IP address."
+        ),
     ) -> None:
         self.planner_failure = planner_failure
         self.writer_failure = writer_failure
         self.writer_tokens = writer_tokens
         self.planner_tokens = planner_tokens
         self.planner_eval_duration_ns = planner_eval_duration_ns
+        self.grounding_responses = grounding_responses or []
+        self.grounding_failure_at = grounding_failure_at
+        self.grounding_response_count = 0
+        self.revision_output = revision_output
+        self.revision_failure = revision_failure
+        self.writer_output = writer_output
         self.requests: list[dict[str, Any]] = []
         self.timeouts: list[float] = []
 
@@ -77,6 +110,24 @@ class FakeOllamaClient:
             }
         )
         if format is not None:
+            if format.get("title") == "GroundingReview":
+                self.grounding_response_count += 1
+                if self.grounding_failure_at == self.grounding_response_count:
+                    raise OllamaTimeoutError("grounding review timed out")
+                content = (
+                    self.grounding_responses[self.grounding_response_count - 1]
+                    if self.grounding_response_count <= len(self.grounding_responses)
+                    else _passing_review()
+                )
+                return ChatResponse(
+                    model=model,
+                    content=content,
+                    prompt_tokens=120,
+                    completion_tokens=24,
+                    total_duration_ns=1_000_000_000,
+                    eval_duration_ns=500_000_000,
+                    completion_reason="stop",
+                )
             if self.planner_failure == "timeout":
                 raise OllamaTimeoutError("planner timed out")
             if self.planner_failure == "invalid_json":
@@ -135,11 +186,23 @@ class FakeOllamaClient:
                 completion_reason="stop",
                 thinking_content="private planner trace for metadata test",
             )
+        if system_message and "Revise the supplied complete artifact" in system_message:
+            if self.revision_failure:
+                raise OllamaTimeoutError("grounding revision timed out")
+            return ChatResponse(
+                model=model,
+                content=self.revision_output,
+                prompt_tokens=180,
+                completion_tokens=self.writer_tokens,
+                total_duration_ns=5_000_000_000,
+                eval_duration_ns=4_000_000_000,
+                completion_reason="stop",
+            )
         if self.writer_failure:
             raise OllamaTimeoutError("writer timed out")
         return ChatResponse(
             model=model,
-            content="# DNS: a concise explanation\n\nA domain name maps to an IP address.",
+            content=self.writer_output,
             prompt_tokens=180,
             completion_tokens=self.writer_tokens,
             total_duration_ns=5_000_000_000,
@@ -250,10 +313,10 @@ def test_standard_calls_planner_then_writer_with_structured_context(
         on_progress=events.append,
     )
 
-    assert result.status is GenerationStatus.COMPLETED
+    assert result.status is GenerationStatus.COMPLETED, result.errors
     assert result.planner_result is not None and result.planner_result.plan is not None
-    assert len(fake.requests) == 2
-    planner_request, writer_request = fake.requests
+    assert len(fake.requests) == 3
+    planner_request, writer_request, grounding_request = fake.requests
     assert planner_request["format"] is not None
     assert planner_request["format"]["title"] == "ExplanationPlan"
     assert planner_request["think"] is False
@@ -275,12 +338,21 @@ def test_standard_calls_planner_then_writer_with_structured_context(
         30.0,
         standard_profile.planner.timeout_seconds,
         standard_profile.writer.timeout_seconds,
+        standard_profile.writer.timeout_seconds,
     ]
     assert "Supplied source material" in planner_request["user_message"]
     assert "Previous course context" in planner_request["user_message"]
     assert "Authoritative user request" in writer_request["user_message"]
     assert "Teaching plan to follow" in writer_request["user_message"]
     assert "Supplied source material" in writer_request["user_message"]
+    assert grounding_request["format"]["title"] == "GroundingReview"
+    assert grounding_request["think"] is False
+    assert grounding_request["options"]["temperature"] == 0
+    assert "Authoritative supplied sources" in grounding_request["user_message"]
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.decision is GroundingDecision.PASS
+    assert result.final_output == result.writer_result.raw_response
     assert result.planner_result.timing.generated_tokens == 80
     assert result.planner_result.timing.thinking_enabled is False
     assert result.planner_result.timing.thinking_characters is None
@@ -296,6 +368,8 @@ def test_standard_calls_planner_then_writer_with_structured_context(
         GenerationStage.PLANNING,
         GenerationStage.WRITING,
         GenerationStage.WRITING,
+        GenerationStage.REVIEWING,
+        GenerationStage.REVIEWING,
         GenerationStage.COMPLETE,
     ]
     assert events[1].estimate_rate_source == "fallback"
@@ -418,7 +492,7 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert "private planner trace" not in result.model_dump_json()
     assert fake.requests[1]["think"] is False
     assert fake.requests[1]["options"]["num_predict"] == 4096
-    assert fake.timeouts == [30.0, 1500.0, 1800.0]
+    assert fake.timeouts == [30.0, 1500.0, 1800.0, 1800.0]
     assert result.writer_result is not None
     assert result.writer_result.timing.selected_context in {8192, 16384, 32768}
     assert profiles.profiles[GenerationProfileName.DEEP].review_enabled is False
@@ -518,6 +592,405 @@ def test_writer_timeout_preserves_successful_plan(configs: tuple[Any, Any]) -> N
     assert result.writer_result is not None
     assert result.writer_result.error_type == "OllamaTimeoutError"
     assert result.final_output is None
+
+
+def _revision_required_review(
+    excerpt: str = "The primary motivation for predicate logic was to simplify the web.",
+) -> str:
+    return json.dumps(
+        {
+            "decision": "revision_required",
+            "claim_assessments": [
+                {
+                    "excerpt": excerpt,
+                    "status": "unsupported",
+                }
+            ],
+            "issues": [
+                {
+                    "excerpt": excerpt,
+                    "category": "unsupported_framing",
+                    "reason": "The supplied source does not state this motivation.",
+                    "relevant_source_ids": ["S1"],
+                }
+            ],
+            "revision_instructions": ["Remove the unsupported motivation claim."],
+        }
+    )
+
+
+def test_grounding_review_rejects_inconsistent_decisions() -> None:
+    with pytest.raises(ValidationError):
+        GroundingReview.model_validate(
+            {
+                "decision": "pass",
+                "claim_assessments": [
+                    {
+                        "excerpt": "unsupported claim",
+                        "status": "unsupported",
+                    }
+                ],
+                "issues": [
+                    {
+                        "excerpt": "unsupported claim",
+                        "category": "unsupported_fact",
+                        "reason": "No supporting source.",
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValidationError):
+        GroundingReview.model_validate(
+            {
+                "decision": "revision_required",
+                "claim_assessments": [{"excerpt": "unsupported claim", "status": "unsupported"}],
+                "issues": [],
+            }
+        )
+
+
+def test_claim_coverage_normalizes_markdown_math_and_sentence_quotes() -> None:
+    artifact = (
+        'The **Universal Quantifier** ($∀$) applies to "all members." '
+        "Predicate logic uses predicates."
+    )
+    review = GroundingReview.model_validate(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": (
+                        'The **Universal Quantifier** ($\\forall$) applies to "all members.", '
+                        "Predicate logic uses predicates."
+                    ),
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                },
+            ],
+            "issues": [],
+        }
+    )
+
+    _validate_claim_coverage(artifact, review)
+
+
+def test_claim_coverage_normalizes_alternate_quotes_inside_excerpts() -> None:
+    artifact = 'Predicate logic expresses claims about "all" or "some" members.'
+    review = GroundingReview.model_validate(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": "Predicate logic expresses claims about 'all' or 'some' members.",
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                }
+            ],
+            "issues": [],
+        }
+    )
+
+    _validate_claim_coverage(artifact, review)
+
+
+def test_claim_coverage_preserves_identifiers_inside_inline_math() -> None:
+    artifact = "A one-place predicate $P$ maps an entity to the proposition $P(a)$."
+    review = GroundingReview.model_validate(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": "A one-place predicate P maps an entity to the proposition P(a).",
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                }
+            ],
+            "issues": [],
+        }
+    )
+
+    _validate_claim_coverage(artifact, review)
+
+
+def test_factual_sentence_extraction_skips_labeled_formal_examples() -> None:
+    artifact = (
+        "**Expression:** $\\forall x P(x)$\n"
+        'For example: "$x$ is tall."\n'
+        "This foundation supports rigorous reasoning."
+    )
+
+    assert _factual_sentence_excerpts(artifact) == ["This foundation supports rigorous reasoning."]
+
+
+def test_factual_sentence_extraction_skips_instructional_question_stems() -> None:
+    artifact = (
+        'Consider the statement "All swans are white." How do quantifiers express "all"?\n'
+        "Explain the difference between a free variable and a bound variable. "
+        "Why is binding needed?\n"
+        "Predicate logic uses quantifiers."
+    )
+
+    assert _factual_sentence_excerpts(artifact) == ["Predicate logic uses quantifiers."]
+
+
+def test_claim_coverage_splits_sentence_before_wiki_link() -> None:
+    artifact = (
+        "This resemblance was historically important. "
+        "[[The Decision Problem|The later decision problem]] asked whether a procedure could "
+        "decide every proposition."
+    )
+    review = GroundingReview.model_validate(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": "This resemblance was historically important.",
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                },
+                {
+                    "excerpt": (
+                        "[[The Decision Problem|The later decision problem]] asked whether a "
+                        "procedure could decide every proposition."
+                    ),
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                },
+            ],
+            "issues": [],
+        }
+    )
+
+    _validate_claim_coverage(artifact, review)
+
+
+def test_claim_coverage_rejects_an_unassessed_factual_sentence() -> None:
+    artifact = "Predicate logic uses predicates. Quantifiers bind variables."
+    review = GroundingReview.model_validate(
+        {
+            "decision": "pass",
+            "claim_assessments": [
+                {
+                    "excerpt": "Predicate logic uses predicates.",
+                    "status": "supported",
+                    "source_ids": ["S1"],
+                }
+            ],
+            "issues": [],
+        }
+    )
+
+    with pytest.raises(ValueError, match="omitted 1 factual sentence"):
+        _validate_claim_coverage(artifact, review)
+
+
+def test_grounding_review_revises_once_and_validates_revised_output(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    candidate = "# DNS\n\nThe primary motivation for predicate logic was to simplify the web."
+    revised = "# DNS\n\nDNS maps a human-readable domain name to an IP address."
+    fake = FakeOllamaClient(
+        writer_output=candidate,
+        revision_output=revised,
+        grounding_responses=[
+            _revision_required_review(),
+            _passing_review(),
+        ],
+    )
+    events = []
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD),
+        on_progress=events.append,
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.writer_result is not None and result.writer_result.raw_response == candidate
+    assert result.revision_result is not None
+    assert result.revision_result.raw_response == revised
+    assert result.revision_result.prompt_version == "grounding-revision-v2"
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.decision is GroundingDecision.REVISION_REQUIRED
+    assert (
+        result.initial_grounding_review.review.issues[0].excerpt
+        == "The primary motivation for predicate logic was to simplify the web."
+    )
+    assert result.final_grounding_review is not None
+    assert result.final_grounding_review.review is not None
+    assert result.final_grounding_review.review.decision is GroundingDecision.PASS
+    assert result.final_output == revised
+    assert sum(event.stage is GenerationStage.REVISING for event in events) == 2
+    assert sum(event.stage is GenerationStage.REVIEWING for event in events) == 4
+    assert fake.grounding_response_count == 2
+
+
+def test_unsupported_claims_override_inconsistent_model_pass(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    unsupported_sentence = "Predicate logic is essential to all computer science."
+    contradictory_response = json.dumps(
+        {
+            "decision": "pass",
+            "claims": [
+                {
+                    "claim": unsupported_sentence,
+                    "status": "unsupported",
+                    "sources": [],
+                }
+            ],
+            "issues": [],
+        }
+    )
+    fake = FakeOllamaClient(
+        writer_output=unsupported_sentence,
+        revision_output="DNS maps a human-readable domain name to an IP address.",
+        grounding_responses=[contradictory_response, _passing_review()],
+    )
+
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD)
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.decision is GroundingDecision.REVISION_REQUIRED
+    assert result.initial_grounding_review.review.issues[0].excerpt == unsupported_sentence
+    assert any(
+        "conservatively changed" in note
+        for note in result.initial_grounding_review.review.source_consistency_notes
+    )
+    assert result.final_output == "DNS maps a human-readable domain name to an IP address."
+
+
+def test_grounding_review_fails_closed_after_second_revision_request(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(
+        grounding_responses=[
+            _revision_required_review(),
+            _revision_required_review("Predicate logic is essential to computing."),
+        ],
+        writer_output="The primary motivation for predicate logic was to simplify the web.",
+        revision_output="Predicate logic is essential to computing.",
+    )
+    result = make_pipeline(model, profiles, fake).route(sample_request(GenerationProfileName.DEEP))
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_output is None
+    assert result.revision_result is not None
+    assert result.revision_result.status is GenerationStatus.COMPLETED
+    assert result.final_grounding_review is not None
+    assert result.final_grounding_review.review is not None
+    assert result.final_grounding_review.review.decision is GroundingDecision.REVISION_REQUIRED
+    assert fake.grounding_response_count == 2
+    assert any("one-revision limit" in error for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("fake_options", "expected_record"),
+    [
+        ({"grounding_responses": ["not valid JSON"]}, "initial_grounding_review"),
+        ({"grounding_failure_at": 1}, "initial_grounding_review"),
+        (
+            {
+                "grounding_responses": [_revision_required_review()],
+                "writer_output": (
+                    "The primary motivation for predicate logic was to simplify the web."
+                ),
+                "revision_failure": True,
+            },
+            "revision_result",
+        ),
+        (
+            {
+                "grounding_responses": [
+                    _revision_required_review(),
+                    _passing_review(),
+                ],
+                "writer_output": (
+                    "The primary motivation for predicate logic was to simplify the web."
+                ),
+                "revision_output": "Predicate logic is essential to computing.",
+                "grounding_failure_at": 2,
+            },
+            "final_grounding_review",
+        ),
+    ],
+)
+def test_grounding_stage_errors_fail_closed(
+    configs: tuple[Any, Any],
+    fake_options: dict[str, Any],
+    expected_record: str,
+) -> None:
+    model, profiles = configs
+    result = make_pipeline(model, profiles, FakeOllamaClient(**fake_options)).route(
+        sample_request(GenerationProfileName.STANDARD)
+    )
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_output is None
+    assert getattr(result, expected_record) is not None
+    if expected_record == "initial_grounding_review":
+        assert result.initial_grounding_review.status is GenerationStatus.FAILED
+    if expected_record == "revision_result":
+        assert result.revision_result.status is GenerationStatus.FAILED
+    if expected_record == "final_grounding_review":
+        assert result.final_grounding_review.status is GenerationStatus.FAILED
+
+
+def test_grounding_review_fails_closed_when_claim_ledger_omits_a_sentence(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    candidate = (
+        "DNS maps a human-readable domain name to an IP address. "
+        "Predicate logic is essential to all computer science."
+    )
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(writer_output=candidate),
+    ).route(sample_request(GenerationProfileName.STANDARD))
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_output is None
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.status is GenerationStatus.FAILED
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.decision is GroundingDecision.PASS
+    assert "omitted 1 factual sentence" in (result.initial_grounding_review.error_message or "")
+
+
+@pytest.mark.parametrize(
+    ("profile", "sources"),
+    [
+        (GenerationProfileName.QUICK, True),
+        (GenerationProfileName.STANDARD, False),
+    ],
+)
+def test_grounding_review_is_inactive_for_quick_or_source_free_generation(
+    configs: tuple[Any, Any],
+    profile: GenerationProfileName,
+    sources: bool,
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient()
+    request = sample_request(profile)
+    if not sources:
+        request = request.model_copy(update={"source_material": []})
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is None
+    assert result.revision_result is None
+    assert result.final_grounding_review is None
+    assert fake.grounding_response_count == 0
+    assert result.final_output == result.writer_result.raw_response
 
 
 def test_generation_keeps_model_defaults_separate_from_profile(configs: tuple[Any, Any]) -> None:
@@ -632,6 +1105,9 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
         "planner_prompt.json",
         "plan.json",
         "writer_prompt.json",
+        "writer_output.md",
+        "grounding_review_initial.json",
+        "grounding_review_initial_prompt.json",
         "result.json",
         "output.md",
         "diagnostics.md",
@@ -671,10 +1147,62 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     assert saved_result["planner_result"]["plan"]["task"] == "lecture"
     assert (run_dir / "output.md").read_text(encoding="utf-8") == result.final_output
+    assert (
+        json.loads((run_dir / "grounding_review_initial.json").read_text(encoding="utf-8"))[
+            "review"
+        ]["decision"]
+        == "pass"
+    )
+    saved_review_prompt = json.loads(
+        (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
+    )
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v3"
+    assert "Candidate artifact" in saved_review_prompt["user_message"]
     diagnostics = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
     assert "- Retrieval enabled: yes" in diagnostics
     assert "- Number of retrieved matches: 1" in diagnostics
     assert "- Number of assembled source materials: 1" in diagnostics
+    assert "Initial grounding review" in diagnostics
+
+
+def test_failed_final_grounding_review_persists_both_candidates_and_prompts(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    original = "The primary motivation for predicate logic was to simplify the web."
+    revised = "Predicate logic is essential to computing."
+    request = sample_request(GenerationProfileName.STANDARD)
+    fake = FakeOllamaClient(
+        writer_output=original,
+        revision_output=revised,
+        grounding_responses=[
+            _revision_required_review(),
+            _revision_required_review("Predicate logic is essential to computing."),
+        ],
+    )
+    result = make_pipeline(model, profiles, fake).route(request)
+    run_dir = create_generation_run_directory(tmp_path, request.request_id)
+    save_generation_run(run_dir, request, result)
+
+    names = {path.name for path in run_dir.iterdir()}
+    assert result.status is GenerationStatus.FAILED
+    assert {
+        "writer_output.md",
+        "grounding_review_initial.json",
+        "grounding_review_initial_prompt.json",
+        "grounding_revision.json",
+        "grounding_revision_prompt.json",
+        "revised_output.md",
+        "grounding_review_final.json",
+        "grounding_review_final_prompt.json",
+    } <= names
+    assert "output.md" not in names
+    assert (run_dir / "writer_output.md").read_text(encoding="utf-8") == original
+    assert (run_dir / "revised_output.md").read_text(encoding="utf-8") == revised
+    assert "Predicate logic is essential to computing." in (
+        run_dir / "grounding_review_final.json"
+    ).read_text(encoding="utf-8")
 
 
 def test_quick_persistence_saves_writer_prompt_without_planner_files(

@@ -642,6 +642,7 @@ name = "lecture-slm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "fastembed" },
     { name = "httpx" },
     { name = "numpy" },
@@ -651,6 +652,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "python-pptx" },
     { name = "pyyaml" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -680,6 +682,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'training'" },
     { name = "bitsandbytes", marker = "extra == 'training'" },
     { name = "datasets", marker = "extra == 'training'" },
+    { name = "fastapi", specifier = ">=0.115,<1.0" },
     { name = "fastembed", specifier = ">=0.7,<1.0" },
     { name = "httpx", specifier = ">=0.27,<1.0" },
     { name = "numpy", specifier = ">=2.0,<3.0" },
@@ -694,6 +697,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'training'" },
     { name = "trl", marker = "extra == 'training'" },
     { name = "unsloth", marker = "extra == 'training'" },
+    { name = "uvicorn", specifier = ">=0.30,<1.0" },
 ]
 provides-extras = ["training"]
 

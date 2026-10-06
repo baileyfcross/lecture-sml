@@ -12,7 +12,13 @@ from pydantic import TypeAdapter
 from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationResult,
+    GroundingReviewRecord,
     StageRecord,
+)
+from lecture_slm.generation.prompts.grounding import (
+    build_grounding_review_prompt,
+    build_grounding_revision_prompt,
+    grounding_source_ref_map,
 )
 from lecture_slm.generation.prompts.planner import (
     STANDARD_PLANNER_PROMPT_VERSION,
@@ -91,6 +97,29 @@ def _stage_diagnostic(name: str, record: StageRecord | None, *, used: bool) -> l
     return lines
 
 
+def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> list[str]:
+    lines = [f"## {name}", f"- Used: {'yes' if record is not None else 'no'}"]
+    if record is None:
+        return lines
+    lines.extend(
+        [
+            f"- Status: {record.status.value}",
+            f"- Decision: {record.review.decision.value if record.review is not None else 'n/a'}",
+            f"- Prompt version: {record.prompt_version or 'n/a'}",
+            f"- Duration: {record.timing.duration_seconds if record.timing is not None else 'n/a'}",
+        ]
+    )
+    if record.review is not None:
+        lines.append(f"- Flagged claims: {len(record.review.issues)}")
+        lines.extend(
+            f"  - [{issue.category.value}] {issue.excerpt}: {issue.reason}"
+            for issue in record.review.issues
+        )
+    if record.error_message is not None:
+        lines.append(f"- Error: {record.error_type}: {record.error_message}")
+    return lines
+
+
 def _write_diagnostics(
     directory: Path,
     request: GenerationRequest,
@@ -132,6 +161,16 @@ def _write_diagnostics(
         *_stage_diagnostic("Planner", planner_record, used=planner_used),
         "",
         *_stage_diagnostic("Writer", writer_record, used=writer_used),
+        "",
+        *_grounding_diagnostic("Initial grounding review", result.initial_grounding_review),
+        "",
+        *_stage_diagnostic(
+            "Grounding revision",
+            result.revision_result,
+            used=result.revision_result is not None,
+        ),
+        "",
+        *_grounding_diagnostic("Final grounding review", result.final_grounding_review),
         "",
         "## Files",
     ]
@@ -208,6 +247,92 @@ def save_generation_run(
                 "selected_context": timing.selected_context,
                 "estimated_input_tokens": timing.estimated_input_tokens,
                 "output_budget": timing.output_budget,
+            },
+        )
+    if (
+        result.initial_grounding_review is not None
+        and writer_record is not None
+        and writer_record.raw_response is not None
+    ):
+        (directory / "writer_output.md").write_text(writer_record.raw_response, encoding="utf-8")
+
+    initial_review = result.initial_grounding_review
+    if initial_review is not None:
+        _write_json(directory / "grounding_review_initial.json", initial_review)
+        review_prompt = build_grounding_review_prompt(
+            request,
+            (writer_record.raw_response if writer_record is not None else None) or "",
+        )
+        timing = initial_review.timing
+        _write_json(
+            directory / "grounding_review_initial_prompt.json",
+            {
+                "prompt_version": review_prompt.version,
+                "system_message": review_prompt.system_message,
+                "user_message": review_prompt.user_message,
+                "source_ref_map": grounding_source_ref_map(request),
+                "selected_context": None if timing is None else timing.selected_context,
+                "estimated_input_tokens": (
+                    None if timing is None else timing.estimated_input_tokens
+                ),
+                "output_budget": None if timing is None else timing.output_budget,
+            },
+        )
+
+    revision_record = result.revision_result
+    if revision_record is not None:
+        _write_json(directory / "grounding_revision.json", revision_record)
+        if revision_record.raw_response is not None:
+            (directory / "revised_output.md").write_text(
+                revision_record.raw_response,
+                encoding="utf-8",
+            )
+        if initial_review is not None and initial_review.review is not None:
+            revision_prompt = build_grounding_revision_prompt(
+                request,
+                (writer_record.raw_response if writer_record is not None else None) or "",
+                initial_review.review,
+            )
+            timing = revision_record.timing
+            _write_json(
+                directory / "grounding_revision_prompt.json",
+                {
+                    "prompt_version": revision_prompt.version,
+                    "system_message": revision_prompt.system_message,
+                    "user_message": revision_prompt.user_message,
+                    "source_ref_map": grounding_source_ref_map(request),
+                    "selected_context": None if timing is None else timing.selected_context,
+                    "estimated_input_tokens": (
+                        None if timing is None else timing.estimated_input_tokens
+                    ),
+                    "output_budget": None if timing is None else timing.output_budget,
+                },
+            )
+
+    final_review = result.final_grounding_review
+    if final_review is not None:
+        _write_json(directory / "grounding_review_final.json", final_review)
+        final_candidate = (
+            revision_record.raw_response
+            if revision_record is not None
+            else writer_record.raw_response
+            if writer_record is not None
+            else ""
+        )
+        review_prompt = build_grounding_review_prompt(request, final_candidate or "")
+        timing = final_review.timing
+        _write_json(
+            directory / "grounding_review_final_prompt.json",
+            {
+                "prompt_version": review_prompt.version,
+                "system_message": review_prompt.system_message,
+                "user_message": review_prompt.user_message,
+                "source_ref_map": grounding_source_ref_map(request),
+                "selected_context": None if timing is None else timing.selected_context,
+                "estimated_input_tokens": (
+                    None if timing is None else timing.estimated_input_tokens
+                ),
+                "output_budget": None if timing is None else timing.output_budget,
             },
         )
 

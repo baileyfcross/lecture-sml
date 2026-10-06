@@ -16,7 +16,7 @@ When source material is supplied, the writer grounds not only definitions and te
 
 - **Quick:** one Writer request, no Planner; useful for short explanations, rewriting, single slides, and small edits.
 - **Standard:** concise task-specific Planner request with thinking disabled and temperature 0, then a separate Writer request with thinking disabled. This is the recommended workflow for normal educational artifacts.
-- **Deep:** larger Planner budget/context followed by Writer with configurable context tiers. Reviewer support is represented by a protocol, but review is disabled by default and no automatic judge is implemented.
+- **Deep:** larger Planner budget/context followed by Writer with configurable context tiers. Like Standard, sourced Deep requests receive a bounded source-grounding review and, only when needed, one revision followed by a final review.
 
 Planner failure is explicit and prevents Writer execution. Writer failure retains the completed plan in `GenerationResult`. No silent Planner-to-Quick fallback occurs. Planner retries are profile-configurable, limited to one retry, and currently configured as zero.
 
@@ -29,6 +29,10 @@ Standard and Deep planning are separate: Standard uses concise plan-only wording
 When source material is supplied, the Planner limits factual topics to what those sources support, while retaining freedom to add pedagogical structure and illustrative examples. The Writer treats source scope as higher priority than the teaching plan and omits or narrows unsupported factual plan requirements. Without supplied sources, both stages retain normal model-knowledge behavior.
 
 Planner templates are versioned as `planner-standard-v3` for concise Standard planning and `planner-v2` for Deep planning. The Writer template is `writer-v7`. The selected versions are saved in result metadata.
+
+For Standard and Deep requests with assembled source material, the pipeline reviews the complete Writer candidate against those sources using the configured Ollama model at temperature 0. A typed `GroundingReview` includes a claim-by-claim ledger: every supported factual claim must cite supplied source IDs, and every unsupported ledger entry must match an issue with an exact claim excerpt, category, reason, and revision instructions. Hypothetical examples and formal statements being analyzed are distinguished from narrator assertions. If the model marks a claim unsupported but returns `pass` or omits its issue, the pipeline conservatively creates the missing issue and changes the decision to revision-required; this correction is recorded in source-consistency notes. A required revision receives the complete artifact and review findings; it is limited to one attempt. The revised artifact is reviewed once more, and generation completes only if that final review passes. Reviewer/reviser errors, malformed or incomplete ledgers, invalid source references, or a second revision request fail closed: no unapproved candidate is exposed as `final_output`. The original Writer output and revision candidate remain independently available in result diagnostics. Quick and source-free requests are unchanged, and the existing opt-in `ReviewFeedback` reviewer remains a separate compatibility feature.
+
+The grounding prompts are versioned as `grounding-review-v3` and `grounding-revision-v2`. The review must account for each factual sentence and scan the closing paragraph explicitly; the pipeline also fails closed when its claim ledger omits a sentence. The revision prompt carries only actionable findings rather than the full claim ledger, keeping the complete artifact and relevant source context within the configured context tier. This is a model-based consistency check against the supplied context, not a formal proof that every claim is supported; inspect its findings and retained candidates when source accuracy is critical.
 
 ## Task budgets and context selection
 
@@ -44,7 +48,7 @@ Stage-time estimates use the task-specific output budget. The first model stage 
 
 The pipeline emits `ProgressEvent` callbacks for preparing, planning, writing, reviewing, complete, and failed states. Events can include elapsed time, generated tokens, observed tokens/second, and a clearly approximate remaining-time estimate. The CLI prints these events without logging source documents.
 
-A `GenerationResult` retains Planner and Writer records separately, including timings, tokens, stop reasons, selected contexts, estimated input sizes, errors, final output, model defaults, effective profile, and prompt versions. Reviewer output is an actionable `ReviewFeedback` shape; it has no arbitrary score field.
+A `GenerationResult` retains Planner and Writer records separately, including timings, tokens, stop reasons, selected contexts, estimated input sizes, errors, final output, model defaults, effective profile, and prompt versions. Automatic grounding review records retain the initial and final decisions, structured issue excerpts, timing, and raw response independently from the original Writer output and any revision. The legacy opt-in reviewer returns actionable `ReviewFeedback`; it has no arbitrary score field.
 
 Run persistence is opt-in:
 
@@ -52,8 +56,80 @@ Run persistence is opt-in:
 uv run python scripts/generate.py --profile standard --task lecture --instruction "Create a short introductory lesson about DNS." --save-run
 ```
 
-Saved development artifacts go under ignored `artifacts/generations/<run-id>/`. A run includes `request.json`, the complete `sources.json` and readable `sources.md` for material actually assembled into the request, `result.json`, `diagnostics.md`, and `output.md` when available. Retrieval runs also include `retrieval.json`; stages that ran include their exact prompt snapshots (`planner_prompt.json` and/or `writer_prompt.json`), and a validated Planner result is retained in `plan.json`. These opt-in saved runs are intended for development diagnostics, retrieval and grounding inspection, reproducibility, and investigating whether a questionable claim came from retrieved context or model generation. The stage-separated files preserve Planner success if Writer fails, providing the foundation for future resume from a saved plan. Full resume behavior is not implemented yet.
+Saved development artifacts go under ignored `artifacts/generations/<run-id>/`. A run includes `request.json`, the complete `sources.json` and readable `sources.md` for material actually assembled into the request, `result.json`, `diagnostics.md`, and `output.md` only when a final artifact is approved. Retrieval runs also include `retrieval.json`; stages that ran include their exact prompt snapshots (`planner_prompt.json`, `writer_prompt.json`, and applicable grounding review/revision prompt JSON files), and a validated Planner result is retained in `plan.json`. Grounded runs retain `writer_output.md`, structured `grounding_review_initial.json` and (after revision) `grounding_review_final.json`, and `grounding_revision.json`; `revised_output.md` is retained even when the final review fails. Diagnostics summarize decisions, flagged claim excerpts, errors, and stage timings. These opt-in files support development diagnostics, retrieval and grounding inspection, reproducibility, and investigating whether a questionable claim came from retrieved context or model generation. The stage-separated files preserve Planner success if Writer fails, providing the foundation for future resume from a saved plan. Full resume behavior is not implemented yet.
 
 ## Training boundary
 
 This runtime does not train models or create adapters. Fine-tuning teaches how the instructor teaches; course profiles/context define who is being taught; retrieved sources supply factual knowledge; and caller-provided previous-course context describes where the class currently is. Knowledge indexing/retrieval and the later training pipeline remain separate systems. Retrieval is opt-in with `--retrieve`; existing commands and explicit `--source-file` behavior remain available without it.
+
+## Local HTTP API
+
+The local FastAPI service exposes the same `GenerationService` and `GenerationPipeline` as the CLI. It does not call Ollama as an alternate generation path, and sourced Standard/Deep requests retain the existing grounding review, bounded revision, and final approval rules.
+
+Start the API from the repository root:
+
+```powershell
+uv run python scripts/serve.py --model-config configs/models/lecture-slm.yaml
+```
+
+It binds to `127.0.0.1:8000` by default. Open the interactive Swagger interface at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs); the OpenAPI document is at [http://127.0.0.1:8000/openapi.json](http://127.0.0.1:8000/openapi.json). The launcher also accepts `--generation-config`, `--knowledge-config`, `--host`, and `--port`. Binding to an address other than localhost (for example, `--host 0.0.0.0`) exposes the API to the network and must be an intentional choice. The first version has no authentication and does not enable permissive CORS.
+
+Available endpoints:
+
+- `GET /api/health` reports API process health, configured-model availability, and knowledge-index availability separately.
+- `GET /api/tasks` and `GET /api/profiles` report the configured task and generation profile values.
+- `POST /api/generate` runs one request and returns its status, approved output (or `null`), grounding summary, source counts, timing summary, errors, and optional saved-run path. A pipeline-level grounding failure is returned as a structured `failed` result rather than an HTTP server error.
+- `POST /api/generate/stream` sends Server-Sent Events named `progress` followed by `result`. Progress contains only the existing public `ProgressEvent` metadata; no model reasoning is streamed.
+- `GET /api/runs/{request_id}` returns one of the 100 most recent API results held in process memory. Saved-run artifacts remain the persistent diagnostic record.
+
+Example request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "explanation",
+    "profile": "standard",
+    "instruction": "Explain predicate logic.",
+    "retrieve": true,
+    "retrieval_top_k": 2,
+    "save_run": true
+  }'
+```
+
+PowerShell equivalent:
+
+```powershell
+$body = @{
+  task = "explanation"
+  profile = "standard"
+  instruction = "Explain predicate logic."
+  retrieve = $true
+  retrieval_top_k = 2
+  save_run = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/generate" `
+  -Method Post -ContentType "application/json" -Body $body
+```
+
+A JavaScript/TypeScript client can use the same JSON contract:
+
+```typescript
+const response = await fetch("http://127.0.0.1:8000/api/generate", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    task: "explanation",
+    profile: "standard",
+    instruction: "Explain predicate logic.",
+    retrieve: true,
+    retrieval_top_k: 2,
+  }),
+});
+
+const result = await response.json();
+console.log(result.output);
+```
+
+Quick, Standard, and Deep keep their normal Lecture SLM semantics. The API does not bypass retrieval, grounding, revision limits, or fail-closed behavior, and it does not expose full source documents or internal model configuration in ordinary generation responses.

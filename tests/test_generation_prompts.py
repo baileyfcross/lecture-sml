@@ -2,7 +2,14 @@ from lecture_slm.generation.models import (
     ExplanationPlan,
     GenerationProfileName,
     GenerationRequest,
+    GroundingReview,
     SourceMaterial,
+)
+from lecture_slm.generation.prompts.grounding import (
+    GROUNDING_REVIEW_PROMPT_VERSION,
+    GROUNDING_REVISION_PROMPT_VERSION,
+    build_grounding_review_prompt,
+    build_grounding_revision_prompt,
 )
 from lecture_slm.generation.prompts.planner import (
     PLANNER_PROMPT_VERSION,
@@ -213,3 +220,48 @@ def test_source_free_standard_request_has_no_strict_grounding_policies() -> None
     assert SOURCE_GROUNDING_INSTRUCTIONS not in writer_prompt.system_message
     assert planner_prompt.system_message == STANDARD_PLANNER_SYSTEM_PROMPT
     assert writer_prompt.system_message == WRITER_SYSTEM_PROMPT
+
+
+def test_grounding_review_and_revision_prompts_are_versioned_and_structured() -> None:
+    request = _request()
+    review_prompt = build_grounding_review_prompt(
+        request,
+        "# Predicates\n\nPredicates describe properties of entities.",
+    )
+    review = GroundingReview.model_validate(
+        {
+            "decision": "revision_required",
+            "claim_assessments": [
+                {
+                    "excerpt": "Predicate logic is essential to all computer science.",
+                    "status": "unsupported",
+                }
+            ],
+            "issues": [
+                {
+                    "excerpt": "Predicate logic is essential to all computer science.",
+                    "category": "unsupported_significance",
+                    "reason": "The supplied source does not establish this significance claim.",
+                }
+            ],
+            "revision_instructions": ["Remove the unsupported significance claim."],
+        }
+    )
+    revision_prompt = build_grounding_revision_prompt(
+        request,
+        "# Predicates\n\nPredicates describe properties of entities.",
+        review,
+    )
+
+    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v3"
+    assert "exhaustive claim ledger" in review_prompt.system_message
+    assert "last sentence" in review_prompt.system_message
+    assert "motivation" in review_prompt.system_message
+    assert "S1" in review_prompt.user_message
+    assert revision_prompt.version == GROUNDING_REVISION_PROMPT_VERSION
+    assert revision_prompt.version == "grounding-revision-v2"
+    assert "smallest necessary changes" in revision_prompt.system_message
+    assert "Grounding review findings" in revision_prompt.user_message
+    assert "Predicate logic is essential to all computer science." in revision_prompt.user_message
+    assert '"unsupported_excerpts"' in revision_prompt.user_message
+    assert '"claim_assessments"' not in revision_prompt.user_message

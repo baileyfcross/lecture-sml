@@ -2,10 +2,10 @@
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
@@ -254,6 +254,88 @@ class ReviewFeedback(BaseModel):
     dimensions_to_revisit: list[EvaluationDimension] = Field(default_factory=list)
 
 
+class GroundingDecision(StrEnum):
+    PASS = "pass"  # noqa: S105
+    REVISION_REQUIRED = "revision_required"
+
+
+class GroundingIssueCategory(StrEnum):
+    UNSUPPORTED_FACT = "unsupported_fact"
+    UNSUPPORTED_FRAMING = "unsupported_framing"
+    UNSUPPORTED_HISTORICAL = "unsupported_historical"
+    UNSUPPORTED_SIGNIFICANCE = "unsupported_significance"
+    UNSUPPORTED_CAUSAL = "unsupported_causal"
+    UNSUPPORTED_APPLICATION = "unsupported_application"
+
+
+class GroundingIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    excerpt: str = Field(min_length=1, alias="claim")
+    category: GroundingIssueCategory = Field(alias="kind")
+    reason: str = Field(min_length=1, alias="why")
+    relevant_source_ids: list[str] = Field(default_factory=list, alias="sources")
+
+
+class GroundingClaimStatus(StrEnum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+
+
+class GroundingClaimAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    excerpt: str = Field(min_length=1, alias="claim")
+    status: GroundingClaimStatus = Field(alias="status")
+    source_ids: list[str] = Field(default_factory=list, alias="sources")
+
+    @model_validator(mode="after")
+    def validate_support_evidence(self) -> Self:
+        if self.status is GroundingClaimStatus.SUPPORTED and not self.source_ids:
+            raise ValueError("supported claims must cite at least one supplied source")
+        return self
+
+
+class GroundingReview(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    decision: GroundingDecision
+    claim_assessments: list[GroundingClaimAssessment] = Field(min_length=1, alias="claims")
+    issues: list[GroundingIssue] = Field(default_factory=list)
+    revision_instructions: list[str] = Field(default_factory=list, alias="fixes")
+    source_consistency_notes: list[str] = Field(default_factory=list, alias="notes")
+
+    @model_validator(mode="after")
+    def validate_decision_details(self) -> Self:
+        unsupported = {
+            " ".join(claim.excerpt.split()).casefold()
+            for claim in self.claim_assessments
+            if claim.status is GroundingClaimStatus.UNSUPPORTED
+        }
+        issue_excerpts = {" ".join(issue.excerpt.split()).casefold() for issue in self.issues}
+        if self.decision is GroundingDecision.PASS and (self.issues or unsupported):
+            raise ValueError("a passing grounding review cannot contain unsupported issues")
+        if self.decision is GroundingDecision.REVISION_REQUIRED and not self.issues:
+            raise ValueError("a required revision must identify at least one unsupported issue")
+        if self.decision is GroundingDecision.REVISION_REQUIRED and unsupported != issue_excerpts:
+            raise ValueError(
+                "unsupported claim assessments must match the reported grounding issues"
+            )
+        if self.decision is GroundingDecision.REVISION_REQUIRED and not self.revision_instructions:
+            raise ValueError("a required revision must include revision instructions")
+        return self
+
+
+class GroundingReviewRecord(BaseModel):
+    status: GenerationStatus
+    review: GroundingReview | None = None
+    timing: StageTiming | None = None
+    raw_response: str | None = None
+    prompt_version: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
 class ProgressEvent(BaseModel):
     stage: GenerationStage
     message: str = Field(min_length=1)
@@ -275,6 +357,9 @@ class GenerationResult(BaseModel):
     status: GenerationStatus
     planner_result: StageRecord | None = None
     writer_result: StageRecord | None = None
+    initial_grounding_review: GroundingReviewRecord | None = None
+    revision_result: StageRecord | None = None
+    final_grounding_review: GroundingReviewRecord | None = None
     reviewer_result: ReviewFeedback | None = None
     reviewer_error: str | None = None
     final_output: str | None = None

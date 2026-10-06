@@ -13,6 +13,8 @@ from lecture_slm.generation.models import (
     GenerationResult,
     GenerationStage,
     GenerationStatus,
+    GroundingDecision,
+    GroundingReviewRecord,
     ProgressEvent,
     ReviewFeedback,
     StageRecord,
@@ -25,7 +27,11 @@ from lecture_slm.generation.prompts.writer import (
     WRITER_PROMPT_VERSION,
     build_writer_prompt,
 )
-from lecture_slm.generation.reviewer import GenerationReviewer
+from lecture_slm.generation.reviewer import (
+    GROUNDING_REVIEW_OUTPUT_TOKENS,
+    GenerationReviewer,
+    GroundingStageRunner,
+)
 from lecture_slm.generation.writer import Writer
 from lecture_slm.inference.ollama_client import OllamaClient, OllamaError
 
@@ -66,6 +72,9 @@ class GenerationPipeline:
         writer_record: StageRecord | None = None
         reviewer_feedback = None
         reviewer_error: str | None = None
+        initial_grounding_review: GroundingReviewRecord | None = None
+        revision_record: StageRecord | None = None
+        final_grounding_review: GroundingReviewRecord | None = None
         plan = None
         selected_contexts: dict[str, int] = {}
         estimated_inputs: dict[str, int] = {}
@@ -232,6 +241,153 @@ class GenerationPipeline:
             )
             progress(GenerationStage.FAILED, "Writer failed; any completed plan was preserved")
 
+        grounding_review_enabled = bool(request.source_material) and request.profile.value in {
+            "standard",
+            "deep",
+        }
+        if grounding_review_enabled:
+            final_output = None
+        if status is GenerationStatus.COMPLETED and grounding_review_enabled:
+            grounding_runner = GroundingStageRunner(
+                client=self.client_factory(
+                    self.model_config.inference.host,
+                    profile.writer.timeout_seconds,
+                ),
+                model=self.model_config.ollama_name,
+                model_config=self.model_config,
+                profiles=self.profiles,
+                settings=profile.writer,
+            )
+            self._emit_stage_start(
+                progress,
+                GenerationStage.REVIEWING,
+                "Grounding review: checking claims against supplied sources",
+                GROUNDING_REVIEW_OUTPUT_TOKENS,
+                previous_record=writer_record,
+            )
+            initial_grounding_review = grounding_runner.review(
+                request,
+                writer_record.raw_response or "",
+            )
+            self._emit_stage_complete(
+                progress,
+                GenerationStage.REVIEWING,
+                self._review_as_stage(initial_grounding_review),
+            )
+            self._record_stage_selection(
+                "grounding_review",
+                initial_grounding_review.timing,
+                selected_contexts,
+                estimated_inputs,
+            )
+
+            if initial_grounding_review.status is GenerationStatus.FAILED:
+                status = GenerationStatus.FAILED
+                errors.append(
+                    "Initial grounding review failed: "
+                    f"{initial_grounding_review.error_type}: "
+                    f"{initial_grounding_review.error_message}"
+                )
+                progress(
+                    GenerationStage.FAILED,
+                    "Grounding review failed; the candidate was not approved",
+                )
+            elif (
+                initial_grounding_review.review is not None
+                and initial_grounding_review.review.decision is GroundingDecision.PASS
+            ):
+                final_output = writer_record.raw_response
+            else:
+                review = initial_grounding_review.review
+                if review is None:
+                    status = GenerationStatus.FAILED
+                    errors.append("Initial grounding review completed without a decision")
+                    progress(GenerationStage.FAILED, "Grounding review returned no decision")
+                else:
+                    self._emit_stage_start(
+                        progress,
+                        GenerationStage.REVISING,
+                        "Grounding revision: applying the bounded source-based corrections",
+                        profile.writer.output_budget(request.task),
+                        previous_record=self._review_as_stage(initial_grounding_review),
+                    )
+                    revision_record = grounding_runner.revise(
+                        request,
+                        writer_record.raw_response or "",
+                        review,
+                    )
+                    self._emit_stage_complete(
+                        progress,
+                        GenerationStage.REVISING,
+                        revision_record,
+                    )
+                    self._record_stage_selection(
+                        "grounding_revision",
+                        revision_record.timing,
+                        selected_contexts,
+                        estimated_inputs,
+                    )
+                    if revision_record.status is GenerationStatus.FAILED:
+                        status = GenerationStatus.FAILED
+                        errors.append(
+                            "Grounding revision failed: "
+                            f"{revision_record.error_type}: {revision_record.error_message}"
+                        )
+                        progress(
+                            GenerationStage.FAILED,
+                            "Grounding revision failed; the original candidate was retained",
+                        )
+                    else:
+                        revised_output = revision_record.raw_response or ""
+                        self._emit_stage_start(
+                            progress,
+                            GenerationStage.REVIEWING,
+                            "Final grounding review: validating the revised artifact",
+                            GROUNDING_REVIEW_OUTPUT_TOKENS,
+                            previous_record=revision_record,
+                        )
+                        final_grounding_review = grounding_runner.review(
+                            request,
+                            revised_output,
+                        )
+                        self._emit_stage_complete(
+                            progress,
+                            GenerationStage.REVIEWING,
+                            self._review_as_stage(final_grounding_review),
+                        )
+                        self._record_stage_selection(
+                            "grounding_final_review",
+                            final_grounding_review.timing,
+                            selected_contexts,
+                            estimated_inputs,
+                        )
+                        if final_grounding_review.status is GenerationStatus.FAILED:
+                            status = GenerationStatus.FAILED
+                            errors.append(
+                                "Final grounding review failed: "
+                                f"{final_grounding_review.error_type}: "
+                                f"{final_grounding_review.error_message}"
+                            )
+                            progress(
+                                GenerationStage.FAILED,
+                                "Final grounding review failed; revised candidate was not approved",
+                            )
+                        elif (
+                            final_grounding_review.review is not None
+                            and final_grounding_review.review.decision is GroundingDecision.PASS
+                        ):
+                            final_output = revised_output
+                        else:
+                            status = GenerationStatus.FAILED
+                            errors.append(
+                                "Final grounding review still requires revision; "
+                                "the one-revision limit was reached"
+                            )
+                            progress(
+                                GenerationStage.FAILED,
+                                "Final review still requires revision; revision limit reached",
+                            )
+
         if status is GenerationStatus.COMPLETED and (
             request.enable_review or profile.review_enabled
         ):
@@ -261,6 +417,9 @@ class GenerationPipeline:
             reviewer_feedback=reviewer_feedback,
             reviewer_error=reviewer_error,
             final_output=final_output,
+            initial_grounding_review=initial_grounding_review,
+            revision_record=revision_record,
+            final_grounding_review=final_grounding_review,
         )
 
     def _progress_emitter(
@@ -318,6 +477,24 @@ class GenerationPipeline:
         )
 
     @staticmethod
+    def _review_as_stage(record: GroundingReviewRecord) -> StageRecord:
+        return StageRecord(status=record.status, timing=record.timing)
+
+    @staticmethod
+    def _record_stage_selection(
+        name: str,
+        timing: StageTiming | None,
+        selected_contexts: dict[str, int],
+        estimated_inputs: dict[str, int],
+    ) -> None:
+        if timing is None:
+            return
+        if timing.selected_context is not None:
+            selected_contexts[name] = timing.selected_context
+        if timing.estimated_input_tokens is not None:
+            estimated_inputs[name] = timing.estimated_input_tokens
+
+    @staticmethod
     def _usable_stage_rate(record: StageRecord | None) -> float | None:
         if (
             record is None
@@ -359,6 +536,9 @@ class GenerationPipeline:
         reviewer_feedback: ReviewFeedback | None,
         reviewer_error: str | None,
         final_output: str | None,
+        initial_grounding_review: GroundingReviewRecord | None = None,
+        revision_record: StageRecord | None = None,
+        final_grounding_review: GroundingReviewRecord | None = None,
     ) -> GenerationResult:
         planner_seconds = (
             0.0
@@ -380,6 +560,9 @@ class GenerationPipeline:
             status=status,
             planner_result=planner_record,
             writer_result=writer_record,
+            initial_grounding_review=initial_grounding_review,
+            revision_result=revision_record,
+            final_grounding_review=final_grounding_review,
             reviewer_result=reviewer_feedback,
             reviewer_error=reviewer_error,
             final_output=final_output,
@@ -396,6 +579,22 @@ class GenerationPipeline:
                     None if planner_record is None else planner_record.prompt_version
                 ),
                 "writer_prompt_version": WRITER_PROMPT_VERSION,
+                "grounding_review_enabled": (
+                    bool(request.source_material) and request.profile.value in {"standard", "deep"}
+                ),
+                "grounding_review_prompt_version": (
+                    None
+                    if initial_grounding_review is None
+                    else initial_grounding_review.prompt_version
+                ),
+                "grounding_revision_prompt_version": (
+                    None if revision_record is None else revision_record.prompt_version
+                ),
+                "grounding_final_review_prompt_version": (
+                    None
+                    if final_grounding_review is None
+                    else final_grounding_review.prompt_version
+                ),
                 "planner_duration_seconds": planner_seconds,
                 "writer_duration_seconds": writer_seconds,
                 "profile_sha256": hashlib.sha256(
