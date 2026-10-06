@@ -12,11 +12,16 @@ from lecture_slm.generation.context import select_context_tier
 from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationStatus,
-    GroundingClaimStatus,
+    GroundingClaimAssessment,
+    GroundingClaimClassification,
+    GroundingClaimInput,
     GroundingDecision,
+    GroundingIssue,
     GroundingIssueCategory,
     GroundingReview,
+    GroundingReviewerResponse,
     GroundingReviewRecord,
+    GroundingSupportMethod,
     ReviewFeedback,
     StageRecord,
     StageTiming,
@@ -24,6 +29,7 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.profiles import GenerationProfiles, StageProfile
 from lecture_slm.generation.prompts.grounding import (
+    GROUNDING_REVIEW_PROMPT_VERSION,
     build_grounding_review_prompt,
     build_grounding_revision_prompt,
     grounding_source_ref_map,
@@ -34,79 +40,14 @@ from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, Olla
 GROUNDING_REVIEW_OUTPUT_TOKENS = 4096
 
 
-def _normalize_grounding_review(content: str) -> GroundingReview:
+def _normalize_grounding_review(content: str) -> GroundingReviewerResponse:
     value = json.loads(content)
     if not isinstance(value, dict):
         raise ValueError("Grounding review response must be a JSON object")
-    payload = dict(value)
-    claims_key = "claims" if "claims" in payload else "claim_assessments"
-    fixes_key = "fixes" if "fixes" in payload else "revision_instructions"
-    notes_key = "notes" if "notes" in payload else "source_consistency_notes"
-    claims = payload.get(claims_key)
-    issues = payload.get("issues", [])
-    if not isinstance(claims, list) or not isinstance(issues, list):
-        raise ValueError("Grounding review must include claim assessments and issues lists")
-
-    def excerpt(item: object) -> str | None:
-        if not isinstance(item, dict):
-            return None
-        text = item.get("claim", item.get("excerpt"))
-        return text if isinstance(text, str) else None
-
-    def normalized(text: str) -> str:
-        return " ".join(text.split()).casefold()
-
-    unsupported_claims = [
-        claim
-        for claim in claims
-        if isinstance(claim, dict) and claim.get("status") == GroundingClaimStatus.UNSUPPORTED.value
-    ]
-    issue_excerpts = {normalized(text) for issue in issues if (text := excerpt(issue)) is not None}
-    for claim in unsupported_claims:
-        text = excerpt(claim)
-        if text is not None and normalized(text) not in issue_excerpts:
-            issues.append(
-                {
-                    "claim": text,
-                    "kind": GroundingIssueCategory.UNSUPPORTED_FACT.value,
-                    "why": (
-                        "The reviewer marked this sentence unsupported but omitted issue details; "
-                        "it must remain unapproved until grounded."
-                    ),
-                    "sources": [],
-                }
-            )
-            issue_excerpts.add(normalized(text))
-
-    for issue in list(issues):
-        text = excerpt(issue)
-        claim_excerpts = {
-            normalized(claim_text) for claim in claims if (claim_text := excerpt(claim)) is not None
-        }
-        if text is not None and normalized(text) not in claim_excerpts:
-            claims.append({"claim": text, "status": "unsupported", "sources": []})
-
-    if issues:
-        original_decision = payload.get("decision")
-        payload["decision"] = GroundingDecision.REVISION_REQUIRED.value
-        if original_decision != GroundingDecision.REVISION_REQUIRED.value:
-            notes = payload.get(notes_key)
-            if not isinstance(notes, list):
-                notes = []
-                payload[notes_key] = notes
-            notes.append(
-                "The model marked at least one claim unsupported while returning a pass; "
-                "the decision was conservatively changed to revision_required."
-            )
-        fixes = payload.get(fixes_key)
-        if not isinstance(fixes, list) or not fixes:
-            payload[fixes_key] = [
-                "Remove, narrow, or qualify each sentence unsupported by the supplied sources."
-            ]
-
-    payload[claims_key] = claims
-    payload["issues"] = issues
-    return GroundingReview.model_validate(payload)
+    payload = value
+    if "claims" not in payload and "claim_assessments" in payload:
+        payload = {**payload, "claims": payload["claim_assessments"]}
+    return GroundingReviewerResponse.model_validate(payload)
 
 
 def _sentence_key(text: str) -> str:
@@ -135,7 +76,18 @@ def _sentence_key(text: str) -> str:
         text = text.replace(command, name)
     text = re.sub(r"\\(?:text|mathrm|mathbf)\{([^{}]*)\}", r"\1", text)
     text = re.sub(r"[*`_$]", "", text)
-    text = text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    text = (
+        text.replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+        .replace("‐", "-")
+        .replace("‑", "-")
+        .replace("‒", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("…", "...")
+    )
     text = re.sub(r"""(?<!\w)["']|["'](?!\w)""", "", text)
     text = text.strip().strip("\"'.,;:!?")
     return " ".join(text.split()).casefold()
@@ -203,7 +155,7 @@ def _factual_sentence_excerpts(artifact: str) -> list[str]:
 
 
 def _validate_claim_coverage(artifact: str, review: GroundingReview) -> None:
-    assessed = {_sentence_key(claim.excerpt) for claim in review.claim_assessments}
+    assessed = [_sentence_key(claim.text) for claim in review.claim_assessments]
     missing = [
         sentence
         for sentence in _factual_sentence_excerpts(artifact)
@@ -217,6 +169,179 @@ def _validate_claim_coverage(artifact: str, review: GroundingReview) -> None:
 
 def _claim_covers_sentence(claim: str, sentence: str) -> bool:
     return claim == sentence or re.search(rf"(?<!\w){re.escape(sentence)}(?!\w)", claim) is not None
+
+
+def _direct_match_key(text: str) -> str:
+    text = _sentence_key(text)
+    text = re.sub(r"(?<!\d)[,:;.!?]+|[,:;.!?]+(?!\d)", " ", text)
+    return " ".join(text.split())
+
+
+def prepare_grounding_claims(
+    request: GenerationRequest,
+    artifact: str,
+) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
+    """Assign stable IDs and deterministically resolve obvious source-text matches."""
+    refs = grounding_source_ref_map(request)
+    sources_by_ref = {
+        ref: source for ref, source in zip(refs, request.source_material, strict=True)
+    }
+    inputs = [
+        GroundingClaimInput(claim_id=f"C{index:03d}", text=text)
+        for index, text in enumerate(_factual_sentence_excerpts(artifact), start=1)
+    ]
+    direct: list[GroundingClaimAssessment] = []
+    unresolved: list[GroundingClaimInput] = []
+    for claim in inputs:
+        claim_key = _direct_match_key(claim.text)
+        matched_refs = [
+            ref
+            for ref, source in sources_by_ref.items()
+            if _claim_covers_sentence(_direct_match_key(source.text), claim_key)
+        ]
+        if not matched_refs:
+            unresolved.append(claim)
+            continue
+        direct.append(
+            GroundingClaimAssessment(
+                claim_id=claim.claim_id,
+                text=claim.text,
+                classification=GroundingClaimClassification.DIRECT_SUPPORTED,
+                support_method=GroundingSupportMethod.NORMALIZED_DIRECT_MATCH,
+                source_ids=[sources_by_ref[ref].source_id for ref in matched_refs],
+                supporting_excerpts=[claim.text],
+                reason="Normalized claim text occurs directly in the supplied source.",
+            )
+        )
+    return inputs, direct, unresolved
+
+
+def merge_grounding_review(
+    all_claims: list[GroundingClaimInput],
+    direct_claims: list[GroundingClaimAssessment],
+    reviewer_response: GroundingReviewerResponse | None,
+    source_ref_map: dict[str, str],
+    source_texts: dict[str, str],
+) -> GroundingReview:
+    """Validate reviewer IDs/evidence and assemble the authoritative complete ledger."""
+    unresolved_ids = {claim.claim_id for claim in all_claims} - {
+        claim.claim_id for claim in direct_claims
+    }
+    adjudications = [] if reviewer_response is None else reviewer_response.claim_assessments
+    received_ids = [item.claim_id for item in adjudications]
+    if len(received_ids) != len(set(received_ids)):
+        raise ValueError("Grounding review returned duplicate claim IDs")
+    if set(received_ids) != unresolved_ids:
+        missing = unresolved_ids - set(received_ids)
+        unknown = set(received_ids) - unresolved_ids
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(sorted(missing)))
+        if unknown:
+            details.append("unknown " + ", ".join(sorted(unknown)))
+        raise ValueError("Grounding review claim IDs are incomplete: " + "; ".join(details))
+
+    inputs_by_id = {claim.claim_id: claim for claim in all_claims}
+    merged = list(direct_claims)
+    evidence_failures = 0
+    for assessment in adjudications:
+        claim = inputs_by_id[assessment.claim_id]
+        valid_refs = [
+            source_ref for source_ref in assessment.source_ids if source_ref in source_ref_map
+        ]
+        invalid_refs = [
+            source_ref for source_ref in assessment.source_ids if source_ref not in source_ref_map
+        ]
+        valid_evidence: list[str] = []
+        claim_evidence_failures = 0
+        if assessment.classification is GroundingClaimClassification.SUPPORTED:
+            if not valid_refs:
+                claim_evidence_failures += 1
+            for excerpt in assessment.supporting_excerpts:
+                excerpt_key = _direct_match_key(excerpt)
+                if excerpt_key and any(
+                    _claim_covers_sentence(_direct_match_key(source_text), excerpt_key)
+                    for ref in valid_refs
+                    if (source_text := source_texts.get(ref)) is not None
+                ):
+                    valid_evidence.append(excerpt)
+                else:
+                    claim_evidence_failures += 1
+            if not assessment.supporting_excerpts:
+                claim_evidence_failures += 1
+        classification = assessment.classification
+        reason = assessment.reason
+        category = assessment.category
+        if invalid_refs:
+            claim_evidence_failures += 1
+            classification = GroundingClaimClassification.UNSUPPORTED
+            reason += " Reviewer cited unknown source references."
+        if classification is GroundingClaimClassification.SUPPORTED and claim_evidence_failures:
+            classification = GroundingClaimClassification.UNSUPPORTED
+            reason += " No supporting excerpt was verified in the cited source material."
+        if claim_evidence_failures:
+            evidence_failures += 1
+        if classification is GroundingClaimClassification.UNSUPPORTED and category is None:
+            category = GroundingIssueCategory.UNSUPPORTED_FACT
+        method = {
+            GroundingClaimClassification.SUPPORTED: GroundingSupportMethod.REVIEWER_ENTAILMENT,
+            GroundingClaimClassification.PEDAGOGICAL: GroundingSupportMethod.PEDAGOGICAL,
+            GroundingClaimClassification.UNSUPPORTED: GroundingSupportMethod.UNSUPPORTED,
+        }[classification]
+        mapped_source_ids = [source_ref_map[source_ref] for source_ref in valid_refs]
+        merged.append(
+            GroundingClaimAssessment(
+                claim_id=claim.claim_id,
+                text=claim.text,
+                classification=classification,
+                support_method=method,
+                source_ids=mapped_source_ids,
+                supporting_excerpts=valid_evidence,
+                reason=reason,
+                category=category,
+            )
+        )
+
+    if len(merged) != len(all_claims) or {claim.claim_id for claim in merged} != {
+        claim.claim_id for claim in all_claims
+    }:
+        raise ValueError(
+            "Merged grounding ledger does not cover every extracted claim exactly once"
+        )
+    merged_by_id = {claim.claim_id: claim for claim in merged}
+    merged = [merged_by_id[claim.claim_id] for claim in all_claims]
+
+    issues = [
+        GroundingIssue(
+            claim_id=claim.claim_id,
+            claim=claim.text,
+            kind=claim.category or GroundingIssueCategory.UNSUPPORTED_FACT,
+            why=claim.reason,
+            sources=claim.source_ids,
+        )
+        for claim in merged
+        if claim.classification is GroundingClaimClassification.UNSUPPORTED
+    ]
+    notes = []
+    if evidence_failures:
+        notes.append(
+            f"{evidence_failures} reviewer support decision(s) failed "
+            "programmatic evidence validation."
+        )
+    decision = GroundingDecision.REVISION_REQUIRED if issues else GroundingDecision.PASS
+    return GroundingReview(
+        decision=decision,
+        claims=merged,
+        issues=issues,
+        fixes=(
+            ["Remove, narrow, or qualify each claim without verified source support."]
+            if issues
+            else []
+        ),
+        notes=notes,
+        evidence_validation_failures=evidence_failures,
+        coverage_complete=True,
+    )
 
 
 class GenerationReviewer(Protocol):
@@ -253,7 +378,35 @@ class GroundingStageRunner:
         request: GenerationRequest,
         artifact: str,
     ) -> GroundingReviewRecord:
-        prompt = build_grounding_review_prompt(request, artifact)
+        all_claims, direct_claims, unresolved_claims = prepare_grounding_claims(request, artifact)
+        source_ref_map = grounding_source_ref_map(request)
+        source_texts = {
+            ref: source.text
+            for ref, source in zip(source_ref_map, request.source_material, strict=True)
+        }
+        if not unresolved_claims:
+            try:
+                direct_review = merge_grounding_review(
+                    all_claims,
+                    direct_claims,
+                    None,
+                    source_ref_map,
+                    source_texts,
+                )
+                _validate_claim_coverage(artifact, direct_review)
+            except (ValidationError, ValueError) as error:
+                return GroundingReviewRecord(
+                    status=GenerationStatus.FAILED,
+                    error_type=type(error).__name__,
+                    error_message=self._safe_error(str(error)),
+                )
+            return GroundingReviewRecord(
+                status=GenerationStatus.COMPLETED,
+                review=direct_review,
+                prompt_version=GROUNDING_REVIEW_PROMPT_VERSION,
+            )
+
+        prompt = build_grounding_review_prompt(request, unresolved_claims)
         budget = GROUNDING_REVIEW_OUTPUT_TOKENS
         try:
             selection = select_context_tier(
@@ -287,28 +440,17 @@ class GroundingStageRunner:
                 },
                 think=False,
                 keep_alive=self.model_config.inference.keep_alive,
-                format=GroundingReview.model_json_schema(),
+                format=GroundingReviewerResponse.model_json_schema(),
             )
-            review = _normalize_grounding_review(response.content)
+            reviewer_response = _normalize_grounding_review(response.content)
+            review = merge_grounding_review(
+                all_claims,
+                direct_claims,
+                reviewer_response,
+                source_ref_map,
+                source_texts,
+            )
             _validate_claim_coverage(artifact, review)
-            source_ref_map = grounding_source_ref_map(request)
-            cited_source_refs = {
-                source_id for claim in review.claim_assessments for source_id in claim.source_ids
-            } | {source_id for issue in review.issues for source_id in issue.relevant_source_ids}
-            unknown_source_refs = cited_source_refs - set(source_ref_map)
-            if unknown_source_refs:
-                raise ValueError(
-                    "Grounding review cited unknown source references: "
-                    + ", ".join(sorted(unknown_source_refs))
-                )
-            review_payload = review.model_dump()
-            for claim in review_payload["claim_assessments"]:
-                claim["source_ids"] = [source_ref_map[source] for source in claim["source_ids"]]
-            for issue in review_payload["issues"]:
-                issue["relevant_source_ids"] = [
-                    source_ref_map[source] for source in issue["relevant_source_ids"]
-                ]
-            review = GroundingReview.model_validate(review_payload)
         except (OllamaError, ValidationError, ValueError) as error:
             return GroundingReviewRecord(
                 status=GenerationStatus.FAILED,

@@ -115,7 +115,6 @@ class GenerateResponse(BaseModel):
         result = execution.result
         initial = result.initial_grounding_review
         final = result.final_grounding_review
-        latest_review = final if final is not None else initial
         return cls(
             request_id=result.request_id,
             status=result.status,
@@ -132,9 +131,7 @@ class GenerateResponse(BaseModel):
                     else initial.review.decision.value
                 ),
                 final_decision=(
-                    None
-                    if latest_review is None or latest_review.review is None
-                    else latest_review.review.decision.value
+                    None if final is None or final.review is None else final.review.decision.value
                 ),
             ),
             sources=SourceSummary(

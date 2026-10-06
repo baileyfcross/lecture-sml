@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
@@ -271,6 +271,7 @@ class GroundingIssueCategory(StrEnum):
 class GroundingIssue(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+    claim_id: str | None = Field(default=None, pattern=r"^C\d{3,}$")
     excerpt: str = Field(min_length=1, alias="claim")
     category: GroundingIssueCategory = Field(alias="kind")
     reason: str = Field(min_length=1, alias="why")
@@ -282,47 +283,125 @@ class GroundingClaimStatus(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class GroundingClaimClassification(StrEnum):
+    DIRECT_SUPPORTED = "direct_supported"
+    SUPPORTED = "supported"
+    PEDAGOGICAL = "pedagogical"
+    UNSUPPORTED = "unsupported"
+
+
+class GroundingSupportMethod(StrEnum):
+    NORMALIZED_DIRECT_MATCH = "normalized_direct_match"
+    REVIEWER_ENTAILMENT = "reviewer_entailment"
+    PEDAGOGICAL = "pedagogical"
+    UNSUPPORTED = "unsupported"
+
+
+class GroundingClaimInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    text: str = Field(min_length=1)
+
+
+class GroundingReviewerAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    classification: Literal[
+        GroundingClaimClassification.SUPPORTED,
+        GroundingClaimClassification.PEDAGOGICAL,
+        GroundingClaimClassification.UNSUPPORTED,
+    ]
+    reason: str = Field(min_length=1)
+    source_ids: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("source_refs", "source_ids"),
+        serialization_alias="source_refs",
+    )
+    supporting_excerpts: list[str] = Field(default_factory=list)
+    category: GroundingIssueCategory | None = None
+
+
+class GroundingReviewerResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    claim_assessments: list[GroundingReviewerAssessment] = Field(alias="claims", min_length=1)
+
+
 class GroundingClaimAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    excerpt: str = Field(min_length=1, alias="claim")
-    status: GroundingClaimStatus = Field(alias="status")
-    source_ids: list[str] = Field(default_factory=list, alias="sources")
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    text: str = Field(min_length=1)
+    classification: GroundingClaimClassification
+    support_method: GroundingSupportMethod
+    source_ids: list[str] = Field(default_factory=list)
+    supporting_excerpts: list[str] = Field(default_factory=list)
+    reason: str = Field(min_length=1)
+    category: GroundingIssueCategory | None = None
 
     @model_validator(mode="after")
-    def validate_support_evidence(self) -> Self:
-        if self.status is GroundingClaimStatus.SUPPORTED and not self.source_ids:
-            raise ValueError("supported claims must cite at least one supplied source")
+    def validate_provenance(self) -> Self:
+        expected_method = {
+            GroundingClaimClassification.DIRECT_SUPPORTED: (
+                GroundingSupportMethod.NORMALIZED_DIRECT_MATCH
+            ),
+            GroundingClaimClassification.SUPPORTED: GroundingSupportMethod.REVIEWER_ENTAILMENT,
+            GroundingClaimClassification.PEDAGOGICAL: GroundingSupportMethod.PEDAGOGICAL,
+            GroundingClaimClassification.UNSUPPORTED: GroundingSupportMethod.UNSUPPORTED,
+        }[self.classification]
+        if self.support_method is not expected_method:
+            raise ValueError("claim classification and support method do not agree")
+        if self.classification in {
+            GroundingClaimClassification.DIRECT_SUPPORTED,
+            GroundingClaimClassification.SUPPORTED,
+        } and (not self.source_ids or not self.supporting_excerpts):
+            raise ValueError("supported claims must retain source IDs and evidence excerpts")
         return self
+
+    @property
+    def excerpt(self) -> str:
+        return self.text
+
+    @property
+    def status(self) -> GroundingClaimStatus:
+        return (
+            GroundingClaimStatus.UNSUPPORTED
+            if self.classification is GroundingClaimClassification.UNSUPPORTED
+            else GroundingClaimStatus.SUPPORTED
+        )
 
 
 class GroundingReview(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     decision: GroundingDecision
-    claim_assessments: list[GroundingClaimAssessment] = Field(min_length=1, alias="claims")
+    claim_assessments: list[GroundingClaimAssessment] = Field(default_factory=list, alias="claims")
     issues: list[GroundingIssue] = Field(default_factory=list)
     revision_instructions: list[str] = Field(default_factory=list, alias="fixes")
     source_consistency_notes: list[str] = Field(default_factory=list, alias="notes")
+    evidence_validation_failures: int = Field(default=0, ge=0)
+    coverage_complete: bool = True
 
     @model_validator(mode="after")
     def validate_decision_details(self) -> Self:
         unsupported = {
-            " ".join(claim.excerpt.split()).casefold()
+            claim.claim_id
             for claim in self.claim_assessments
-            if claim.status is GroundingClaimStatus.UNSUPPORTED
+            if claim.classification is GroundingClaimClassification.UNSUPPORTED
         }
-        issue_excerpts = {" ".join(issue.excerpt.split()).casefold() for issue in self.issues}
+        issue_ids = {issue.claim_id for issue in self.issues if issue.claim_id is not None}
         if self.decision is GroundingDecision.PASS and (self.issues or unsupported):
             raise ValueError("a passing grounding review cannot contain unsupported issues")
         if self.decision is GroundingDecision.REVISION_REQUIRED and not self.issues:
             raise ValueError("a required revision must identify at least one unsupported issue")
-        if self.decision is GroundingDecision.REVISION_REQUIRED and unsupported != issue_excerpts:
-            raise ValueError(
-                "unsupported claim assessments must match the reported grounding issues"
-            )
+        if self.decision is GroundingDecision.REVISION_REQUIRED and unsupported != issue_ids:
+            raise ValueError("unsupported claim IDs must match the reported grounding issue IDs")
         if self.decision is GroundingDecision.REVISION_REQUIRED and not self.revision_instructions:
             raise ValueError("a required revision must include revision instructions")
+        if len({claim.claim_id for claim in self.claim_assessments}) != len(self.claim_assessments):
+            raise ValueError("grounding claim IDs must be unique")
         return self
 
 

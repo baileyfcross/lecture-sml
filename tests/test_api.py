@@ -5,6 +5,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from lecture_slm.api.app import create_app
+from lecture_slm.api.models import GenerateResponse
 from lecture_slm.config.loader import load_model_config
 from lecture_slm.generation.models import (
     GenerationProfileName,
@@ -12,11 +13,12 @@ from lecture_slm.generation.models import (
     GenerationResult,
     GenerationStage,
     GenerationStatus,
-    GroundingClaimStatus,
+    GroundingClaimClassification,
     GroundingDecision,
     GroundingIssueCategory,
     GroundingReview,
     GroundingReviewRecord,
+    GroundingSupportMethod,
     ProgressEvent,
     StageRecord,
     StageTiming,
@@ -86,12 +88,16 @@ class FakeService:
                     decision=GroundingDecision.REVISION_REQUIRED,
                     claim_assessments=[
                         {
-                            "excerpt": excerpt,
-                            "status": GroundingClaimStatus.UNSUPPORTED,
+                            "claim_id": "C001",
+                            "text": excerpt,
+                            "classification": GroundingClaimClassification.UNSUPPORTED,
+                            "support_method": GroundingSupportMethod.UNSUPPORTED,
+                            "reason": "No source supports this claim.",
                         }
                     ],
                     issues=[
                         {
+                            "claim_id": "C001",
                             "excerpt": excerpt,
                             "category": GroundingIssueCategory.UNSUPPORTED_FACT,
                             "reason": "No source supports this claim.",
@@ -253,6 +259,34 @@ def test_pipeline_grounding_failure_is_a_normal_response() -> None:
     assert result["grounding"]["final_decision"] == "revision_required"
 
 
+def test_initial_grounding_decision_is_not_reported_as_final() -> None:
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        profile=GenerationProfileName.STANDARD,
+        instruction="Explain predicate logic.",
+    )
+    execution = FakeService(status=GenerationStatus.FAILED).generate(request)
+    result = execution.result
+    assert result.final_grounding_review is not None
+    initial_only_result = result.model_copy(
+        update={
+            "initial_grounding_review": result.final_grounding_review,
+            "final_grounding_review": None,
+        }
+    )
+    response = GenerateResponse.from_execution(
+        GenerationExecution(
+            execution.request,
+            initial_only_result,
+            execution.saved_run_directory,
+            execution.retrieved_count,
+        )
+    )
+
+    assert response.grounding.initial_decision == "revision_required"
+    assert response.grounding.final_decision is None
+
+
 def test_invalid_task_and_profile_are_rejected() -> None:
     client = TestClient(create_app(FakeService()))
     for field, value in (("task", "unknown"), ("profile", "unknown")):
@@ -304,3 +338,31 @@ def test_unknown_run_and_bounded_registry() -> None:
     assert first_id is not None
     assert client.get(f"/api/runs/{first_id}").status_code == 404
     assert client.get("/api/runs/unknown").status_code == 404
+
+
+def test_frontend_build_missing_keeps_api_and_docs_available(tmp_path: Path) -> None:
+    client = TestClient(create_app(FakeService(), frontend_dist=tmp_path))
+
+    root = client.get("/")
+    assert root.status_code == 200
+    assert "web UI has not been built" in root.text
+    assert client.get("/api/tasks").status_code == 200
+    assert client.get("/docs").status_code == 200
+    assert client.get("/openapi.json").status_code == 200
+
+
+def test_built_frontend_is_served_without_capturing_api_routes(tmp_path: Path) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><html><body><main>Lecture SLM UI</main></body></html>",
+        encoding="utf-8",
+    )
+    (assets / "app.css").write_text("body { color: black; }", encoding="utf-8")
+    client = TestClient(create_app(FakeService(), frontend_dist=tmp_path))
+
+    assert "Lecture SLM UI" in client.get("/").text
+    assert client.get("/assets/app.css").text == "body { color: black; }"
+    assert client.get("/api/tasks").status_code == 200
+    assert client.get("/docs").status_code == 200
+    assert client.get("/openapi.json").status_code == 200

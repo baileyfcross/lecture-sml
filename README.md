@@ -92,6 +92,47 @@ uv run python scripts/generate.py --profile deep --task explanation --instructio
 
 Generation accepts explicit source files and previous-course context. Knowledge retrieval remains opt-in; when enabled, retrieved material is converted to the same `SourceMaterial` contract and joined with any explicit source file. See [docs/GENERATION.md](docs/GENERATION.md) for generation details and [docs/KNOWLEDGE.md](docs/KNOWLEDGE.md) for indexing/retrieval operations.
 
+## Local Web Interface
+
+Lecture SLM includes a lightweight browser UI backed by the same local FastAPI service and `GenerationService` as the CLI. Start the API from the repository root:
+
+```powershell
+uv run python scripts/serve.py --model-config configs/models/lecture-slm.yaml
+```
+
+The server binds to `127.0.0.1:8000` by default. For frontend development, install the web dependencies once and run Vite in a second terminal:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Open the local address printed by Vite (normally [http://localhost:5173](http://localhost:5173)). Its development server proxies API requests to FastAPI on `127.0.0.1:8000`.
+
+To build the frontend and serve it directly from FastAPI instead:
+
+```powershell
+cd web
+npm run build
+cd ..
+uv run python scripts/serve.py --model-config configs/models/lecture-slm.yaml
+```
+
+Then open [http://127.0.0.1:8000/](http://127.0.0.1:8000/). The API can still start if the frontend has not been built; the root page will explain how to build it. Swagger remains available at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+
+The web interface lets you:
+
+- Choose a generation task and the Quick, Standard, or Deep profile.
+- Enter a multiline instruction and optionally enable Vault retrieval with a configurable top-k.
+- Follow generation progress and backend timing estimates as they stream.
+- View approved output as Markdown and copy it.
+- Inspect source counts, grounding decisions, timings, errors, and saved-run paths.
+- Distinguish grounding failures (where no output is approved) from API or connection errors.
+- See API, model, and knowledge-index readiness.
+
+The browser communicates with the Lecture SLM API only; it does not call Ollama directly or store prompts and generated output in browser storage. Retrieval and generation settings remain governed by the backend. See [docs/GENERATION.md](docs/GENERATION.md) for the API contract and frontend development details.
+
 ## Local Knowledge
 
 Configure `LECTURE_SLM_VAULT_PATH` or provide a vault path explicitly. The default YAML contains no private path. Indexing is never automatic:

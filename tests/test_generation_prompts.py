@@ -2,7 +2,11 @@ from lecture_slm.generation.models import (
     ExplanationPlan,
     GenerationProfileName,
     GenerationRequest,
+    GroundingClaimAssessment,
+    GroundingClaimClassification,
+    GroundingClaimInput,
     GroundingReview,
+    GroundingSupportMethod,
     SourceMaterial,
 )
 from lecture_slm.generation.prompts.grounding import (
@@ -226,19 +230,24 @@ def test_grounding_review_and_revision_prompts_are_versioned_and_structured() ->
     request = _request()
     review_prompt = build_grounding_review_prompt(
         request,
-        "# Predicates\n\nPredicates describe properties of entities.",
+        [GroundingClaimInput(claim_id="C001", text="Predicates describe properties of entities.")],
     )
     review = GroundingReview.model_validate(
         {
             "decision": "revision_required",
             "claim_assessments": [
-                {
-                    "excerpt": "Predicate logic is essential to all computer science.",
-                    "status": "unsupported",
-                }
+                GroundingClaimAssessment(
+                    claim_id="C001",
+                    text="Predicate logic is essential to all computer science.",
+                    classification=GroundingClaimClassification.UNSUPPORTED,
+                    support_method=GroundingSupportMethod.UNSUPPORTED,
+                    reason="The supplied source does not establish this significance claim.",
+                    category="unsupported_significance",
+                )
             ],
             "issues": [
                 {
+                    "claim_id": "C001",
                     "excerpt": "Predicate logic is essential to all computer science.",
                     "category": "unsupported_significance",
                     "reason": "The supplied source does not establish this significance claim.",
@@ -253,9 +262,9 @@ def test_grounding_review_and_revision_prompts_are_versioned_and_structured() ->
         review,
     )
 
-    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v3"
-    assert "exhaustive claim ledger" in review_prompt.system_message
-    assert "last sentence" in review_prompt.system_message
+    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v4"
+    assert "deterministic source matching" in review_prompt.system_message
+    assert "claim_id" in review_prompt.user_message
     assert "motivation" in review_prompt.system_message
     assert "S1" in review_prompt.user_message
     assert revision_prompt.version == GROUNDING_REVISION_PROMPT_VERSION

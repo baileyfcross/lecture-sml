@@ -30,9 +30,9 @@ When source material is supplied, the Planner limits factual topics to what thos
 
 Planner templates are versioned as `planner-standard-v3` for concise Standard planning and `planner-v2` for Deep planning. The Writer template is `writer-v7`. The selected versions are saved in result metadata.
 
-For Standard and Deep requests with assembled source material, the pipeline reviews the complete Writer candidate against those sources using the configured Ollama model at temperature 0. A typed `GroundingReview` includes a claim-by-claim ledger: every supported factual claim must cite supplied source IDs, and every unsupported ledger entry must match an issue with an exact claim excerpt, category, reason, and revision instructions. Hypothetical examples and formal statements being analyzed are distinguished from narrator assertions. If the model marks a claim unsupported but returns `pass` or omits its issue, the pipeline conservatively creates the missing issue and changes the decision to revision-required; this correction is recorded in source-consistency notes. A required revision receives the complete artifact and review findings; it is limited to one attempt. The revised artifact is reviewed once more, and generation completes only if that final review passes. Reviewer/reviser errors, malformed or incomplete ledgers, invalid source references, or a second revision request fail closed: no unapproved candidate is exposed as `final_output`. The original Writer output and revision candidate remain independently available in result diagnostics. Quick and source-free requests are unchanged, and the existing opt-in `ReviewFeedback` reviewer remains a separate compatibility feature.
+For Standard and Deep requests with assembled source material, each factual sentence receives a deterministic `C001`, `C002`, ... ID. Before any LLM call, conservative normalization handles Markdown, inline math, wiki links, punctuation, and whitespace; exact normalized equality or whole-claim containment in a supplied source class the claim `direct_supported`. These claims retain their source IDs and evidence excerpts and are not sent to the reviewer. Only unresolved claims are sent to Ollama at temperature 0, keyed by claim ID. The reviewer may classify them `supported`, `pedagogical`, or `unsupported`; supported entailments must include source IDs and exact excerpts. The application verifies every excerpt against the cited source and converts unsupported evidence or fabricated source references into unsupported claims. It merges deterministic and reviewer decisions into one ordered ledger and enforces that every extracted claim appears exactly once. Only unsupported claims produce issues and require revision. A required revision receives the complete artifact and findings; it is limited to one attempt and receives the same deterministic pre-pass plus evidence validation in final review. Reviewer/reviser errors, malformed or incomplete IDs, invalid source evidence, or a second revision request fail closed: no unapproved candidate is exposed as `final_output`. The original Writer output and revision candidate remain independently available in result diagnostics. Quick and source-free requests are unchanged, and the existing opt-in `ReviewFeedback` reviewer remains a separate compatibility feature.
 
-The grounding prompts are versioned as `grounding-review-v3` and `grounding-revision-v2`. The review must account for each factual sentence and scan the closing paragraph explicitly; the pipeline also fails closed when its claim ledger omits a sentence. The revision prompt carries only actionable findings rather than the full claim ledger, keeping the complete artifact and relevant source context within the configured context tier. This is a model-based consistency check against the supplied context, not a formal proof that every claim is supported; inspect its findings and retained candidates when source accuracy is critical.
+The grounding prompts are versioned as `grounding-review-v4` and `grounding-revision-v2`. The review prompt contains only unresolved claim IDs, while direct matches are decided locally. Saved grounding JSON preserves each final ledger claim's ID, text, classification, support method, source IDs, evidence excerpts, reason, and any issue category. `diagnostics.md` summarizes direct matches, reviewer decisions, pedagogical and unsupported claims, evidence validation failures, and coverage status. The revision prompt carries actionable findings rather than the full ledger, keeping the complete artifact and relevant source context within the configured context tier. Reviewer entailment remains a model judgment bounded by verifiable source excerpts, not a formal proof; inspect its findings and retained candidates when source accuracy is critical.
 
 ## Task budgets and context selection
 
@@ -133,3 +133,34 @@ console.log(result.output);
 ```
 
 Quick, Standard, and Deep keep their normal Lecture SLM semantics. The API does not bypass retrieval, grounding, revision limits, or fail-closed behavior, and it does not expose full source documents or internal model configuration in ordinary generation responses.
+
+## Local browser interface
+
+The small TypeScript/Vite interface in `web/` talks only to the local HTTP API. For development, start the API in one terminal:
+
+```powershell
+uv run python scripts/serve.py --model-config configs/models/lecture-slm.yaml
+```
+
+Then start the browser UI in another:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+Vite serves the interface on its normal development port and proxies `/api` requests to `http://127.0.0.1:8000`. The browser streams generation through `POST /api/generate/stream`; it does not contact Ollama, load local files, or implement retrieval or grounding itself.
+
+To build and serve the integrated local interface:
+
+```powershell
+cd web
+npm run build
+cd ..
+uv run python scripts/serve.py --model-config configs/models/lecture-slm.yaml
+```
+
+Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/). FastAPI serves the built `web/dist` files when present; without a build, the API still starts and `/` explains how to build the UI. API routes, Swagger at `/docs`, and `/openapi.json` remain available in either case.
+
+Frontend checks are `npm run typecheck`, `npm test`, and `npm run build` from `web/`. Browser preferences are limited to the last task, profile, retrieval toggle, and retrieval top-k in local storage; prompts and generated content are not persisted there.

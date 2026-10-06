@@ -5,10 +5,12 @@ import json
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from lecture_slm.api.models import (
     GenerateRequest,
@@ -45,7 +47,12 @@ class RunRegistry:
             return self._runs.get(request_id)
 
 
-def create_app(service: GenerationService, *, max_retained_runs: int = 100) -> FastAPI:
+def create_app(
+    service: GenerationService,
+    *,
+    max_retained_runs: int = 100,
+    frontend_dist: Path | None = None,
+) -> FastAPI:
     app = FastAPI(
         title="Lecture SLM Local API",
         description="Local HTTP interface to the existing Lecture SLM generation pipeline.",
@@ -54,6 +61,20 @@ def create_app(service: GenerationService, *, max_retained_runs: int = 100) -> F
     registry = RunRegistry(max_retained_runs)
     app.state.generation_service = service
     app.state.run_registry = registry
+    static_root = frontend_dist or Path(__file__).parents[3] / "web" / "dist"
+    index_file = static_root / "index.html"
+    assets_dir = static_root / "assets"
+
+    if index_file.is_file() and assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend-assets")
+
+    @app.get("/", include_in_schema=False, response_model=None)
+    async def frontend() -> Response:
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return PlainTextResponse(
+            "Lecture SLM web UI has not been built. Run `cd web && npm run build`."
+        )
 
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:

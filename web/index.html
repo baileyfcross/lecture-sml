@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="A local browser interface for the Lecture SLM generation pipeline."
+    />
+    <title>Lecture SLM</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Local teaching tool</p>
+          <h1>Lecture SLM</h1>
+          <p class="subtitle">Create grounded teaching materials with your local model.</p>
+        </div>
+        <div class="health">
+          <span id="health-indicator" class="status-dot" aria-hidden="true"></span>
+          <span id="health-label" role="status">Checking local services…</span>
+          <button id="refresh-health" class="button button-quiet" type="button">
+            Refresh status
+          </button>
+        </div>
+      </header>
+
+      <section class="panel request-panel" aria-labelledby="request-heading">
+        <h2 id="request-heading">New generation</h2>
+        <form id="generation-form">
+          <div class="form-grid">
+            <label>
+              Task
+              <select id="task" name="task" required></select>
+            </label>
+            <label>
+              Profile
+              <select id="profile" name="profile" required></select>
+              <span id="profile-purpose" class="field-help"></span>
+            </label>
+          </div>
+
+          <div class="retrieval-controls">
+            <label class="check-label" for="retrieve">
+              <input id="retrieve" name="retrieve" type="checkbox" />
+              Use Vault Sources
+            </label>
+            <label for="top-k">
+              Retrieval Top-K
+              <input id="top-k" name="top-k" type="number" min="1" max="10" value="2" />
+            </label>
+          </div>
+
+          <label for="instruction">
+            Instruction
+            <textarea
+              id="instruction"
+              name="instruction"
+              rows="6"
+              placeholder="What should Lecture SLM create?"
+              required
+            ></textarea>
+          </label>
+          <div class="form-footer">
+            <p id="request-error" class="message message-error" role="alert" hidden></p>
+            <button id="generate" class="button button-primary" type="submit" disabled>
+              Generate
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel progress-panel" aria-labelledby="progress-heading" aria-live="polite">
+        <div class="section-heading">
+          <h2 id="progress-heading">Progress</h2>
+          <span id="generation-label" class="state-label">Idle</span>
+        </div>
+        <p id="progress-message" class="progress-message">Ready when you are.</p>
+        <ol id="stage-list" class="stage-list"></ol>
+        <div class="timing-line">
+          <span id="elapsed">Elapsed: —</span>
+          <span id="estimate"></span>
+        </div>
+      </section>
+
+      <section id="result-section" class="panel result-panel" aria-label="Generation result">
+        <div class="tabs" role="tablist" aria-label="Generation result details">
+          <button id="tab-output" class="tab" type="button" role="tab" aria-selected="true" aria-controls="panel-output" data-tab="output">
+            Output
+          </button>
+          <button id="tab-sources" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-sources" data-tab="sources">
+            Sources
+          </button>
+          <button id="tab-grounding" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-grounding" data-tab="grounding">
+            Grounding
+          </button>
+          <button id="tab-diagnostics" class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-diagnostics" data-tab="diagnostics">
+            Diagnostics
+          </button>
+        </div>
+
+        <section id="panel-output" class="tab-panel" role="tabpanel" aria-labelledby="tab-output" data-panel="output">
+          <div class="section-heading">
+            <h2>Approved output</h2>
+            <button id="copy-output" class="button button-quiet" type="button" disabled>Copy</button>
+          </div>
+          <p id="output-empty" class="empty-state">Your approved output will appear here.</p>
+          <article id="output-markdown" class="markdown-body"></article>
+        </section>
+
+        <section id="panel-sources" class="tab-panel" role="tabpanel" aria-labelledby="tab-sources" data-panel="sources" hidden>
+          <h2>Sources</h2>
+          <dl id="sources-details" class="details-grid"></dl>
+        </section>
+
+        <section id="panel-grounding" class="tab-panel" role="tabpanel" aria-labelledby="tab-grounding" data-panel="grounding" hidden>
+          <h2>Grounding review</h2>
+          <p id="grounding-message" class="empty-state">Grounding information will appear after generation.</p>
+          <dl id="grounding-details" class="details-grid"></dl>
+        </section>
+
+        <section id="panel-diagnostics" class="tab-panel" role="tabpanel" aria-labelledby="tab-diagnostics" data-panel="diagnostics" hidden>
+          <h2>Diagnostics</h2>
+          <dl id="diagnostic-details" class="details-grid"></dl>
+          <div id="diagnostic-errors" class="error-list" hidden>
+            <h3>Errors</h3>
+            <ul id="error-items"></ul>
+          </div>
+          <div class="copy-row">
+            <button id="copy-run-path" class="button button-quiet" type="button" disabled>
+              Copy saved-run path
+            </button>
+            <span id="copy-message" class="field-help" role="status"></span>
+          </div>
+        </section>
+      </section>
+      <footer class="page-footer">Runs locally. The browser communicates only with the Lecture SLM API.</footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

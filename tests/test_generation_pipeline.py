@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,12 @@ from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationStage,
     GenerationStatus,
+    GroundingClaimClassification,
+    GroundingClaimInput,
     GroundingDecision,
     GroundingReview,
+    GroundingReviewerResponse,
+    GroundingSupportMethod,
     PreviousCourseContext,
     SourceMaterial,
     TeachingPlan,
@@ -24,7 +29,12 @@ from lecture_slm.generation.plan_schemas import plan_schema_for_task
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.prompts.planner import build_planner_prompt
 from lecture_slm.generation.prompts.writer import build_writer_prompt
-from lecture_slm.generation.reviewer import _factual_sentence_excerpts, _validate_claim_coverage
+from lecture_slm.generation.reviewer import (
+    _factual_sentence_excerpts,
+    _validate_claim_coverage,
+    merge_grounding_review,
+    prepare_grounding_claims,
+)
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
 from lecture_slm.schemas.course import CourseProfile
@@ -37,17 +47,83 @@ ROOT = Path(__file__).parents[1]
 def _passing_review() -> str:
     return json.dumps(
         {
-            "decision": "pass",
-            "claim_assessments": [
+            "claims": [
                 {
-                    "excerpt": "DNS maps a human-readable domain name to an IP address.",
-                    "status": "supported",
-                    "source_ids": ["S1"],
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "reason": "The source directly states this mapping.",
+                    "source_refs": ["S1"],
+                    "supporting_excerpts": [
+                        "DNS maps a human-readable domain name to an IP address."
+                    ],
                 }
             ],
-            "issues": [],
         }
     )
+
+
+def _default_grounding_review(user_message: str) -> str:
+    claims_match = re.search(
+        r"## Unresolved factual claims to adjudicate\n```json\n(.*?)\n```",
+        user_message,
+        flags=re.DOTALL,
+    )
+    sources_match = re.search(
+        r"## Authoritative supplied sources \(cite source_ref values\)\n```json\n(.*?)\n```",
+        user_message,
+        flags=re.DOTALL,
+    )
+    if claims_match is None or sources_match is None:
+        return _passing_review()
+    claims = json.loads(claims_match.group(1))
+    sources = json.loads(sources_match.group(1))
+    excerpt = sources[0]["text"]
+    return json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": claim["claim_id"],
+                    "classification": "supported",
+                    "reason": "The cited source is the supplied supporting evidence.",
+                    "source_refs": [sources[0]["source_ref"]],
+                    "supporting_excerpts": [excerpt],
+                }
+                for claim in claims
+            ]
+        }
+    )
+
+
+def _assessment(
+    claim_id: str,
+    text: str,
+    *,
+    classification: str = "supported",
+    sources: list[str] | None = None,
+    excerpts: list[str] | None = None,
+    reason: str = "The supplied evidence supports the decision.",
+) -> dict[str, Any]:
+    resolved_sources = sources
+    resolved_excerpts = excerpts
+    if classification == "supported":
+        resolved_sources = ["S1"] if sources is None else sources
+        resolved_excerpts = [text] if excerpts is None else excerpts
+    return {
+        "claim_id": claim_id,
+        "text": text,
+        "classification": classification,
+        "support_method": (
+            "reviewer_entailment"
+            if classification == "supported"
+            else "pedagogical"
+            if classification == "pedagogical"
+            else "unsupported"
+        ),
+        "source_ids": resolved_sources or [],
+        "supporting_excerpts": resolved_excerpts or [],
+        "reason": reason,
+        "category": "unsupported_fact" if classification == "unsupported" else None,
+    }
 
 
 class FakeOllamaClient:
@@ -64,8 +140,7 @@ class FakeOllamaClient:
         revision_output: str = "# DNS: revised explanation\n\nA domain name maps to an IP address.",
         revision_failure: bool = False,
         writer_output: str = (
-            "# DNS: a concise explanation\n\n"
-            "DNS maps a human-readable domain name to an IP address."
+            "# DNS: a concise explanation\n\nDNS maps a domain name to an IP address."
         ),
     ) -> None:
         self.planner_failure = planner_failure
@@ -110,14 +185,14 @@ class FakeOllamaClient:
             }
         )
         if format is not None:
-            if format.get("title") == "GroundingReview":
+            if format.get("title") == "GroundingReviewerResponse":
                 self.grounding_response_count += 1
                 if self.grounding_failure_at == self.grounding_response_count:
                     raise OllamaTimeoutError("grounding review timed out")
                 content = (
                     self.grounding_responses[self.grounding_response_count - 1]
                     if self.grounding_response_count <= len(self.grounding_responses)
-                    else _passing_review()
+                    else _default_grounding_review(user_message)
                 )
                 return ChatResponse(
                     model=model,
@@ -345,7 +420,7 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert "Authoritative user request" in writer_request["user_message"]
     assert "Teaching plan to follow" in writer_request["user_message"]
     assert "Supplied source material" in writer_request["user_message"]
-    assert grounding_request["format"]["title"] == "GroundingReview"
+    assert grounding_request["format"]["title"] == "GroundingReviewerResponse"
     assert grounding_request["think"] is False
     assert grounding_request["options"]["temperature"] == 0
     assert "Authoritative supplied sources" in grounding_request["user_message"]
@@ -599,22 +674,16 @@ def _revision_required_review(
 ) -> str:
     return json.dumps(
         {
-            "decision": "revision_required",
-            "claim_assessments": [
+            "claims": [
                 {
-                    "excerpt": excerpt,
-                    "status": "unsupported",
-                }
-            ],
-            "issues": [
-                {
-                    "excerpt": excerpt,
+                    "claim_id": "C001",
+                    "classification": "unsupported",
+                    "reason": f"The supplied source does not support: {excerpt}",
                     "category": "unsupported_framing",
-                    "reason": "The supplied source does not state this motivation.",
-                    "relevant_source_ids": ["S1"],
+                    "source_refs": [],
+                    "supporting_excerpts": [],
                 }
             ],
-            "revision_instructions": ["Remove the unsupported motivation claim."],
         }
     )
 
@@ -625,13 +694,15 @@ def test_grounding_review_rejects_inconsistent_decisions() -> None:
             {
                 "decision": "pass",
                 "claim_assessments": [
-                    {
-                        "excerpt": "unsupported claim",
-                        "status": "unsupported",
-                    }
+                    _assessment(
+                        "C001",
+                        "unsupported claim",
+                        classification="unsupported",
+                    )
                 ],
                 "issues": [
                     {
+                        "claim_id": "C001",
                         "excerpt": "unsupported claim",
                         "category": "unsupported_fact",
                         "reason": "No supporting source.",
@@ -643,8 +714,15 @@ def test_grounding_review_rejects_inconsistent_decisions() -> None:
         GroundingReview.model_validate(
             {
                 "decision": "revision_required",
-                "claim_assessments": [{"excerpt": "unsupported claim", "status": "unsupported"}],
-                "issues": [],
+                "claim_assessments": [
+                    _assessment(
+                        "C001",
+                        "unsupported claim",
+                        classification="unsupported",
+                    )
+                ],
+                "issues": [{"claim_id": "C001", "excerpt": "unsupported claim"}],
+                "revision_instructions": ["Remove the claim."],
             }
         )
 
@@ -658,14 +736,14 @@ def test_claim_coverage_normalizes_markdown_math_and_sentence_quotes() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                {
-                    "excerpt": (
+                _assessment(
+                    "C001",
+                    (
                         'The **Universal Quantifier** ($\\forall$) applies to "all members.", '
                         "Predicate logic uses predicates."
                     ),
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                },
+                    sources=["S1"],
+                )
             ],
             "issues": [],
         }
@@ -680,11 +758,11 @@ def test_claim_coverage_normalizes_alternate_quotes_inside_excerpts() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                {
-                    "excerpt": "Predicate logic expresses claims about 'all' or 'some' members.",
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                }
+                _assessment(
+                    "C001",
+                    "Predicate logic expresses claims about 'all' or 'some' members.",
+                    sources=["S1"],
+                )
             ],
             "issues": [],
         }
@@ -699,11 +777,11 @@ def test_claim_coverage_preserves_identifiers_inside_inline_math() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                {
-                    "excerpt": "A one-place predicate P maps an entity to the proposition P(a).",
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                }
+                _assessment(
+                    "C001",
+                    "A one-place predicate P maps an entity to the proposition P(a).",
+                    sources=["S1"],
+                )
             ],
             "issues": [],
         }
@@ -743,19 +821,19 @@ def test_claim_coverage_splits_sentence_before_wiki_link() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                {
-                    "excerpt": "This resemblance was historically important.",
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                },
-                {
-                    "excerpt": (
+                _assessment(
+                    "C001",
+                    "This resemblance was historically important.",
+                    sources=["S1"],
+                ),
+                _assessment(
+                    "C002",
+                    (
                         "[[The Decision Problem|The later decision problem]] asked whether a "
                         "procedure could decide every proposition."
                     ),
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                },
+                    sources=["S1"],
+                ),
             ],
             "issues": [],
         }
@@ -770,11 +848,7 @@ def test_claim_coverage_rejects_an_unassessed_factual_sentence() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                {
-                    "excerpt": "Predicate logic uses predicates.",
-                    "status": "supported",
-                    "source_ids": ["S1"],
-                }
+                _assessment("C001", "Predicate logic uses predicates.", sources=["S1"])
             ],
             "issues": [],
         }
@@ -782,6 +856,236 @@ def test_claim_coverage_rejects_an_unassessed_factual_sentence() -> None:
 
     with pytest.raises(ValueError, match="omitted 1 factual sentence"):
         _validate_claim_coverage(artifact, review)
+
+
+@pytest.mark.parametrize(
+    ("source_text", "claim_text"),
+    [
+        (
+            "This resemblance to a programming language was historically important: reasoning "
+            "could be studied as a process performed by rule.",
+            "This resemblance to a programming language was historically important: reasoning "
+            "could be studied as a process performed by rule.",
+        ),
+        ("The predicate $P(a)$ is true.", "The predicate P(a) is true."),
+        (
+            "The [[Universal Quantifier|universal quantifier]] binds variables.",
+            "The universal quantifier binds variables.",
+        ),
+        (
+            "Predicate logic, extends propositional logic!",
+            "Predicate logic extends propositional logic.",
+        ),
+    ],
+)
+def test_direct_source_matches_use_stable_ids_and_bypass_reviewer(
+    source_text: str,
+    claim_text: str,
+) -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(source_id="source-1", title="Logic notes", text=source_text)
+            ]
+        }
+    )
+
+    claims, direct, unresolved = prepare_grounding_claims(request, claim_text)
+
+    assert [claim.claim_id for claim in claims] == ["C001"]
+    assert unresolved == []
+    assert direct[0].classification is GroundingClaimClassification.DIRECT_SUPPORTED
+    assert direct[0].support_method is GroundingSupportMethod.NORMALIZED_DIRECT_MATCH
+    assert direct[0].source_ids == ["source-1"]
+
+
+def test_verbatim_historical_source_match_cannot_be_overturned_by_reviewer(
+    configs: tuple[Any, Any],
+) -> None:
+    source_sentence = (
+        "This resemblance to a programming language was historically important: reasoning "
+        "could be studied as a process performed by rule."
+    )
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(source_id="source-1", title="History", text=source_sentence)
+            ]
+        }
+    )
+    model, profiles = configs
+    fake = FakeOllamaClient(writer_output=source_sentence)
+    result = make_pipeline(
+        model,
+        profiles,
+        fake,
+    ).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.final_output == source_sentence
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.claim_assessments[0].classification is (
+        GroundingClaimClassification.DIRECT_SUPPORTED
+    )
+    assert result.initial_grounding_review.review.claim_assessments[0].source_ids == ["source-1"]
+    assert not any(
+        record["format"] is not None
+        and record["format"].get("title") == "GroundingReviewerResponse"
+        for record in fake.requests
+    )
+
+
+def test_reviewer_entailment_requires_verifiable_evidence() -> None:
+    source_text = (
+        "Variables in an open statement remain free until a Universal Quantifier or Existential "
+        "Quantifier binds them. This lets logic express general claims."
+    )
+    request_claim = GroundingClaimInput(
+        claim_id="C001",
+        text="Quantifiers bind variables so predicate logic can express general claims.",
+    )
+    valid_response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "reason": (
+                        "The source says binding variables lets logic express general claims."
+                    ),
+                    "source_refs": ["S1"],
+                    "supporting_excerpts": ["This lets logic express general claims."],
+                }
+            ]
+        }
+    )
+    review = merge_grounding_review(
+        [request_claim],
+        [],
+        valid_response,
+        {"S1": "logic-notes"},
+        {"S1": source_text},
+    )
+
+    assert review.decision is GroundingDecision.PASS
+    assert review.claim_assessments[0].classification is GroundingClaimClassification.SUPPORTED
+    assert review.claim_assessments[0].supporting_excerpts == [
+        "This lets logic express general claims."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_ids", "excerpts"),
+    [
+        (["S1"], ["Predicate logic is essential to all computer science."]),
+        ([], ["This source excerpt exists, but no source was cited."]),
+        (["unknown-ref"], ["Predicate logic extends propositional logic."]),
+    ],
+)
+def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
+    source_ids: list[str],
+    excerpts: list[str],
+) -> None:
+    claim = GroundingClaimInput(claim_id="C001", text="Predicate logic is essential.")
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "reason": "The reviewer claims support.",
+                    "source_refs": source_ids,
+                    "supporting_excerpts": excerpts,
+                }
+            ]
+        }
+    )
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        {"S1": "logic-notes"},
+        {"S1": "Predicate logic extends propositional logic."},
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    assert review.evidence_validation_failures == 1
+    assert review.issues[0].claim_id == "C001"
+
+
+def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_claims() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(
+                    source_id="logic-notes",
+                    title="Logic notes",
+                    text="Predicate logic extends propositional logic.",
+                )
+            ]
+        }
+    )
+    all_claims, direct, unresolved = prepare_grounding_claims(
+        request,
+        "Predicate logic extends propositional logic. "
+        "Quantifiers bind variables. "
+        "Let P(x) mean x is wise. "
+        "Predicate logic is essential to computer science.",
+    )
+    assert [claim.claim_id for claim in unresolved] == ["C002", "C003", "C004"]
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C002",
+                    "classification": "supported",
+                    "reason": "The source explains quantifier binding.",
+                    "source_refs": ["S1"],
+                    "supporting_excerpts": ["Predicate logic extends propositional logic."],
+                },
+                {
+                    "claim_id": "C003",
+                    "classification": "pedagogical",
+                    "reason": "This is a stipulated illustrative predicate.",
+                    "source_refs": [],
+                    "supporting_excerpts": [],
+                },
+                {
+                    "claim_id": "C004",
+                    "classification": "unsupported",
+                    "reason": "The source does not establish essential status.",
+                    "category": "unsupported_significance",
+                    "source_refs": [],
+                    "supporting_excerpts": [],
+                },
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        all_claims,
+        direct,
+        response,
+        {"S1": "logic-notes"},
+        {"S1": "Predicate logic extends propositional logic."},
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert [claim.claim_id for claim in review.claim_assessments] == [
+        "C001",
+        "C002",
+        "C003",
+        "C004",
+    ]
+    assert [claim.classification.value for claim in review.claim_assessments] == [
+        "direct_supported",
+        "supported",
+        "pedagogical",
+        "unsupported",
+    ]
+    assert [issue.claim_id for issue in review.issues] == ["C004"]
 
 
 def test_grounding_review_revises_once_and_validates_revised_output(
@@ -822,7 +1126,11 @@ def test_grounding_review_revises_once_and_validates_revised_output(
     assert result.final_output == revised
     assert sum(event.stage is GenerationStage.REVISING for event in events) == 2
     assert sum(event.stage is GenerationStage.REVIEWING for event in events) == 4
-    assert fake.grounding_response_count == 2
+    assert fake.grounding_response_count == 1
+    assert (
+        result.final_grounding_review.review.claim_assessments[0].classification
+        is GroundingClaimClassification.DIRECT_SUPPORTED
+    )
 
 
 def test_unsupported_claims_override_inconsistent_model_pass(
@@ -832,15 +1140,16 @@ def test_unsupported_claims_override_inconsistent_model_pass(
     unsupported_sentence = "Predicate logic is essential to all computer science."
     contradictory_response = json.dumps(
         {
-            "decision": "pass",
             "claims": [
                 {
-                    "claim": unsupported_sentence,
-                    "status": "unsupported",
-                    "sources": [],
+                    "claim_id": "C001",
+                    "classification": "unsupported",
+                    "reason": "The sources do not establish this significance claim.",
+                    "category": "unsupported_significance",
+                    "source_refs": [],
+                    "supporting_excerpts": [],
                 }
             ],
-            "issues": [],
         }
     )
     fake = FakeOllamaClient(
@@ -858,9 +1167,8 @@ def test_unsupported_claims_override_inconsistent_model_pass(
     assert result.initial_grounding_review.review is not None
     assert result.initial_grounding_review.review.decision is GroundingDecision.REVISION_REQUIRED
     assert result.initial_grounding_review.review.issues[0].excerpt == unsupported_sentence
-    assert any(
-        "conservatively changed" in note
-        for note in result.initial_grounding_review.review.source_consistency_notes
+    assert result.initial_grounding_review.review.claim_assessments[0].classification.value == (
+        "unsupported"
     )
     assert result.final_output == "DNS maps a human-readable domain name to an IP address."
 
@@ -942,7 +1250,7 @@ def test_grounding_stage_errors_fail_closed(
         assert result.final_grounding_review.status is GenerationStatus.FAILED
 
 
-def test_grounding_review_fails_closed_when_claim_ledger_omits_a_sentence(
+def test_grounding_ledger_combines_direct_and_reviewer_claims(
     configs: tuple[Any, Any],
 ) -> None:
     model, profiles = configs
@@ -956,13 +1264,53 @@ def test_grounding_review_fails_closed_when_claim_ledger_omits_a_sentence(
         FakeOllamaClient(writer_output=candidate),
     ).route(sample_request(GenerationProfileName.STANDARD))
 
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    assert result.initial_grounding_review.review.decision is GroundingDecision.PASS
+    claims = result.initial_grounding_review.review.claim_assessments
+    assert [(claim.claim_id, claim.classification.value) for claim in claims] == [
+        ("C001", "direct_supported"),
+        ("C002", "supported"),
+    ]
+    assert result.initial_grounding_review.review.coverage_complete is True
+
+
+def test_grounding_review_fails_closed_when_unresolved_claim_id_is_missing(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "C999",
+                    "classification": "unsupported",
+                    "reason": "The source does not support the claim.",
+                    "source_refs": [],
+                    "supporting_excerpts": [],
+                }
+            ]
+        }
+    )
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(
+            writer_output=(
+                "DNS maps a human-readable domain name to an IP address. "
+                "Predicate logic is essential to all computer science."
+            ),
+            grounding_responses=[response],
+        ),
+    ).route(sample_request(GenerationProfileName.STANDARD))
+
     assert result.status is GenerationStatus.FAILED
     assert result.final_output is None
     assert result.initial_grounding_review is not None
     assert result.initial_grounding_review.status is GenerationStatus.FAILED
-    assert result.initial_grounding_review.review is not None
-    assert result.initial_grounding_review.review.decision is GroundingDecision.PASS
-    assert "omitted 1 factual sentence" in (result.initial_grounding_review.error_message or "")
+    assert "missing C002" in (result.initial_grounding_review.error_message or "")
+    assert "unknown C999" in (result.initial_grounding_review.error_message or "")
 
 
 @pytest.mark.parametrize(
@@ -1106,6 +1454,7 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
         "plan.json",
         "writer_prompt.json",
         "writer_output.md",
+        "grounding_review.json",
         "grounding_review_initial.json",
         "grounding_review_initial_prompt.json",
         "result.json",
@@ -1156,13 +1505,29 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_review_prompt = json.loads(
         (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_review_prompt["prompt_version"] == "grounding-review-v3"
-    assert "Candidate artifact" in saved_review_prompt["user_message"]
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v4"
+    assert "Unresolved factual claims to adjudicate" in saved_review_prompt["user_message"]
+    saved_review = json.loads((run_dir / "grounding_review.json").read_text(encoding="utf-8"))
+    saved_claim = saved_review["review"]["claim_assessments"][0]
+    assert saved_claim["claim_id"] == "C001"
+    assert saved_claim["text"] == "DNS maps a domain name to an IP address."
+    assert saved_claim["classification"] == "supported"
+    assert saved_claim["support_method"] == "reviewer_entailment"
+    assert saved_claim["source_ids"] == ["dns-notes"]
+    assert saved_claim["supporting_excerpts"] == [
+        "DNS maps a human-readable domain name to an IP address."
+    ]
     diagnostics = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
     assert "- Retrieval enabled: yes" in diagnostics
     assert "- Number of retrieved matches: 1" in diagnostics
     assert "- Number of assembled source materials: 1" in diagnostics
     assert "Initial grounding review" in diagnostics
+    assert "- Claims extracted: 1" in diagnostics
+    assert "- Direct source matches: 0" in diagnostics
+    assert "- LLM-reviewed claims: 1" in diagnostics
+    assert "- Reviewer-supported claims: 1" in diagnostics
+    assert "- Evidence validation failures: 0" in diagnostics
+    assert "- Coverage complete: yes" in diagnostics
 
 
 def test_failed_final_grounding_review_persists_both_candidates_and_prompts(

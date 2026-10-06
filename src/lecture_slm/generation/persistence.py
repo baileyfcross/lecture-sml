@@ -12,6 +12,7 @@ from pydantic import TypeAdapter
 from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationResult,
+    GroundingClaimClassification,
     GroundingReviewRecord,
     StageRecord,
 )
@@ -25,6 +26,7 @@ from lecture_slm.generation.prompts.planner import (
     build_planner_prompt,
 )
 from lecture_slm.generation.prompts.writer import build_writer_prompt
+from lecture_slm.generation.reviewer import prepare_grounding_claims
 
 
 def create_generation_run_directory(root: Path, request_id: str) -> Path:
@@ -110,6 +112,24 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
         ]
     )
     if record.review is not None:
+        assessments = record.review.claim_assessments
+        counts = {
+            classification: sum(item.classification is classification for item in assessments)
+            for classification in GroundingClaimClassification
+        }
+        lines.extend(
+            [
+                f"- Claims extracted: {len(assessments)}",
+                f"- Direct source matches: {counts[GroundingClaimClassification.DIRECT_SUPPORTED]}",
+                "- LLM-reviewed claims: "
+                f"{len(assessments) - counts[GroundingClaimClassification.DIRECT_SUPPORTED]}",
+                f"- Reviewer-supported claims: {counts[GroundingClaimClassification.SUPPORTED]}",
+                f"- Pedagogical claims: {counts[GroundingClaimClassification.PEDAGOGICAL]}",
+                f"- Unsupported claims: {counts[GroundingClaimClassification.UNSUPPORTED]}",
+                f"- Evidence validation failures: {record.review.evidence_validation_failures}",
+                f"- Coverage complete: {'yes' if record.review.coverage_complete else 'no'}",
+            ]
+        )
         lines.append(f"- Flagged claims: {len(record.review.issues)}")
         lines.extend(
             f"  - [{issue.category.value}] {issue.excerpt}: {issue.reason}"
@@ -259,10 +279,12 @@ def save_generation_run(
     initial_review = result.initial_grounding_review
     if initial_review is not None:
         _write_json(directory / "grounding_review_initial.json", initial_review)
-        review_prompt = build_grounding_review_prompt(
-            request,
-            (writer_record.raw_response if writer_record is not None else None) or "",
-        )
+        initial_candidate = (
+            writer_record.raw_response if writer_record is not None else None
+        ) or ""
+        _, _, unresolved_claims = prepare_grounding_claims(request, initial_candidate)
+        review_prompt = build_grounding_review_prompt(request, unresolved_claims)
+        _write_json(directory / "grounding_review.json", initial_review)
         timing = initial_review.timing
         _write_json(
             directory / "grounding_review_initial_prompt.json",
@@ -319,7 +341,8 @@ def save_generation_run(
             if writer_record is not None
             else ""
         )
-        review_prompt = build_grounding_review_prompt(request, final_candidate or "")
+        _, _, unresolved_claims = prepare_grounding_claims(request, final_candidate or "")
+        review_prompt = build_grounding_review_prompt(request, unresolved_claims)
         timing = final_review.timing
         _write_json(
             directory / "grounding_review_final_prompt.json",
