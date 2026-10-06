@@ -1,8 +1,10 @@
 """Quick, Standard, and Deep generation orchestration."""
 
 import hashlib
+import math
 import time
 from collections.abc import Callable
+from typing import Literal
 
 from lecture_slm.config.loader import ModelConfig
 from lecture_slm.generation.context import select_context_tier
@@ -126,7 +128,7 @@ class GenerationPipeline:
                     progress,
                     GenerationStage.PLANNING,
                     planning_message,
-                    profile.planner.max_output_tokens,
+                    profile.planner.output_budget(request.task),
                 )
                 planner = Planner(
                     client=self.client_factory(
@@ -197,6 +199,7 @@ class GenerationPipeline:
                 GenerationStage.WRITING,
                 "Writer is producing the requested artifact",
                 writer_budget,
+                previous_record=planner_record,
             )
             writer = Writer(
                 client=self.client_factory(
@@ -272,6 +275,7 @@ class GenerationPipeline:
             generated_tokens: int | None = None,
             tokens_per_second: float | None = None,
             estimated_seconds_remaining: float | None = None,
+            estimate_rate_source: Literal["fallback", "observed_previous_stage"] | None = None,
         ) -> None:
             if callback is not None:
                 callback(
@@ -282,6 +286,7 @@ class GenerationPipeline:
                         generated_tokens=generated_tokens,
                         tokens_per_second=tokens_per_second,
                         estimate_seconds_remaining=estimated_seconds_remaining,
+                        estimate_rate_source=estimate_rate_source,
                         estimate_is_approximate=True,
                     )
                 )
@@ -294,15 +299,36 @@ class GenerationPipeline:
         stage: GenerationStage,
         message: str,
         output_budget: int,
+        *,
+        previous_record: StageRecord | None = None,
     ) -> None:
+        observed_rate = self._usable_stage_rate(previous_record)
+        if observed_rate is None:
+            rate = self.profiles.estimated_fallback_tokens_per_second
+            rate_source: Literal["fallback", "observed_previous_stage"] = "fallback"
+        else:
+            rate = observed_rate
+            rate_source = "observed_previous_stage"
         progress(
             stage,
             message,
-            tokens_per_second=self.profiles.estimated_fallback_tokens_per_second,
-            estimated_seconds_remaining=(
-                output_budget / self.profiles.estimated_fallback_tokens_per_second
-            ),
+            tokens_per_second=rate,
+            estimated_seconds_remaining=output_budget / rate,
+            estimate_rate_source=rate_source,
         )
+
+    @staticmethod
+    def _usable_stage_rate(record: StageRecord | None) -> float | None:
+        if (
+            record is None
+            or record.status is not GenerationStatus.COMPLETED
+            or record.timing is None
+        ):
+            return None
+        rate = record.timing.tokens_per_second
+        if rate is None or rate <= 0 or not math.isfinite(rate):
+            return None
+        return rate
 
     @staticmethod
     def _emit_stage_complete(

@@ -20,6 +20,8 @@ from lecture_slm.generation.models import (
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
 from lecture_slm.generation.plan_schemas import plan_schema_for_task
 from lecture_slm.generation.profiles import load_generation_profiles
+from lecture_slm.generation.prompts.planner import build_planner_prompt
+from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
 from lecture_slm.schemas.course import CourseProfile
@@ -37,11 +39,13 @@ class FakeOllamaClient:
         writer_failure: bool = False,
         writer_tokens: int = 64,
         planner_tokens: int = 80,
+        planner_eval_duration_ns: int | None = 2_000_000_000,
     ) -> None:
         self.planner_failure = planner_failure
         self.writer_failure = writer_failure
         self.writer_tokens = writer_tokens
         self.planner_tokens = planner_tokens
+        self.planner_eval_duration_ns = planner_eval_duration_ns
         self.requests: list[dict[str, Any]] = []
         self.timeouts: list[float] = []
 
@@ -127,7 +131,7 @@ class FakeOllamaClient:
                 completion_tokens=self.planner_tokens,
                 total_duration_ns=3_000_000_000,
                 prompt_eval_duration_ns=1_000_000_000,
-                eval_duration_ns=2_000_000_000,
+                eval_duration_ns=self.planner_eval_duration_ns,
                 completion_reason="stop",
                 thinking_content="private planner trace for metadata test",
             )
@@ -219,7 +223,10 @@ def test_quick_pipeline_is_writer_only(configs: tuple[Any, Any]) -> None:
     assert fake.requests[0]["format"] is None
     assert fake.requests[0]["think"] is False
     assert fake.requests[0]["options"]["num_predict"] == 512
-    assert fake.timeouts == [30.0, 300.0]
+    assert fake.timeouts == [
+        30.0,
+        profiles.profiles[GenerationProfileName.QUICK].writer.timeout_seconds,
+    ]
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
         GenerationStage.WRITING,
@@ -228,6 +235,8 @@ def test_quick_pipeline_is_writer_only(configs: tuple[Any, Any]) -> None:
     ]
     assert events[1].estimate_is_approximate is True
     assert events[1].estimate_seconds_remaining is not None
+    assert events[1].estimate_rate_source == "fallback"
+    assert events[1].tokens_per_second == profiles.estimated_fallback_tokens_per_second
 
 
 def test_standard_calls_planner_then_writer_with_structured_context(
@@ -258,8 +267,15 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     ]
     assert writer_request["format"] is None
     assert writer_request["think"] is False
-    assert writer_request["options"]["num_predict"] == 768
-    assert fake.timeouts == [30.0, 480.0, 900.0]
+    assert writer_request["options"]["num_predict"] == profiles.profiles[
+        GenerationProfileName.STANDARD
+    ].writer.output_budget(TaskType.EXPLANATION)
+    standard_profile = profiles.profiles[GenerationProfileName.STANDARD]
+    assert fake.timeouts == [
+        30.0,
+        standard_profile.planner.timeout_seconds,
+        standard_profile.writer.timeout_seconds,
+    ]
     assert "Supplied source material" in planner_request["user_message"]
     assert "Previous course context" in planner_request["user_message"]
     assert "Authoritative user request" in writer_request["user_message"]
@@ -272,8 +288,8 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert result.writer_result is not None
     assert result.writer_result.timing.generated_tokens == 64
     assert result.writer_result.timing.potentially_truncated is False
-    assert result.metadata["planner_prompt_version"] == "planner-standard-v2"
-    assert result.metadata["writer_prompt_version"] == "writer-v1"
+    assert result.metadata["planner_prompt_version"] == "planner-standard-v3"
+    assert result.metadata["writer_prompt_version"] == "writer-v7"
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
         GenerationStage.PLANNING,
@@ -282,6 +298,76 @@ def test_standard_calls_planner_then_writer_with_structured_context(
         GenerationStage.WRITING,
         GenerationStage.COMPLETE,
     ]
+    assert events[1].estimate_rate_source == "fallback"
+    assert events[1].estimate_seconds_remaining == pytest.approx(
+        profiles.profiles[GenerationProfileName.STANDARD].planner.output_budget(
+            TaskType.EXPLANATION
+        )
+        / profiles.estimated_fallback_tokens_per_second
+    )
+
+
+def test_writer_estimate_uses_successful_planner_rate(configs: tuple[Any, Any]) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(planner_tokens=93)
+    events = []
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION),
+        on_progress=events.append,
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    writer_start = next(
+        event
+        for event in events
+        if event.stage is GenerationStage.WRITING and event.estimate_seconds_remaining is not None
+    )
+    output_budget = profiles.profiles[GenerationProfileName.STANDARD].writer.output_budget(
+        TaskType.EXPLANATION
+    )
+    assert writer_start.tokens_per_second == pytest.approx(46.5)
+    assert writer_start.estimate_seconds_remaining == pytest.approx(output_budget / 46.5)
+    assert writer_start.estimate_rate_source == "observed_previous_stage"
+
+
+@pytest.mark.parametrize("planner_eval_duration_ns", [0, None])
+def test_writer_estimate_falls_back_without_usable_planner_rate(
+    configs: tuple[Any, Any],
+    planner_eval_duration_ns: int | None,
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(planner_eval_duration_ns=planner_eval_duration_ns)
+    events = []
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD),
+        on_progress=events.append,
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    writer_start = next(
+        event
+        for event in events
+        if event.stage is GenerationStage.WRITING and event.estimate_seconds_remaining is not None
+    )
+    assert writer_start.tokens_per_second == profiles.estimated_fallback_tokens_per_second
+    assert writer_start.estimate_rate_source == "fallback"
+
+
+def test_failed_planner_rate_is_not_reused(configs: tuple[Any, Any]) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(planner_failure="invalid_schema", planner_tokens=93)
+    events = []
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD),
+        on_progress=events.append,
+    )
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_result is not None
+    assert result.planner_result.status is GenerationStatus.FAILED
+    assert result.planner_result.timing is not None
+    assert result.planner_result.timing.tokens_per_second == pytest.approx(46.5)
+    assert not any(event.stage is GenerationStage.WRITING for event in events)
 
 
 def test_explanation_uses_compact_task_specific_plan(configs: tuple[Any, Any]) -> None:
@@ -323,7 +409,7 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert fake.requests[0]["options"]["temperature"] == 0.5
     assert result.planner_result is not None
     assert result.planner_result.timing.selected_context == 8192
-    assert result.planner_result.prompt_version == "planner-v1"
+    assert result.planner_result.prompt_version == "planner-v2"
     assert result.planner_result.timing.thinking_enabled is True
     assert result.planner_result.timing.thinking_characters == len(
         "private planner trace for metadata test"
@@ -443,9 +529,12 @@ def test_generation_keeps_model_defaults_separate_from_profile(configs: tuple[An
     assert model.model_dump(mode="json") == original_defaults
     assert result.model_defaults["inference"]["context_length"] == 32768
     assert result.model_defaults["inference"]["think"] is True
-    assert result.profile_configuration["writer"]["context_tiers"] == [8192]
+    assert result.profile_configuration["writer"]["context_tiers"] == [4096, 8192]
     assert result.selected_contexts["planner"] == 4096
-    assert result.selected_contexts["writer"] == 8192
+    assert (
+        result.selected_contexts["writer"]
+        in result.profile_configuration["writer"]["context_tiers"]
+    )
     assert result.estimated_input_tokens["planner"] > 0
 
 
@@ -480,7 +569,10 @@ def test_quick_context_overflow_is_explicit_not_silently_raised(configs: tuple[A
     assert result.status is GenerationStatus.FAILED
     assert result.writer_result is not None
     assert result.writer_result.error_type == "ValueError"
-    assert "configured tiers stop at 4096" in (result.writer_result.error_message or "")
+    maximum_context = max(profiles.profiles[GenerationProfileName.QUICK].writer.context_tiers)
+    assert f"configured tiers stop at {maximum_context}" in (
+        result.writer_result.error_message or ""
+    )
 
 
 def test_profiles_config_has_quick_standard_deep_and_reviewer_disabled(
@@ -511,17 +603,139 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     tmp_path: Path,
 ) -> None:
     model, profiles = configs
-    request = sample_request(GenerationProfileName.STANDARD)
+    retrieval = {
+        "query": "DNS introduction",
+        "matches": [
+            {
+                "chunk_id": "dns-notes:0",
+                "source_id": "dns-notes",
+                "source_title": "DNS notes",
+                "fused_score": 0.82,
+                "neighbor_of": None,
+            }
+        ],
+        "warnings": ["source resolution was exact"],
+        "diagnostics": {"ranking": "hybrid"},
+    }
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={"metadata": {"knowledge_retrieval": retrieval}}
+    )
     result = make_pipeline(model, profiles, FakeOllamaClient()).route(request)
     run_dir = create_generation_run_directory(tmp_path, request.request_id)
     save_generation_run(run_dir, request, result)
 
     assert {path.name for path in run_dir.iterdir()} == {
         "request.json",
+        "retrieval.json",
+        "sources.json",
+        "sources.md",
+        "planner_prompt.json",
         "plan.json",
+        "writer_prompt.json",
         "result.json",
         "output.md",
+        "diagnostics.md",
     }
+    assert json.loads((run_dir / "retrieval.json").read_text(encoding="utf-8")) == retrieval
+    saved_sources = json.loads((run_dir / "sources.json").read_text(encoding="utf-8"))
+    assert saved_sources == [source.model_dump(mode="json") for source in request.source_material]
+    source_markdown = (run_dir / "sources.md").read_text(encoding="utf-8")
+    assert request.source_material[0].text in source_markdown
+    assert request.source_material[0].title in source_markdown
+    assert request.source_material[0].source_id in source_markdown
+
+    saved_planner_prompt = json.loads((run_dir / "planner_prompt.json").read_text(encoding="utf-8"))
+    expected_planner_prompt = build_planner_prompt(request, concise=True)
+    assert saved_planner_prompt["system_message"] == expected_planner_prompt.system_message
+    assert saved_planner_prompt["user_message"] == expected_planner_prompt.user_message
+    assert saved_planner_prompt["prompt_version"] == expected_planner_prompt.version
+    assert saved_planner_prompt["selected_context"] == result.planner_result.timing.selected_context
+    assert (
+        saved_planner_prompt["estimated_input_tokens"]
+        == result.planner_result.timing.estimated_input_tokens
+    )
+    assert saved_planner_prompt["output_budget"] == result.planner_result.timing.output_budget
+
+    saved_writer_prompt = json.loads((run_dir / "writer_prompt.json").read_text(encoding="utf-8"))
+    expected_writer_prompt = build_writer_prompt(request, result.planner_result.plan)
+    assert saved_writer_prompt["system_message"] == expected_writer_prompt.system_message
+    assert saved_writer_prompt["user_message"] == expected_writer_prompt.user_message
+    assert saved_writer_prompt["prompt_version"] == expected_writer_prompt.version
+    assert saved_writer_prompt["selected_context"] == result.writer_result.timing.selected_context
+    assert (
+        saved_writer_prompt["estimated_input_tokens"]
+        == result.writer_result.timing.estimated_input_tokens
+    )
+    assert saved_writer_prompt["output_budget"] == result.writer_result.timing.output_budget
+
     saved_result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     assert saved_result["planner_result"]["plan"]["task"] == "lecture"
     assert (run_dir / "output.md").read_text(encoding="utf-8") == result.final_output
+    diagnostics = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
+    assert "- Retrieval enabled: yes" in diagnostics
+    assert "- Number of retrieved matches: 1" in diagnostics
+    assert "- Number of assembled source materials: 1" in diagnostics
+
+
+def test_quick_persistence_saves_writer_prompt_without_planner_files(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    request = sample_request(GenerationProfileName.QUICK)
+    fake = FakeOllamaClient()
+    result = make_pipeline(model, profiles, fake).route(request)
+    run_dir = create_generation_run_directory(tmp_path, request.request_id)
+    save_generation_run(run_dir, request, result)
+
+    assert "writer_prompt.json" in {path.name for path in run_dir.iterdir()}
+    assert "planner_prompt.json" not in {path.name for path in run_dir.iterdir()}
+    assert "plan.json" not in {path.name for path in run_dir.iterdir()}
+    assert "retrieval.json" not in {path.name for path in run_dir.iterdir()}
+    saved_prompt = json.loads((run_dir / "writer_prompt.json").read_text(encoding="utf-8"))
+    expected_prompt = build_writer_prompt(request, None)
+    assert saved_prompt["system_message"] == expected_prompt.system_message
+    assert saved_prompt["user_message"] == expected_prompt.user_message
+    assert "- Retrieval enabled: no" in (run_dir / "diagnostics.md").read_text(encoding="utf-8")
+
+
+def test_failed_planner_persistence_keeps_available_diagnostics(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    request = sample_request(GenerationProfileName.STANDARD)
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(planner_failure="invalid_json"),
+    ).route(request)
+    run_dir = create_generation_run_directory(tmp_path, request.request_id)
+    save_generation_run(run_dir, request, result)
+
+    names = {path.name for path in run_dir.iterdir()}
+    assert "planner_prompt.json" in names
+    assert "plan.json" not in names
+    assert "writer_prompt.json" not in names
+    assert "output.md" not in names
+    assert "result.json" in names
+    assert "diagnostics.md" in names
+    assert "Writer" in (run_dir / "diagnostics.md").read_text(encoding="utf-8")
+
+
+def test_failed_writer_persistence_keeps_plan_and_prompts(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    request = sample_request(GenerationProfileName.STANDARD)
+    result = make_pipeline(model, profiles, FakeOllamaClient(writer_failure=True)).route(request)
+    run_dir = create_generation_run_directory(tmp_path, request.request_id)
+    save_generation_run(run_dir, request, result)
+
+    names = {path.name for path in run_dir.iterdir()}
+    assert result.status is GenerationStatus.FAILED
+    assert {"planner_prompt.json", "plan.json", "writer_prompt.json", "result.json"} <= names
+    assert "output.md" not in names
+    assert "diagnostics.md" in names
+    assert "- Status: failed" in (run_dir / "diagnostics.md").read_text(encoding="utf-8")

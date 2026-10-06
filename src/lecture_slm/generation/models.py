@@ -261,6 +261,7 @@ class ProgressEvent(BaseModel):
     generated_tokens: int | None = Field(default=None, ge=0)
     tokens_per_second: float | None = Field(default=None, ge=0.0)
     estimate_seconds_remaining: float | None = Field(default=None, ge=0.0)
+    estimate_rate_source: Literal["fallback", "observed_previous_stage"] | None = None
     estimate_is_approximate: bool = True
 
 

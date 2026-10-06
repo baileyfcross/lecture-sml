@@ -8,6 +8,8 @@ Generation is runtime orchestration over the current Ollama model. It is separat
 
 Prompt builders keep instruction, course constraints, pedagogy, teaching plan, sources, and prior-course context in separate labeled JSON blocks. The writer is explicitly asked to ground claims in supplied sources and follow, rather than redo, the teaching plan.
 
+When source material is supplied, the writer grounds not only definitions and technical claims but also framing, motivation, conclusions, significance, and claims about importance or a concept's broader role. It must not infer historical reasons from a capability, or inflate a supported point into an unsupported claim of importance, essential status, or a broader connection. Pedagogical examples, analogies, practice, transitions, and learner-focused explanations remain allowed; source-free requests retain normal access to model knowledge.
+
 ## Profiles and routing
 
 `configs/generation/profiles.yaml` contains versioned Quick, Standard, and Deep settings. Model defaults remain in `configs/models/qwen35-9b.yaml`; the generation profile selects a workflow and stage-specific settings without mutating those defaults.
@@ -22,9 +24,11 @@ Planner failure is explicit and prevents Writer execution. Writer failure retain
 
 Planning uses a shared `TeachingPlanBase` plus task-specific `ExplanationPlan`, `LecturePlan`, `SlidesPlan`, `LabPlan`, `ActivityPlan`, `InstructorGuidePlan`, and `AssessmentPlan` schemas. A typed registry maps canonical task enums to schemas; homework shares `AssessmentPlan` rather than adding a task type. Short explanations therefore require only a concept, assumptions, explanation sequence, example, misconceptions, and check, while lecture plans include objectives, sequence, practice, synthesis, timing, and source coverage. Ollama's native structured-output `format` uses the selected task schema. Malformed JSON/schema output is a distinct failed Planner stage with raw response preserved; missing fields are not silently supplied.
 
-Standard and Deep planning are separate: Standard uses concise plan-only wording, `think: false`, and deterministic Planner temperature 0. Deep uses the model's thinking capability but persists only the validated TeachingPlan. Planner versions are `planner-standard-v2` for concise Standard planning and `planner-v1` for Deep. Ollama thinking character count is captured when available; raw thinking text is never passed to Writer or persisted.
+Standard and Deep planning are separate: Standard uses concise plan-only wording, `think: false`, and deterministic Planner temperature 0. Deep uses the model's thinking capability but persists only the validated TeachingPlan. Planner versions are `planner-standard-v3` for concise Standard planning and `planner-v2` for Deep. Ollama thinking character count is captured when available; raw thinking text is never passed to Writer or persisted.
 
-Planner templates are versioned as `planner-standard-v2` for concise Standard planning and `planner-v1` for Deep planning. The Writer template is `writer-v1`. The selected versions are saved in result metadata.
+When source material is supplied, the Planner limits factual topics to what those sources support, while retaining freedom to add pedagogical structure and illustrative examples. The Writer treats source scope as higher priority than the teaching plan and omits or narrows unsupported factual plan requirements. Without supplied sources, both stages retain normal model-knowledge behavior.
+
+Planner templates are versioned as `planner-standard-v3` for concise Standard planning and `planner-v2` for Deep planning. The Writer template is `writer-v7`. The selected versions are saved in result metadata.
 
 ## Task budgets and context selection
 
@@ -32,7 +36,9 @@ Each generation profile has a global stage output fallback and optional canonica
 
 For each stage, context selection estimates assembled prompt tokens using approximately one token per four characters, multiplies the estimate by the configured safety margin, reserves the stage output budget, then chooses the smallest configured context tier that can fit the result. If no tier can accommodate it, the stage fails explicitly instead of silently sending an undersized context. The estimate and chosen tier are recorded. This is a planning heuristic, not tokenizer integration.
 
-Timeouts are independent from context and output caps. Quick Writer: 300 seconds; Standard Planner/Writer: 480/900 seconds; Deep Planner/Writer: 1500/1800 seconds. Standard task-specific Planner caps are 384 tokens for explanations, 768 for slides, activities, instructor guides, assessments, and homework, 1024 for labs, and 1536 for lectures. Deep keeps larger per-task planning caps up to 3072 for lectures. Standard Writer explanation output is 768 tokens; other Writer budgets remain independently configured. These are generation-profile settings, not model defaults. At the configured fallback rate, the CLI can estimate stage duration as output tokens divided by tokens/second. That value is labeled approximate and is not used as a deadline.
+Timeouts and task-specific output budgets are independently configured in the versioned profiles YAML; they are not model defaults.
+
+Stage-time estimates use the task-specific output budget. The first model stage uses the configured fallback generation speed; later stages may use an observed generation rate from an earlier successful stage in the same request. Estimates remain approximate and are not deadlines.
 
 ## Progress and results
 
@@ -46,7 +52,7 @@ Run persistence is opt-in:
 uv run python scripts/generate.py --profile standard --task lecture --instruction "Create a short introductory lesson about DNS." --save-run
 ```
 
-Saved development artifacts go under ignored `artifacts/generations/<run-id>/`: `request.json`, `plan.json` when planning ran, `result.json`, and `output.md`. The stage-separated files preserve Planner success if Writer fails, providing the foundation for future resume from a saved plan. Full resume behavior is not implemented yet.
+Saved development artifacts go under ignored `artifacts/generations/<run-id>/`. A run includes `request.json`, the complete `sources.json` and readable `sources.md` for material actually assembled into the request, `result.json`, `diagnostics.md`, and `output.md` when available. Retrieval runs also include `retrieval.json`; stages that ran include their exact prompt snapshots (`planner_prompt.json` and/or `writer_prompt.json`), and a validated Planner result is retained in `plan.json`. These opt-in saved runs are intended for development diagnostics, retrieval and grounding inspection, reproducibility, and investigating whether a questionable claim came from retrieved context or model generation. The stage-separated files preserve Planner success if Writer fails, providing the foundation for future resume from a saved plan. Full resume behavior is not implemented yet.
 
 ## Training boundary
 

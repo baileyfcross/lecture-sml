@@ -36,11 +36,19 @@ def _progress(event: ProgressEvent) -> None:
     detail = f"[{event.stage.value}] {event.message} ({event.elapsed_seconds:.1f}s elapsed)"
     if event.estimate_seconds_remaining is not None:
         detail += f"; estimated stage time {event.estimate_seconds_remaining:.0f}s (approx.)"
+        if event.estimate_rate_source == "observed_previous_stage":
+            detail += " [observed prior-stage rate]"
+        elif event.estimate_rate_source == "fallback":
+            detail += " [fallback estimate]"
     if event.generated_tokens is not None:
         detail += f"; {event.generated_tokens} tokens"
     if event.tokens_per_second is not None:
         detail += f" at {event.tokens_per_second:.2f} tokens/s"
-    if event.estimate_is_approximate and event.estimate_seconds_remaining is not None:
+    if (
+        event.estimate_is_approximate
+        and event.estimate_seconds_remaining is not None
+        and event.estimate_rate_source is None
+    ):
         detail += " [estimate, not a deadline]"
     print(detail, flush=True)
 
