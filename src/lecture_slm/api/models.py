@@ -8,6 +8,7 @@ from lecture_slm.generation.models import (
     GenerationProfileName,
     GenerationRequest,
     GenerationStatus,
+    GroundingClaimClassification,
     GroundingReviewRecord,
     OutputPreferences,
     PreviousCourseContext,
@@ -79,9 +80,21 @@ class SourceSummary(BaseModel):
     assembled: int
 
 
+class GroundingPhaseSummary(BaseModel):
+    claims_extracted: int
+    direct_supported: int
+    reviewer_supported: int
+    pedagogical: int
+    unsupported: int
+    evidence_validation_failures: int
+    decision: str
+
+
 class GroundingSummary(BaseModel):
     reviewed: bool
     revision_performed: bool
+    initial: GroundingPhaseSummary | None = None
+    final: GroundingPhaseSummary | None = None
     initial_decision: str | None = None
     final_decision: str | None = None
 
@@ -125,6 +138,8 @@ class GenerateResponse(BaseModel):
             grounding=GroundingSummary(
                 reviewed=initial is not None or final is not None,
                 revision_performed=result.revision_result is not None,
+                initial=_grounding_phase_summary(initial),
+                final=_grounding_phase_summary(final),
                 initial_decision=(
                     None
                     if initial is None or initial.review is None
@@ -202,3 +217,22 @@ def _duration(record: StageRecord | GroundingReviewRecord | None) -> float | Non
     if record is None or record.timing is None:
         return None
     return record.timing.duration_seconds
+
+
+def _grounding_phase_summary(record: GroundingReviewRecord | None) -> GroundingPhaseSummary | None:
+    if record is None or record.review is None:
+        return None
+    assessments = record.review.claim_assessments
+    counts = {
+        classification: sum(item.classification is classification for item in assessments)
+        for classification in GroundingClaimClassification
+    }
+    return GroundingPhaseSummary(
+        claims_extracted=len(assessments),
+        direct_supported=counts[GroundingClaimClassification.DIRECT_SUPPORTED],
+        reviewer_supported=counts[GroundingClaimClassification.SUPPORTED],
+        pedagogical=counts[GroundingClaimClassification.PEDAGOGICAL],
+        unsupported=counts[GroundingClaimClassification.UNSUPPORTED],
+        evidence_validation_failures=record.review.evidence_validation_failures,
+        decision=record.review.decision.value,
+    )

@@ -8,6 +8,7 @@ const request: GenerationRequest = {
   profile: "quick",
   instruction: "Explain predicate logic.",
   retrieve: false,
+  save_run: false,
 };
 
 const completedResult: GenerationResult = {
@@ -20,6 +21,8 @@ const completedResult: GenerationResult = {
   grounding: {
     reviewed: false,
     revision_performed: false,
+    initial: null,
+    final: null,
     initial_decision: null,
     final_decision: null,
   },

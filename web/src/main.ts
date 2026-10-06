@@ -26,6 +26,7 @@ const storageKeys = {
   profile: "lecture-slm.profile",
   retrieve: "lecture-slm.retrieve",
   topK: "lecture-slm.top-k",
+  saveRun: "lecture-slm.save-run",
 };
 
 let generation = initialGenerationState();
@@ -43,6 +44,7 @@ const form = byId<HTMLFormElement>("generation-form");
 const taskSelect = byId<HTMLSelectElement>("task");
 const profileSelect = byId<HTMLSelectElement>("profile");
 const retrieveCheckbox = byId<HTMLInputElement>("retrieve");
+const saveRunCheckbox = byId<HTMLInputElement>("save-run");
 const topKInput = byId<HTMLInputElement>("top-k");
 const instructionInput = byId<HTMLTextAreaElement>("instruction");
 const generateButton = byId<HTMLButtonElement>("generate");
@@ -141,6 +143,7 @@ function updateFormState(): void {
   taskSelect.disabled = isGenerating;
   profileSelect.disabled = isGenerating;
   retrieveCheckbox.disabled = isGenerating;
+  saveRunCheckbox.disabled = isGenerating;
   topKInput.disabled = isGenerating || !retrieveCheckbox.checked;
   instructionInput.disabled = isGenerating;
 }
@@ -192,6 +195,54 @@ function addDetail(list: HTMLDListElement, label: string, value: string): void {
   list.append(term, description);
 }
 
+function addGroundingSummary(
+  list: HTMLDListElement,
+  label: string,
+  summary:
+    | {
+        claims_extracted: number;
+        direct_supported: number;
+        reviewer_supported: number;
+        pedagogical: number;
+        unsupported: number;
+        evidence_validation_failures: number;
+        decision: string;
+      }
+    | null,
+): void {
+  addDetail(list, `${label} claims extracted`, summary === null ? "Unavailable" : String(summary.claims_extracted));
+  addDetail(
+    list,
+    `${label} direct matches`,
+    summary === null ? "Unavailable" : String(summary.direct_supported),
+  );
+  addDetail(
+    list,
+    `${label} reviewer-supported`,
+    summary === null ? "Unavailable" : String(summary.reviewer_supported),
+  );
+  addDetail(
+    list,
+    `${label} pedagogical`,
+    summary === null ? "Unavailable" : String(summary.pedagogical),
+  );
+  addDetail(
+    list,
+    `${label} unsupported`,
+    summary === null ? "Unavailable" : String(summary.unsupported),
+  );
+  addDetail(
+    list,
+    `${label} evidence validation failures`,
+    summary === null ? "Unavailable" : String(summary.evidence_validation_failures),
+  );
+  addDetail(
+    list,
+    `${label} decision`,
+    summary === null ? "Unavailable" : title(summary.decision),
+  );
+}
+
 function formatSeconds(value: number | null): string {
   return value === null ? "Unavailable" : `${value.toFixed(1)} s`;
 }
@@ -233,21 +284,9 @@ function renderResult(): void {
         ? "Grounding review details from the backend response."
         : "No grounding review was performed for this request.";
     addDetail(groundingDetails, "Review performed", result.grounding.reviewed ? "Yes" : "No");
-    addDetail(
-      groundingDetails,
-      "Initial decision",
-      result.grounding.initial_decision ?? "Unavailable",
-    );
-    addDetail(
-      groundingDetails,
-      "Revision performed",
-      result.grounding.revision_performed ? "Yes" : "No",
-    );
-    addDetail(
-      groundingDetails,
-      "Final decision",
-      result.grounding.final_decision ?? "Unavailable",
-    );
+    addDetail(groundingDetails, "Revision performed", result.grounding.revision_performed ? "Yes" : "No");
+    addGroundingSummary(groundingDetails, "Initial review", result.grounding.initial);
+    addGroundingSummary(groundingDetails, "Final review", result.grounding.final);
   } else {
     groundingMessage.hidden = false;
     groundingMessage.textContent = "Grounding information will appear after generation.";
@@ -340,6 +379,7 @@ async function submitGeneration(event: SubmitEvent): Promise<void> {
     profile: profileSelect.value as GenerationRequest["profile"],
     instruction: instructionInput.value.trim(),
     retrieve: retrieveCheckbox.checked,
+    save_run: saveRunCheckbox.checked,
   };
   if (retrieveCheckbox.checked) request.retrieval_top_k = Number(topKInput.value);
 
@@ -384,10 +424,13 @@ function savePreferences(): void {
   if (profileSelect.value) setPreference(storageKeys.profile, profileSelect.value);
   setPreference(storageKeys.retrieve, String(retrieveCheckbox.checked));
   setPreference(storageKeys.topK, topKInput.value);
+  setPreference(storageKeys.saveRun, String(saveRunCheckbox.checked));
 }
 
 function initializePreferences(): void {
   retrieveCheckbox.checked = localStorage.getItem(storageKeys.retrieve) === "true";
+  const savedRunPreference = localStorage.getItem(storageKeys.saveRun);
+  saveRunCheckbox.checked = savedRunPreference === null ? true : savedRunPreference === "true";
   const topK = Number(localStorage.getItem(storageKeys.topK));
   if (Number.isInteger(topK) && topK >= 1 && topK <= 10) topKInput.value = String(topK);
 }
@@ -408,6 +451,7 @@ retrieveCheckbox.addEventListener("change", () => {
   savePreferences();
   updateFormState();
 });
+saveRunCheckbox.addEventListener("change", savePreferences);
 topKInput.addEventListener("change", savePreferences);
 refreshHealthButton.addEventListener("click", () => void refreshHealth());
 document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {

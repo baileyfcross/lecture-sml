@@ -8,7 +8,9 @@ from pydantic import ValidationError
 
 from lecture_slm.config.loader import load_model_config
 from lecture_slm.generation.context import select_context_tier
+from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
+    EvidenceSpan,
     ExplanationPlan,
     GenerationProfileName,
     GenerationRequest,
@@ -52,10 +54,7 @@ def _passing_review() -> str:
                     "claim_id": "C001",
                     "classification": "supported",
                     "reason": "The source directly states this mapping.",
-                    "source_refs": ["S1"],
-                    "supporting_excerpts": [
-                        "DNS maps a human-readable domain name to an IP address."
-                    ],
+                    "evidence_ids": ["S01-E001"],
                 }
             ],
         }
@@ -69,7 +68,7 @@ def _default_grounding_review(user_message: str) -> str:
         flags=re.DOTALL,
     )
     sources_match = re.search(
-        r"## Authoritative supplied sources \(cite source_ref values\)\n```json\n(.*?)\n```",
+        r"## Deterministic evidence ledger \(cite evidence_id values\)\n```json\n(.*?)\n```",
         user_message,
         flags=re.DOTALL,
     )
@@ -77,7 +76,7 @@ def _default_grounding_review(user_message: str) -> str:
         return _passing_review()
     claims = json.loads(claims_match.group(1))
     sources = json.loads(sources_match.group(1))
-    excerpt = sources[0]["text"]
+    evidence_id = sources[0]["evidence_id"]
     return json.dumps(
         {
             "claims": [
@@ -85,8 +84,7 @@ def _default_grounding_review(user_message: str) -> str:
                     "claim_id": claim["claim_id"],
                     "classification": "supported",
                     "reason": "The cited source is the supplied supporting evidence.",
-                    "source_refs": [sources[0]["source_ref"]],
-                    "supporting_excerpts": [excerpt],
+                    "evidence_ids": [evidence_id],
                 }
                 for claim in claims
             ]
@@ -99,15 +97,12 @@ def _assessment(
     text: str,
     *,
     classification: str = "supported",
-    sources: list[str] | None = None,
-    excerpts: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
     reason: str = "The supplied evidence supports the decision.",
 ) -> dict[str, Any]:
-    resolved_sources = sources
-    resolved_excerpts = excerpts
+    resolved_evidence_ids = evidence_ids
     if classification == "supported":
-        resolved_sources = ["S1"] if sources is None else sources
-        resolved_excerpts = [text] if excerpts is None else excerpts
+        resolved_evidence_ids = ["S01-E001"] if evidence_ids is None else evidence_ids
     return {
         "claim_id": claim_id,
         "text": text,
@@ -119,8 +114,7 @@ def _assessment(
             if classification == "pedagogical"
             else "unsupported"
         ),
-        "source_ids": resolved_sources or [],
-        "supporting_excerpts": resolved_excerpts or [],
+        "evidence_ids": resolved_evidence_ids or [],
         "reason": reason,
         "category": "unsupported_fact" if classification == "unsupported" else None,
     }
@@ -423,7 +417,7 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert grounding_request["format"]["title"] == "GroundingReviewerResponse"
     assert grounding_request["think"] is False
     assert grounding_request["options"]["temperature"] == 0
-    assert "Authoritative supplied sources" in grounding_request["user_message"]
+    assert "Deterministic evidence ledger" in grounding_request["user_message"]
     assert result.initial_grounding_review is not None
     assert result.initial_grounding_review.review is not None
     assert result.initial_grounding_review.review.decision is GroundingDecision.PASS
@@ -680,8 +674,7 @@ def _revision_required_review(
                     "classification": "unsupported",
                     "reason": f"The supplied source does not support: {excerpt}",
                     "category": "unsupported_framing",
-                    "source_refs": [],
-                    "supporting_excerpts": [],
+                    "evidence_ids": [],
                 }
             ],
         }
@@ -742,7 +735,7 @@ def test_claim_coverage_normalizes_markdown_math_and_sentence_quotes() -> None:
                         'The **Universal Quantifier** ($\\forall$) applies to "all members.", '
                         "Predicate logic uses predicates."
                     ),
-                    sources=["S1"],
+                    evidence_ids=["S01-E001"],
                 )
             ],
             "issues": [],
@@ -761,7 +754,7 @@ def test_claim_coverage_normalizes_alternate_quotes_inside_excerpts() -> None:
                 _assessment(
                     "C001",
                     "Predicate logic expresses claims about 'all' or 'some' members.",
-                    sources=["S1"],
+                    evidence_ids=["S01-E001"],
                 )
             ],
             "issues": [],
@@ -780,7 +773,7 @@ def test_claim_coverage_preserves_identifiers_inside_inline_math() -> None:
                 _assessment(
                     "C001",
                     "A one-place predicate P maps an entity to the proposition P(a).",
-                    sources=["S1"],
+                    evidence_ids=["S01-E001"],
                 )
             ],
             "issues": [],
@@ -824,7 +817,7 @@ def test_claim_coverage_splits_sentence_before_wiki_link() -> None:
                 _assessment(
                     "C001",
                     "This resemblance was historically important.",
-                    sources=["S1"],
+                    evidence_ids=["S01-E001"],
                 ),
                 _assessment(
                     "C002",
@@ -832,7 +825,7 @@ def test_claim_coverage_splits_sentence_before_wiki_link() -> None:
                         "[[The Decision Problem|The later decision problem]] asked whether a "
                         "procedure could decide every proposition."
                     ),
-                    sources=["S1"],
+                    evidence_ids=["S01-E001"],
                 ),
             ],
             "issues": [],
@@ -848,7 +841,7 @@ def test_claim_coverage_rejects_an_unassessed_factual_sentence() -> None:
         {
             "decision": "pass",
             "claim_assessments": [
-                _assessment("C001", "Predicate logic uses predicates.", sources=["S1"])
+                _assessment("C001", "Predicate logic uses predicates.", evidence_ids=["S01-E001"])
             ],
             "issues": [],
         }
@@ -896,7 +889,45 @@ def test_direct_source_matches_use_stable_ids_and_bypass_reviewer(
     assert unresolved == []
     assert direct[0].classification is GroundingClaimClassification.DIRECT_SUPPORTED
     assert direct[0].support_method is GroundingSupportMethod.NORMALIZED_DIRECT_MATCH
-    assert direct[0].source_ids == ["source-1"]
+    assert direct[0].evidence_ids == ["S01-E001"]
+
+
+def test_evidence_ledger_is_deterministic_and_ordered() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(
+                    source_id="logic-1",
+                    title="Logic 1",
+                    text="First sentence. Second sentence.",
+                ),
+                SourceMaterial(
+                    source_id="logic-2",
+                    title="Logic 2",
+                    text="Third sentence.",
+                ),
+            ]
+        }
+    )
+
+    ledger = build_evidence_ledger(request)
+
+    assert [span.evidence_id for span in ledger] == ["S01-E001", "S01-E002", "S02-E001"]
+    assert [span.source_id for span in ledger] == ["logic-1", "logic-1", "logic-2"]
+    assert [span.order for span in ledger] == [1, 2, 3]
+
+
+def test_evidence_ledger_allows_empty_source_material() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={"source_material": []}
+    )
+
+    assert build_evidence_ledger(request) == []
+
+
+def test_invalid_source_material_is_still_rejected() -> None:
+    with pytest.raises(ValidationError):
+        SourceMaterial(source_id="logic-1", title="Logic 1", text="")
 
 
 def test_verbatim_historical_source_match_cannot_be_overturned_by_reviewer(
@@ -928,7 +959,7 @@ def test_verbatim_historical_source_match_cannot_be_overturned_by_reviewer(
     assert result.initial_grounding_review.review.claim_assessments[0].classification is (
         GroundingClaimClassification.DIRECT_SUPPORTED
     )
-    assert result.initial_grounding_review.review.claim_assessments[0].source_ids == ["source-1"]
+    assert result.initial_grounding_review.review.claim_assessments[0].evidence_ids == ["S01-E001"]
     assert not any(
         record["format"] is not None
         and record["format"].get("title") == "GroundingReviewerResponse"
@@ -954,8 +985,7 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
                     "reason": (
                         "The source says binding variables lets logic express general claims."
                     ),
-                    "source_refs": ["S1"],
-                    "supporting_excerpts": ["This lets logic express general claims."],
+                    "evidence_ids": ["S01-E001"],
                 }
             ]
         }
@@ -964,28 +994,31 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
         [request_claim],
         [],
         valid_response,
-        {"S1": "logic-notes"},
-        {"S1": source_text},
+        [
+            EvidenceSpan(
+                evidence_id="S01-E001",
+                source_id="logic-notes",
+                source_title="Logic notes",
+                text=source_text,
+                order=1,
+            )
+        ],
     )
 
     assert review.decision is GroundingDecision.PASS
     assert review.claim_assessments[0].classification is GroundingClaimClassification.SUPPORTED
-    assert review.claim_assessments[0].supporting_excerpts == [
-        "This lets logic express general claims."
-    ]
+    assert review.claim_assessments[0].evidence_ids == ["S01-E001"]
 
 
 @pytest.mark.parametrize(
-    ("source_ids", "excerpts"),
+    ("evidence_ids",),
     [
-        (["S1"], ["Predicate logic is essential to all computer science."]),
-        ([], ["This source excerpt exists, but no source was cited."]),
-        (["unknown-ref"], ["Predicate logic extends propositional logic."]),
+        ([],),
+        (["unknown-ref"],),
     ],
 )
 def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
-    source_ids: list[str],
-    excerpts: list[str],
+    evidence_ids: list[str],
 ) -> None:
     claim = GroundingClaimInput(claim_id="C001", text="Predicate logic is essential.")
     response = GroundingReviewerResponse.model_validate(
@@ -995,8 +1028,7 @@ def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
                     "claim_id": "C001",
                     "classification": "supported",
                     "reason": "The reviewer claims support.",
-                    "source_refs": source_ids,
-                    "supporting_excerpts": excerpts,
+                    "evidence_ids": evidence_ids,
                 }
             ]
         }
@@ -1005,8 +1037,15 @@ def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
         [claim],
         [],
         response,
-        {"S1": "logic-notes"},
-        {"S1": "Predicate logic extends propositional logic."},
+        [
+            EvidenceSpan(
+                evidence_id="S01-E001",
+                source_id="logic-notes",
+                source_title="Logic notes",
+                text="Predicate logic extends propositional logic.",
+                order=1,
+            )
+        ],
     )
 
     assert review.decision is GroundingDecision.REVISION_REQUIRED
@@ -1042,23 +1081,18 @@ def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_cl
                     "claim_id": "C002",
                     "classification": "supported",
                     "reason": "The source explains quantifier binding.",
-                    "source_refs": ["S1"],
-                    "supporting_excerpts": ["Predicate logic extends propositional logic."],
+                    "evidence_ids": ["S01-E001"],
                 },
                 {
                     "claim_id": "C003",
                     "classification": "pedagogical",
                     "reason": "This is a stipulated illustrative predicate.",
-                    "source_refs": [],
-                    "supporting_excerpts": [],
                 },
                 {
                     "claim_id": "C004",
                     "classification": "unsupported",
                     "reason": "The source does not establish essential status.",
                     "category": "unsupported_significance",
-                    "source_refs": [],
-                    "supporting_excerpts": [],
                 },
             ]
         }
@@ -1068,8 +1102,7 @@ def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_cl
         all_claims,
         direct,
         response,
-        {"S1": "logic-notes"},
-        {"S1": "Predicate logic extends propositional logic."},
+        build_evidence_ledger(request),
     )
 
     assert review.decision is GroundingDecision.REVISION_REQUIRED
@@ -1146,8 +1179,7 @@ def test_unsupported_claims_override_inconsistent_model_pass(
                     "classification": "unsupported",
                     "reason": "The sources do not establish this significance claim.",
                     "category": "unsupported_significance",
-                    "source_refs": [],
-                    "supporting_excerpts": [],
+                    "evidence_ids": [],
                 }
             ],
         }
@@ -1287,8 +1319,7 @@ def test_grounding_review_fails_closed_when_unresolved_claim_id_is_missing(
                     "claim_id": "C999",
                     "classification": "unsupported",
                     "reason": "The source does not support the claim.",
-                    "source_refs": [],
-                    "supporting_excerpts": [],
+                    "evidence_ids": [],
                 }
             ]
         }
@@ -1505,7 +1536,7 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_review_prompt = json.loads(
         (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_review_prompt["prompt_version"] == "grounding-review-v4"
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v5"
     assert "Unresolved factual claims to adjudicate" in saved_review_prompt["user_message"]
     saved_review = json.loads((run_dir / "grounding_review.json").read_text(encoding="utf-8"))
     saved_claim = saved_review["review"]["claim_assessments"][0]
@@ -1513,10 +1544,7 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert saved_claim["text"] == "DNS maps a domain name to an IP address."
     assert saved_claim["classification"] == "supported"
     assert saved_claim["support_method"] == "reviewer_entailment"
-    assert saved_claim["source_ids"] == ["dns-notes"]
-    assert saved_claim["supporting_excerpts"] == [
-        "DNS maps a human-readable domain name to an IP address."
-    ]
+    assert saved_claim["evidence_ids"] == ["S01-E001"]
     diagnostics = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
     assert "- Retrieval enabled: yes" in diagnostics
     assert "- Number of retrieved matches: 1" in diagnostics
@@ -1524,9 +1552,8 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert "Initial grounding review" in diagnostics
     assert "- Claims extracted: 1" in diagnostics
     assert "- Direct source matches: 0" in diagnostics
-    assert "- LLM-reviewed claims: 1" in diagnostics
     assert "- Reviewer-supported claims: 1" in diagnostics
-    assert "- Evidence validation failures: 0" in diagnostics
+    assert "- Evidence validation failures / unknown evidence IDs: 0" in diagnostics
     assert "- Coverage complete: yes" in diagnostics
 
 

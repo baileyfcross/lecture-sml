@@ -46,6 +46,16 @@ class SourceMaterial(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class EvidenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(pattern=r"^S\d{2}-E\d{3}$")
+    source_id: str = Field(min_length=1)
+    source_title: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    order: int = Field(ge=1)
+
+
 class PreviousCourseContext(BaseModel):
     """Caller-provided history describing what learners have already covered."""
 
@@ -314,12 +324,11 @@ class GroundingReviewerAssessment(BaseModel):
         GroundingClaimClassification.UNSUPPORTED,
     ]
     reason: str = Field(min_length=1)
-    source_ids: list[str] = Field(
+    evidence_ids: list[str] = Field(
         default_factory=list,
-        validation_alias=AliasChoices("source_refs", "source_ids"),
-        serialization_alias="source_refs",
+        validation_alias=AliasChoices("evidence_ids", "source_refs", "source_ids"),
+        serialization_alias="evidence_ids",
     )
-    supporting_excerpts: list[str] = Field(default_factory=list)
     category: GroundingIssueCategory | None = None
 
 
@@ -336,8 +345,7 @@ class GroundingClaimAssessment(BaseModel):
     text: str = Field(min_length=1)
     classification: GroundingClaimClassification
     support_method: GroundingSupportMethod
-    source_ids: list[str] = Field(default_factory=list)
-    supporting_excerpts: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1)
     category: GroundingIssueCategory | None = None
 
@@ -353,11 +361,15 @@ class GroundingClaimAssessment(BaseModel):
         }[self.classification]
         if self.support_method is not expected_method:
             raise ValueError("claim classification and support method do not agree")
-        if self.classification in {
-            GroundingClaimClassification.DIRECT_SUPPORTED,
-            GroundingClaimClassification.SUPPORTED,
-        } and (not self.source_ids or not self.supporting_excerpts):
-            raise ValueError("supported claims must retain source IDs and evidence excerpts")
+        if (
+            self.classification
+            in {
+                GroundingClaimClassification.DIRECT_SUPPORTED,
+                GroundingClaimClassification.SUPPORTED,
+            }
+            and not self.evidence_ids
+        ):
+            raise ValueError("supported claims must retain evidence IDs")
         return self
 
     @property
@@ -378,6 +390,7 @@ class GroundingReview(BaseModel):
 
     decision: GroundingDecision
     claim_assessments: list[GroundingClaimAssessment] = Field(default_factory=list, alias="claims")
+    evidence_ledger: list[EvidenceSpan] = Field(default_factory=list)
     issues: list[GroundingIssue] = Field(default_factory=list)
     revision_instructions: list[str] = Field(default_factory=list, alias="fixes")
     source_consistency_notes: list[str] = Field(default_factory=list, alias="notes")
@@ -402,6 +415,8 @@ class GroundingReview(BaseModel):
             raise ValueError("a required revision must include revision instructions")
         if len({claim.claim_id for claim in self.claim_assessments}) != len(self.claim_assessments):
             raise ValueError("grounding claim IDs must be unique")
+        if len({span.evidence_id for span in self.evidence_ledger}) != len(self.evidence_ledger):
+            raise ValueError("grounding evidence IDs must be unique")
         return self
 
 

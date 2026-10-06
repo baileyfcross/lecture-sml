@@ -51,6 +51,7 @@ export interface GenerationRequest {
   instruction: string;
   retrieve: boolean;
   retrieval_top_k?: number;
+  save_run: boolean;
 }
 
 export interface ProgressEvent {
@@ -67,8 +68,20 @@ export interface ProgressEvent {
 export interface GroundingSummary {
   reviewed: boolean;
   revision_performed: boolean;
+  initial: GroundingPhaseSummary | null;
+  final: GroundingPhaseSummary | null;
   initial_decision: string | null;
   final_decision: string | null;
+}
+
+export interface GroundingPhaseSummary {
+  claims_extracted: number;
+  direct_supported: number;
+  reviewer_supported: number;
+  pedagogical: number;
+  unsupported: number;
+  evidence_validation_failures: number;
+  decision: string;
 }
 
 export interface SourceSummary {

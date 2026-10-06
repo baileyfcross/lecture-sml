@@ -34,6 +34,26 @@ const result = (
   grounding: {
     reviewed: finalDecision !== null,
     revision_performed: status === "failed",
+    initial: {
+      claims_extracted: 2,
+      direct_supported: 1,
+      reviewer_supported: 1,
+      pedagogical: 0,
+      unsupported: status === "failed" ? 1 : 0,
+      evidence_validation_failures: status === "failed" ? 1 : 0,
+      decision: finalDecision ?? "pass",
+    },
+    final: finalDecision === null
+      ? null
+      : {
+          claims_extracted: 1,
+          direct_supported: 1,
+          reviewer_supported: 0,
+          pedagogical: 0,
+          unsupported: 0,
+          evidence_validation_failures: 0,
+          decision: finalDecision,
+        },
     initial_decision: "revision_required",
     final_decision: finalDecision,
   },

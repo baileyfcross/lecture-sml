@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from lecture_slm.config.loader import ModelConfig
 from lecture_slm.generation.context import select_context_tier
+from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
+    EvidenceSpan,
     GenerationRequest,
     GenerationStatus,
     GroundingClaimAssessment,
@@ -32,7 +34,6 @@ from lecture_slm.generation.prompts.grounding import (
     GROUNDING_REVIEW_PROMPT_VERSION,
     build_grounding_review_prompt,
     build_grounding_revision_prompt,
-    grounding_source_ref_map,
 )
 from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
@@ -177,15 +178,38 @@ def _direct_match_key(text: str) -> str:
     return " ".join(text.split())
 
 
+def _evidence_ids_for_direct_claim(
+    claim_text: str,
+    request: GenerationRequest,
+    evidence_ledger: list[EvidenceSpan],
+) -> list[str]:
+    claim_key = _direct_match_key(claim_text)
+    evidence_by_source: dict[str, list[EvidenceSpan]] = {}
+    for span in evidence_ledger:
+        evidence_by_source.setdefault(span.source_id, []).append(span)
+
+    matched_ids: list[str] = []
+    for source in request.source_material:
+        spans = evidence_by_source.get(source.source_id, [])
+        span_matches = [
+            span.evidence_id
+            for span in spans
+            if _claim_covers_sentence(_direct_match_key(span.text), claim_key)
+        ]
+        if span_matches:
+            matched_ids.extend(span_matches)
+            continue
+        if _claim_covers_sentence(_direct_match_key(source.text), claim_key):
+            matched_ids.extend(span.evidence_id for span in spans)
+    return list(dict.fromkeys(matched_ids))
+
+
 def prepare_grounding_claims(
     request: GenerationRequest,
     artifact: str,
 ) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
     """Assign stable IDs and deterministically resolve obvious source-text matches."""
-    refs = grounding_source_ref_map(request)
-    sources_by_ref = {
-        ref: source for ref, source in zip(refs, request.source_material, strict=True)
-    }
+    evidence_ledger = build_evidence_ledger(request)
     inputs = [
         GroundingClaimInput(claim_id=f"C{index:03d}", text=text)
         for index, text in enumerate(_factual_sentence_excerpts(artifact), start=1)
@@ -193,13 +217,8 @@ def prepare_grounding_claims(
     direct: list[GroundingClaimAssessment] = []
     unresolved: list[GroundingClaimInput] = []
     for claim in inputs:
-        claim_key = _direct_match_key(claim.text)
-        matched_refs = [
-            ref
-            for ref, source in sources_by_ref.items()
-            if _claim_covers_sentence(_direct_match_key(source.text), claim_key)
-        ]
-        if not matched_refs:
+        matched_evidence_ids = _evidence_ids_for_direct_claim(claim.text, request, evidence_ledger)
+        if not matched_evidence_ids:
             unresolved.append(claim)
             continue
         direct.append(
@@ -208,8 +227,7 @@ def prepare_grounding_claims(
                 text=claim.text,
                 classification=GroundingClaimClassification.DIRECT_SUPPORTED,
                 support_method=GroundingSupportMethod.NORMALIZED_DIRECT_MATCH,
-                source_ids=[sources_by_ref[ref].source_id for ref in matched_refs],
-                supporting_excerpts=[claim.text],
+                evidence_ids=matched_evidence_ids,
                 reason="Normalized claim text occurs directly in the supplied source.",
             )
         )
@@ -220,8 +238,7 @@ def merge_grounding_review(
     all_claims: list[GroundingClaimInput],
     direct_claims: list[GroundingClaimAssessment],
     reviewer_response: GroundingReviewerResponse | None,
-    source_ref_map: dict[str, str],
-    source_texts: dict[str, str],
+    evidence_ledger: list[EvidenceSpan],
 ) -> GroundingReview:
     """Validate reviewer IDs/evidence and assemble the authoritative complete ledger."""
     unresolved_ids = {claim.claim_id for claim in all_claims} - {
@@ -242,43 +259,35 @@ def merge_grounding_review(
         raise ValueError("Grounding review claim IDs are incomplete: " + "; ".join(details))
 
     inputs_by_id = {claim.claim_id: claim for claim in all_claims}
+    evidence_by_id = {span.evidence_id: span for span in evidence_ledger}
     merged = list(direct_claims)
     evidence_failures = 0
     for assessment in adjudications:
         claim = inputs_by_id[assessment.claim_id]
-        valid_refs = [
-            source_ref for source_ref in assessment.source_ids if source_ref in source_ref_map
+        valid_evidence_ids = [
+            evidence_id for evidence_id in assessment.evidence_ids if evidence_id in evidence_by_id
         ]
-        invalid_refs = [
-            source_ref for source_ref in assessment.source_ids if source_ref not in source_ref_map
+        invalid_evidence_ids = [
+            evidence_id
+            for evidence_id in assessment.evidence_ids
+            if evidence_id not in evidence_by_id
         ]
-        valid_evidence: list[str] = []
         claim_evidence_failures = 0
         if assessment.classification is GroundingClaimClassification.SUPPORTED:
-            if not valid_refs:
+            if not valid_evidence_ids:
                 claim_evidence_failures += 1
-            for excerpt in assessment.supporting_excerpts:
-                excerpt_key = _direct_match_key(excerpt)
-                if excerpt_key and any(
-                    _claim_covers_sentence(_direct_match_key(source_text), excerpt_key)
-                    for ref in valid_refs
-                    if (source_text := source_texts.get(ref)) is not None
-                ):
-                    valid_evidence.append(excerpt)
-                else:
-                    claim_evidence_failures += 1
-            if not assessment.supporting_excerpts:
+            if invalid_evidence_ids:
                 claim_evidence_failures += 1
         classification = assessment.classification
         reason = assessment.reason
         category = assessment.category
-        if invalid_refs:
+        if invalid_evidence_ids:
             claim_evidence_failures += 1
             classification = GroundingClaimClassification.UNSUPPORTED
-            reason += " Reviewer cited unknown source references."
+            reason += " Reviewer cited unknown evidence IDs."
         if classification is GroundingClaimClassification.SUPPORTED and claim_evidence_failures:
             classification = GroundingClaimClassification.UNSUPPORTED
-            reason += " No supporting excerpt was verified in the cited source material."
+            reason += " No supporting evidence IDs were verified in the cited source material."
         if claim_evidence_failures:
             evidence_failures += 1
         if classification is GroundingClaimClassification.UNSUPPORTED and category is None:
@@ -288,15 +297,16 @@ def merge_grounding_review(
             GroundingClaimClassification.PEDAGOGICAL: GroundingSupportMethod.PEDAGOGICAL,
             GroundingClaimClassification.UNSUPPORTED: GroundingSupportMethod.UNSUPPORTED,
         }[classification]
-        mapped_source_ids = [source_ref_map[source_ref] for source_ref in valid_refs]
+        mapped_evidence_ids = valid_evidence_ids
+        if classification is GroundingClaimClassification.UNSUPPORTED:
+            mapped_evidence_ids = []
         merged.append(
             GroundingClaimAssessment(
                 claim_id=claim.claim_id,
                 text=claim.text,
                 classification=classification,
                 support_method=method,
-                source_ids=mapped_source_ids,
-                supporting_excerpts=valid_evidence,
+                evidence_ids=mapped_evidence_ids,
                 reason=reason,
                 category=category,
             )
@@ -317,7 +327,11 @@ def merge_grounding_review(
             claim=claim.text,
             kind=claim.category or GroundingIssueCategory.UNSUPPORTED_FACT,
             why=claim.reason,
-            sources=claim.source_ids,
+            sources=[
+                evidence_by_id[evidence_id].source_id
+                for evidence_id in claim.evidence_ids
+                if evidence_id in evidence_by_id
+            ],
         )
         for claim in merged
         if claim.classification is GroundingClaimClassification.UNSUPPORTED
@@ -332,6 +346,7 @@ def merge_grounding_review(
     return GroundingReview(
         decision=decision,
         claims=merged,
+        evidence_ledger=evidence_ledger,
         issues=issues,
         fixes=(
             ["Remove, narrow, or qualify each claim without verified source support."]
@@ -379,19 +394,14 @@ class GroundingStageRunner:
         artifact: str,
     ) -> GroundingReviewRecord:
         all_claims, direct_claims, unresolved_claims = prepare_grounding_claims(request, artifact)
-        source_ref_map = grounding_source_ref_map(request)
-        source_texts = {
-            ref: source.text
-            for ref, source in zip(source_ref_map, request.source_material, strict=True)
-        }
+        evidence_ledger = build_evidence_ledger(request)
         if not unresolved_claims:
             try:
                 direct_review = merge_grounding_review(
                     all_claims,
                     direct_claims,
                     None,
-                    source_ref_map,
-                    source_texts,
+                    evidence_ledger,
                 )
                 _validate_claim_coverage(artifact, direct_review)
             except (ValidationError, ValueError) as error:
@@ -447,8 +457,7 @@ class GroundingStageRunner:
                 all_claims,
                 direct_claims,
                 reviewer_response,
-                source_ref_map,
-                source_texts,
+                evidence_ledger,
             )
             _validate_claim_coverage(artifact, review)
         except (OllamaError, ValidationError, ValueError) as error:

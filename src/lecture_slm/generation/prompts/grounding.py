@@ -1,5 +1,6 @@
 """Versioned prompts for grounding review and bounded artifact revision."""
 
+from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
     GenerationRequest,
     GroundingClaimInput,
@@ -7,32 +8,39 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.prompts.base import PromptPackage, json_block
 
-GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v4"
+GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v5"
 GROUNDING_REVISION_PROMPT_VERSION = "grounding-revision-v2"
 
 GROUNDING_REVIEW_SYSTEM_PROMPT = (
-    "You are a source-grounding reviewer. The supplied sources are the only factual evidence "
-    "for this review. Do not decide whether a claim is generally true; decide whether the supplied "
-    "sources state or reasonably entail it. Do not use pretrained knowledge as evidence or use "
-    "external sources. Claims already confirmed by deterministic source matching have been "
-    "removed from this review request. Review only the unresolved claims listed below and return "
-    "exactly one decision for each claim_id. Do not add claims, omit IDs, duplicate IDs, or use "
-    "claim text as the review key. For each remaining claim, decide whether the supplied sources "
-    "reasonably support or entail it. General model knowledge is not evidence. Include framing, "
-    "motivation, "
-    "historical, causal, application, significance, importance, prevalence, foundational status, "
-    "and broader-field claims. Mark a claim supported only when supplied sources state or "
-    "reasonably entail it; otherwise mark it unsupported. Every supported claim must include one "
-    "or more exact supporting_excerpts copied from its cited source_ref values and cite those "
-    "source_refs. Do not invent or paraphrase evidence excerpts: the application verifies them "
-    "against the cited source. Reasonable entailment is allowed when the source evidence is "
-    "explicit and sufficient. Distinguish a pedagogical claim that is only a stipulated "
-    "hypothetical setup or formal example from factual narrator assertions; classify only the "
-    "former as pedagogical. Do not call real-world facts pedagogical. Be strict about inflated "
-    "framing such as essential, foundational, primary motivation, historical causation, and "
-    "broader-field significance: support the full wording, not merely a related capability. Give "
-    "a concise reason for every decision. Return compact JSON using the schema and source_ref "
-    "values, with no extra commentary."
+    "You are a source-grounding reviewer. The deterministic evidence ledger is the complete "
+    "factual evidence available for this review. Do not use pretrained knowledge or external "
+    "sources as evidence. Do not decide whether a claim is generally true; decide whether the "
+    "evidence ledger states or reasonably entails it. Claims already confirmed by deterministic "
+    "direct matching have been removed from this review request. Review only the unresolved "
+    "claims listed below and return exactly one decision for each claim_id. Do not add claims, "
+    "omit IDs, duplicate IDs, or use claim text as the review key. For each remaining claim, "
+    "classify it as supported, pedagogical, or unsupported. A supported claim must include one "
+    "or more evidence_ids that actually support or reasonably entail the claim. Reasonable "
+    "paraphrase does not need to match source wording exactly. Do not require exact lexical "
+    "identity. Do not inflate a technical statement into importance, significance, historical "
+    "cause, foundational status, broader application, or general necessity unless the evidence "
+    "establishes that stronger claim. Pedagogical claims may remain pedagogical when they are "
+    "stipulated examples or illustrative setups. General model knowledge is not evidence. Return "
+    "compact JSON only.\n\n"
+    "Example 1:\n"
+    "Evidence:\n"
+    "[E001] Variables remain free until a universal or existential quantifier binds them.\n"
+    "[E002] This lets logic express general claims.\n"
+    "Claim: Quantifiers bind free variables so that general claims can be expressed.\n"
+    "Correct: supported with evidence_ids [E001, E002].\n\n"
+    "Example 2:\n"
+    "Evidence:\n"
+    "[E001] Predicate logic extends propositional logic.\n"
+    "Claim: Predicate logic is essential to modern computer science.\n"
+    "Correct: unsupported.\n\n"
+    "Example 3:\n"
+    "Claim: Let P(x) mean 'x is wise.'\n"
+    "Correct: pedagogical."
 )
 
 GROUNDING_REVISION_SYSTEM_PROMPT = (
@@ -50,6 +58,19 @@ def grounding_source_ref_map(request: GenerationRequest) -> dict[str, str]:
         f"S{index}": source.source_id
         for index, source in enumerate(request.source_material, start=1)
     }
+
+
+def _evidence_ledger(request: GenerationRequest) -> list[dict[str, str | int]]:
+    return [
+        {
+            "evidence_id": span.evidence_id,
+            "source_id": span.source_id,
+            "source_title": span.source_title,
+            "text": span.text,
+            "order": span.order,
+        }
+        for span in build_evidence_ledger(request)
+    ]
 
 
 def _grounding_sources(request: GenerationRequest) -> list[dict[str, str | None]]:
@@ -78,7 +99,7 @@ def build_grounding_review_prompt(
             {"instruction": request.instruction, "task": request.task.value},
         ),
         json_block(
-            "Authoritative supplied sources (cite source_ref values)", _grounding_sources(request)
+            "Deterministic evidence ledger (cite evidence_id values)", _evidence_ledger(request)
         ),
         json_block("Unresolved factual claims to adjudicate", claims),
     ]

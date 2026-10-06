@@ -117,17 +117,18 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
             classification: sum(item.classification is classification for item in assessments)
             for classification in GroundingClaimClassification
         }
+        evidence_failures = record.review.evidence_validation_failures
         lines.extend(
             [
+                f"- Evidence ledger spans: {len(record.review.evidence_ledger)}",
                 f"- Claims extracted: {len(assessments)}",
                 f"- Direct source matches: {counts[GroundingClaimClassification.DIRECT_SUPPORTED]}",
-                "- LLM-reviewed claims: "
-                f"{len(assessments) - counts[GroundingClaimClassification.DIRECT_SUPPORTED]}",
                 f"- Reviewer-supported claims: {counts[GroundingClaimClassification.SUPPORTED]}",
                 f"- Pedagogical claims: {counts[GroundingClaimClassification.PEDAGOGICAL]}",
                 f"- Unsupported claims: {counts[GroundingClaimClassification.UNSUPPORTED]}",
-                f"- Evidence validation failures: {record.review.evidence_validation_failures}",
+                (f"- Evidence validation failures / unknown evidence IDs: {evidence_failures}"),
                 f"- Coverage complete: {'yes' if record.review.coverage_complete else 'no'}",
+                f"- Decision: {record.review.decision.value}",
             ]
         )
         lines.append(f"- Flagged claims: {len(record.review.issues)}")

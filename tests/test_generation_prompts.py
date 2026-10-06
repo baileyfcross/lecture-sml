@@ -1,3 +1,4 @@
+from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
     ExplanationPlan,
     GenerationProfileName,
@@ -245,6 +246,7 @@ def test_grounding_review_and_revision_prompts_are_versioned_and_structured() ->
                     category="unsupported_significance",
                 )
             ],
+            "evidence_ledger": build_evidence_ledger(request),
             "issues": [
                 {
                     "claim_id": "C001",
@@ -262,11 +264,12 @@ def test_grounding_review_and_revision_prompts_are_versioned_and_structured() ->
         review,
     )
 
-    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v4"
-    assert "deterministic source matching" in review_prompt.system_message
+    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v5"
+    assert "evidence ledger" in review_prompt.system_message.lower()
+    assert "deterministic evidence ledger" in review_prompt.system_message
     assert "claim_id" in review_prompt.user_message
-    assert "motivation" in review_prompt.system_message
-    assert "S1" in review_prompt.user_message
+    assert "reasonable paraphrase" in review_prompt.system_message.lower()
+    assert "S01-E001" in review_prompt.user_message
     assert revision_prompt.version == GROUNDING_REVISION_PROMPT_VERSION
     assert revision_prompt.version == "grounding-revision-v2"
     assert "smallest necessary changes" in revision_prompt.system_message
