@@ -18,6 +18,7 @@ const completedResult: GenerationResult = {
   profile: "quick",
   output: "Approved output",
   errors: [],
+  source_coverage: null,
   grounding: {
     reviewed: false,
     revision_performed: false,

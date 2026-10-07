@@ -14,6 +14,8 @@ When source material is supplied, the writer grounds not only definitions and te
 
 `configs/generation/profiles.yaml` contains versioned Quick, Standard, and Deep settings. Model defaults remain in `configs/models/qwen35-9b.yaml`; the generation profile selects a workflow and stage-specific settings without mutating those defaults.
 
+When Vault retrieval is enabled, the original instruction remains unchanged for planning and generation, while a deterministic canonical query strips recognized leading request scaffolding such as “Can you explain,” “Create a lecture about,” and “What is.” The resulting query is used consistently by lexical and semantic retrieval and query-term coverage; retrieval diagnostics preserve both the original instruction and canonical query. No general stopword removal or additional retrieval pass is performed.
+
 - **Quick:** one Writer request, no Planner; useful for short explanations, rewriting, single slides, and small edits.
 - **Standard:** concise task-specific Planner request with thinking disabled and temperature 0, then a separate Writer request with thinking disabled. This is the recommended workflow for normal educational artifacts.
 - **Deep:** larger Planner budget/context followed by Writer with configurable context tiers. Like Standard, sourced Deep requests receive a bounded source-grounding review and, only when needed, one revision followed by a final review.
@@ -32,7 +34,21 @@ Planner templates are versioned as `planner-standard-v3` for concise Standard pl
 
 For Standard and Deep requests with assembled source material, each source is first converted into a deterministic evidence ledger with stable IDs like `S01-E001`, `S01-E002`, ... . Before any LLM call, conservative normalization handles Markdown, inline math, wiki links, punctuation, and whitespace; exact normalized equality or whole-claim containment in a supplied source class the claim `direct_supported`. These claims retain deterministic evidence IDs and are not sent to the reviewer. Only unresolved claims are sent to Ollama at temperature 0, keyed by claim ID. The reviewer may classify them `supported`, `pedagogical`, or `unsupported`; supported entailments must include one or more evidence IDs. The application verifies that each evidence ID exists in the ledger and converts unsupported evidence or fabricated IDs into unsupported claims. It merges deterministic and reviewer decisions into one ordered ledger and enforces that every extracted claim appears exactly once. Only unsupported claims produce issues and require revision. A required revision receives the complete artifact and findings; it is limited to one attempt and receives the same deterministic pre-pass plus evidence-ID validation in final review. Reviewer/reviser errors, malformed or incomplete IDs, invalid evidence IDs, or a second revision request fail closed: no unapproved candidate is exposed as `final_output`. The original Writer output and revision candidate remain independently available in result diagnostics. Quick and source-free requests are unchanged, and the existing opt-in `ReviewFeedback` reviewer remains a separate compatibility feature.
 
+Sourced plans include a common `source_scope` assessment: `sufficient`, `partial`, or `insufficient`, with supported topics and requested topics not covered by the sources. Partial coverage narrows the factual plan and output without removing non-factual user constraints. Insufficient coverage preserves the plan and retrieval diagnostics but fails before Writer, rather than silently generating an unsupported artifact. Source-free plans set `source_scope` to null and retain normal behavior.
+
 The grounding prompts are versioned as `grounding-review-v6` and `grounding-revision-v2`. The reviewer output schema uses classification-specific models: `supported` requires at least one `evidence_ids` value, while `unsupported` and `pedagogical` require the field to be present and empty. The review prompt contains only unresolved claim IDs plus the deterministic evidence ledger, while direct matches are decided locally. Presentation-only emphasized Markdown labels (including optional blockquote labels) are ignored for deterministic direct-source matching; factual claim text remains unchanged. Saved grounding JSON preserves each final ledger claim's ID, text, classification, support method, evidence IDs, reason, and any issue category, along with the evidence ledger itself. `diagnostics.md` summarizes direct matches, reviewer decisions, pedagogical and unsupported claims, evidence validation failures, and coverage status. The revision prompt carries actionable findings rather than the full ledger, keeping the complete artifact and relevant source context within the configured context tier. Reviewer entailment remains a model judgment bounded by verifiable evidence IDs, not a formal proof; inspect its findings and retained candidates when source accuracy is critical.
+
+## Rendering approved output
+
+The web UI renders approved Markdown with KaTeX for inline `$...$` and `\(...\)` math and display `$$...$$` and `\[...\]` math. KaTeX's HTML and MathML output passes through DOMPurify before insertion; untrusted generated HTML remains sanitized. For example, a universal statement can be written as:
+
+```latex
+\[
+\forall x \, P(x)
+\]
+```
+
+Copy continues to copy the original Markdown and LaTeX delimiters.
 
 ## Task budgets and context selection
 
@@ -57,6 +73,10 @@ uv run python scripts/generate.py --profile standard --task lecture --instructio
 ```
 
 Saved development artifacts go under ignored `artifacts/generations/<run-id>/`. A run includes `request.json`, the complete `sources.json` and readable `sources.md` for material actually assembled into the request, `result.json`, `diagnostics.md`, and `output.md` only when a final artifact is approved. Retrieval runs also include `retrieval.json`; stages that ran include their exact prompt snapshots (`planner_prompt.json`, `writer_prompt.json`, and applicable grounding review/revision prompt JSON files), and a validated Planner result is retained in `plan.json`. Grounded runs retain `writer_output.md`, structured `grounding_review_initial.json` and (after revision) `grounding_review_final.json`, and `grounding_revision.json`; `revised_output.md` is retained even when the final review fails. Diagnostics summarize decisions, flagged claim excerpts, errors, and stage timings. These opt-in files support development diagnostics, retrieval and grounding inspection, reproducibility, and investigating whether a questionable claim came from retrieved context or model generation. The stage-separated files preserve Planner success if Writer fails, providing the foundation for future resume from a saved plan. Full resume behavior is not implemented yet.
+
+When retrieved sources produce a partial first-pass scope assessment, generation makes one bounded expansion attempt using the unsupported requested topics, anchored to the canonical query. It runs at most three expansion queries, each with at most two results, merges and deduplicates those passages with the initial results, then reassesses scope once. There are never more than two retrieval rounds or two scope assessments. Sufficient first-pass scope proceeds directly; insufficient first-pass scope still stops before Writer. If expanded scope remains partial, generation proceeds narrowed to supported topics; insufficient final scope stops before Writer. Expansion does not recurse or alter grounding. Explicit-only source material and source-free requests are not expanded.
+
+Saved `retrieval.json` and `diagnostics.md` record retrieval rounds, per-query result summaries and timings, expansion topics and queries, unique added chunks, and initial/final scope assessments.
 
 ## Training boundary
 

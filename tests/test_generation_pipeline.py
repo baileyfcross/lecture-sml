@@ -24,6 +24,7 @@ from lecture_slm.generation.models import (
     GroundingSupportMethod,
     PreviousCourseContext,
     SourceMaterial,
+    SourceScopeStatus,
     TeachingPlan,
 )
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
@@ -133,6 +134,8 @@ class FakeOllamaClient:
         grounding_failure_at: int | None = None,
         revision_output: str = "# DNS: revised explanation\n\nA domain name maps to an IP address.",
         revision_failure: bool = False,
+        source_scope_status: str = "sufficient",
+        source_scope_statuses: list[str] | None = None,
         writer_output: str = (
             "# DNS: a concise explanation\n\nDNS maps a domain name to an IP address."
         ),
@@ -147,6 +150,9 @@ class FakeOllamaClient:
         self.grounding_response_count = 0
         self.revision_output = revision_output
         self.revision_failure = revision_failure
+        self.source_scope_status = source_scope_status
+        self.source_scope_statuses = source_scope_statuses or []
+        self.planner_response_count = 0
         self.writer_output = writer_output
         self.requests: list[dict[str, Any]] = []
         self.timeouts: list[float] = []
@@ -197,6 +203,14 @@ class FakeOllamaClient:
                     eval_duration_ns=500_000_000,
                     completion_reason="stop",
                 )
+            source_scope_status = (
+                self.source_scope_statuses[
+                    min(self.planner_response_count, len(self.source_scope_statuses) - 1)
+                ]
+                if self.source_scope_statuses
+                else self.source_scope_status
+            )
+            self.planner_response_count += 1
             if self.planner_failure == "timeout":
                 raise OllamaTimeoutError("planner timed out")
             if self.planner_failure == "invalid_json":
@@ -204,10 +218,29 @@ class FakeOllamaClient:
             elif self.planner_failure == "invalid_schema":
                 content = json.dumps({"task": "lecture", "sequence": [{"unexpected": True}]})
             elif format.get("title") == "ExplanationPlan":
+                source_scope = (
+                    {
+                        "status": source_scope_status,
+                        "supported_topics": ["DNS name resolution"],
+                        "unsupported_requested_topics": (
+                            ["the broader requested topic"]
+                            if source_scope_status != "sufficient"
+                            else []
+                        ),
+                        "scope_note": (
+                            "Available sources cover DNS name resolution only."
+                            if source_scope_status == "partial"
+                            else None
+                        ),
+                    }
+                    if "## Supplied source material" in user_message
+                    else None
+                )
                 content = json.dumps(
                     {
                         "task": "explanation",
                         "artifact_structure": ["concept", "example", "check"],
+                        "source_scope": source_scope,
                         "concept": "DNS maps names to IP addresses.",
                         "assumed_knowledge": ["websites use network addresses"],
                         "explanation_sequence": ["name", "lookup", "address"],
@@ -218,10 +251,29 @@ class FakeOllamaClient:
                     }
                 )
             else:
+                source_scope = (
+                    {
+                        "status": source_scope_status,
+                        "supported_topics": ["DNS name resolution"],
+                        "unsupported_requested_topics": (
+                            ["the broader requested topic"]
+                            if source_scope_status != "sufficient"
+                            else []
+                        ),
+                        "scope_note": (
+                            "Available sources cover DNS name resolution only."
+                            if source_scope_status == "partial"
+                            else None
+                        ),
+                    }
+                    if "## Supplied source material" in user_message
+                    else None
+                )
                 content = json.dumps(
                     {
                         "task": "lecture",
                         "artifact_structure": ["objectives", "example", "practice"],
+                        "source_scope": source_scope,
                         "objectives": ["Explain DNS name resolution."],
                         "prerequisites": ["domain names and IP addresses"],
                         "prior_knowledge_connections": ["URLs contain domain names"],
@@ -414,6 +466,9 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert "Authoritative user request" in writer_request["user_message"]
     assert "Teaching plan to follow" in writer_request["user_message"]
     assert "Supplied source material" in writer_request["user_message"]
+    assert '"source_scope"' in writer_request["user_message"]
+    assert '"status": "sufficient"' in writer_request["user_message"]
+    assert "when partial, stay within supported_topics" in writer_request["system_message"]
     assert grounding_request["format"]["title"] == "GroundingReviewerResponse"
     assert grounding_request["think"] is False
     assert grounding_request["options"]["temperature"] == 0
@@ -429,8 +484,8 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert result.writer_result is not None
     assert result.writer_result.timing.generated_tokens == 64
     assert result.writer_result.timing.potentially_truncated is False
-    assert result.metadata["planner_prompt_version"] == "planner-standard-v3"
-    assert result.metadata["writer_prompt_version"] == "writer-v7"
+    assert result.metadata["planner_prompt_version"] == "planner-standard-v4"
+    assert result.metadata["writer_prompt_version"] == "writer-v8"
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
         GenerationStage.PLANNING,
@@ -552,7 +607,7 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert fake.requests[0]["options"]["temperature"] == 0.5
     assert result.planner_result is not None
     assert result.planner_result.timing.selected_context == 8192
-    assert result.planner_result.prompt_version == "planner-v2"
+    assert result.planner_result.prompt_version == "planner-v3"
     assert result.planner_result.timing.thinking_enabled is True
     assert result.planner_result.timing.thinking_characters == len(
         "private planner trace for metadata test"
@@ -643,6 +698,175 @@ def test_invalid_teaching_plan_schema_preserves_raw_planner_response(
     assert result.planner_result.timing.generated_tokens == 80
     assert result.planner_result.timing.stop_reason == "stop"
     assert result.writer_result is None
+
+
+def test_partial_source_scope_is_passed_to_writer_and_pipeline_continues(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_status="partial")
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.planner_result is not None and result.planner_result.plan is not None
+    scope = result.planner_result.plan.source_scope
+    assert scope is not None and scope.status is SourceScopeStatus.PARTIAL
+    assert scope.supported_topics == ["DNS name resolution"]
+    assert scope.unsupported_requested_topics == ["the broader requested topic"]
+    assert result.writer_result is not None
+    writer_request = next(item for item in fake.requests if item["format"] is None)
+    assert '"status": "partial"' in writer_request["user_message"]
+    assert "do not fill unsupported_requested_topics" in writer_request["system_message"]
+    assert result.initial_grounding_review is not None
+
+
+def test_insufficient_source_scope_fails_before_writer_without_fallback(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_status="insufficient")
+    result = make_pipeline(model, profiles, fake).route(
+        sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    )
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_output is None
+    assert result.planner_result is not None and result.planner_result.plan is not None
+    assert result.planner_result.plan.source_scope is not None
+    assert result.planner_result.plan.source_scope.status is SourceScopeStatus.INSUFFICIENT
+    assert result.writer_result is None
+    assert len(fake.requests) == 1
+    assert any("sources are insufficient" in error for error in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("final_status", "expected_status", "writer_runs"),
+    [
+        ("sufficient", GenerationStatus.COMPLETED, True),
+        ("partial", GenerationStatus.COMPLETED, True),
+        ("insufficient", GenerationStatus.FAILED, False),
+    ],
+)
+def test_partial_scope_expands_once_and_uses_final_assessment(
+    configs: tuple[Any, Any],
+    final_status: str,
+    expected_status: GenerationStatus,
+    writer_runs: bool,
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_statuses=["partial", final_status])
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    retrieval_metadata = {
+        "knowledge_retrieval": {
+            "diagnostics": {
+                "retrieval_rounds": [{"round": 1, "type": "initial", "retrieved_count": 1}]
+            }
+        }
+    }
+    request = request.model_copy(update={"metadata": retrieval_metadata})
+    expansion_calls: list[SourceScopeStatus] = []
+    expanded_requests: list[GenerationRequest] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: Any,
+    ) -> GenerationRequest:
+        expansion_calls.append(scope.status)
+        metadata = dict(sourced_request.metadata)
+        diagnostics = dict(metadata["knowledge_retrieval"]["diagnostics"])
+        diagnostics["scope_reassessment"] = True
+        diagnostics["retrieval_rounds"] = [
+            *diagnostics["retrieval_rounds"],
+            {"round": 2, "type": "expansion", "retrieved_count": 1},
+        ]
+        metadata["knowledge_retrieval"] = {
+            **metadata["knowledge_retrieval"],
+            "diagnostics": diagnostics,
+        }
+        expanded_request = sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="dns-expansion",
+                        title="Expanded DNS source",
+                        text="Expanded source details about DNS.",
+                    ),
+                ],
+                "metadata": metadata,
+            }
+        )
+        expanded_requests.append(expanded_request)
+        return expanded_request
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    assert result.status is expected_status
+    assert expansion_calls == [SourceScopeStatus.PARTIAL]
+    planner_requests = [
+        item
+        for item in fake.requests
+        if item["format"] is not None and item["format"].get("title") == "ExplanationPlan"
+    ]
+    assert len(planner_requests) == 2
+    assert "Expanded DNS source" in planner_requests[1]["user_message"]
+    assert "## Scope reassessment" in planner_requests[1]["user_message"]
+    assert (result.writer_result is not None) is writer_runs
+    final_scope = result.planner_result.plan.source_scope
+    assert final_scope is not None and final_scope.status.value == final_status
+    diagnostics = expanded_requests[0].metadata["knowledge_retrieval"]["diagnostics"]
+    assert diagnostics["source_scope_assessments"]["initial"]["status"] == "partial"
+    assert diagnostics["source_scope_assessments"]["final"]["status"] == final_status
+    assert len(diagnostics["retrieval_rounds"]) == 2
+
+
+@pytest.mark.parametrize("first_status", ["sufficient", "insufficient"])
+def test_non_partial_initial_scope_does_not_expand(
+    configs: tuple[Any, Any],
+    first_status: str,
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_status=first_status)
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    request = request.model_copy(
+        update={
+            "metadata": {
+                "knowledge_retrieval": {
+                    "diagnostics": {"retrieval_rounds": [{"round": 1, "type": "initial"}]}
+                }
+            }
+        }
+    )
+    expansion_calls: list[bool] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: Any,
+    ) -> GenerationRequest:
+        expansion_calls.append(True)
+        return sourced_request
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    assert expansion_calls == []
+    planner_requests = [
+        item
+        for item in fake.requests
+        if item["format"] is not None and item["format"].get("title") == "ExplanationPlan"
+    ]
+    assert len(planner_requests) == 1
+    assert (result.writer_result is not None) is (first_status == "sufficient")
+    diagnostics = request.metadata["knowledge_retrieval"]["diagnostics"]
+    assert diagnostics["source_scope_assessments"]["initial"]["status"] == first_status
+    assert diagnostics["source_scope_assessments"]["final"]["status"] == first_status
 
 
 def test_teaching_plan_schema_rejects_unknown_task() -> None:
@@ -1704,7 +1928,9 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
 ) -> None:
     model, profiles = configs
     retrieval = {
-        "query": "DNS introduction",
+        "query": "DNS",
+        "original_query": "Can you explain DNS?",
+        "canonical_query": "DNS",
         "matches": [
             {
                 "chunk_id": "dns-notes:0",
@@ -1774,6 +2000,7 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
 
     saved_result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     assert saved_result["planner_result"]["plan"]["task"] == "lecture"
+    assert saved_result["planner_result"]["plan"]["source_scope"]["status"] == "sufficient"
     assert (run_dir / "output.md").read_text(encoding="utf-8") == result.final_output
     assert (
         json.loads((run_dir / "grounding_review_initial.json").read_text(encoding="utf-8"))[
@@ -1795,6 +2022,10 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert saved_claim["evidence_ids"] == ["S01-E001"]
     diagnostics = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
     assert "- Retrieval enabled: yes" in diagnostics
+    assert "- Original instruction: Can you explain DNS?" in diagnostics
+    assert "- Canonical query: DNS" in diagnostics
+    assert "- Status: sufficient" in diagnostics
+    assert "- Supported topics:" in diagnostics
     assert "- Number of retrieved matches: 1" in diagnostics
     assert "- Number of assembled source materials: 1" in diagnostics
     assert "Initial grounding review" in diagnostics

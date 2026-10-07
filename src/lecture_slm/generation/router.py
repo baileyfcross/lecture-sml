@@ -4,7 +4,11 @@ from collections.abc import Callable
 
 from lecture_slm.config.loader import ModelConfig
 from lecture_slm.generation.models import GenerationRequest, GenerationResult
-from lecture_slm.generation.pipeline import GenerationPipeline, ProgressCallback
+from lecture_slm.generation.pipeline import (
+    GenerationPipeline,
+    ProgressCallback,
+    RetrievalExpansionCallback,
+)
 from lecture_slm.generation.profiles import GenerationProfiles
 from lecture_slm.generation.reviewer import GenerationReviewer
 from lecture_slm.inference.ollama_client import OllamaClient
@@ -33,7 +37,12 @@ class GenerationRouter:
         request: GenerationRequest,
         *,
         on_progress: ProgressCallback | None = None,
+        expand_retrieval: RetrievalExpansionCallback | None = None,
     ) -> GenerationResult:
         """Execute the workflow selected by ``request.profile``."""
 
-        return self.pipeline.generate(request, on_progress=on_progress)
+        return self.pipeline.generate(
+            request,
+            on_progress=on_progress,
+            expand_retrieval=expand_retrieval,
+        )

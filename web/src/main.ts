@@ -1,5 +1,3 @@
-import DOMPurify from "dompurify";
-import { marked } from "marked";
 import {
   ApiError,
   generateStream,
@@ -18,6 +16,8 @@ import {
   type TabId,
 } from "./state";
 import type { GenerationRequest, GenerationStage, HealthResponse, ProfileSummary, TaskType } from "./types";
+import { renderArtifactMarkdown } from "./markdown";
+import { renderSourceCoverage } from "./sourceCoverage";
 import "./styles.css";
 
 const tabs: TabId[] = ["output", "sources", "grounding", "diagnostics"];
@@ -55,6 +55,7 @@ const refreshHealthButton = byId<HTMLButtonElement>("refresh-health");
 const profilePurpose = byId<HTMLSpanElement>("profile-purpose");
 const stageList = byId<HTMLOListElement>("stage-list");
 const outputMarkdown = byId<HTMLElement>("output-markdown");
+const sourceCoverage = byId<HTMLElement>("source-coverage");
 const outputEmpty = byId<HTMLParagraphElement>("output-empty");
 const copyOutputButton = byId<HTMLButtonElement>("copy-output");
 const sourcesDetails = byId<HTMLDListElement>("sources-details");
@@ -250,6 +251,7 @@ function formatSeconds(value: number | null): string {
 function renderResult(): void {
   const result = generation.result;
   outputMarkdown.replaceChildren();
+  renderSourceCoverage(sourceCoverage, result?.source_coverage ?? null);
   outputEmpty.hidden = result?.status === "completed" && result.output !== null;
   outputEmpty.textContent =
     result?.status === "failed"
@@ -257,8 +259,7 @@ function renderResult(): void {
       : "Your approved output will appear here.";
   copyOutputButton.disabled = result?.status !== "completed" || !result.output;
   if (result?.status === "completed" && result.output) {
-    const html = marked.parse(result.output, { async: false });
-    outputMarkdown.innerHTML = DOMPurify.sanitize(html);
+    outputMarkdown.innerHTML = renderArtifactMarkdown(result.output);
   }
 
   sourcesDetails.replaceChildren();

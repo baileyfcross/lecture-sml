@@ -3,7 +3,7 @@
 from lecture_slm.generation.models import GenerationRequest, TeachingPlanBase
 from lecture_slm.generation.prompts.base import PromptPackage, json_block, request_blocks
 
-WRITER_PROMPT_VERSION = "writer-v7"
+WRITER_PROMPT_VERSION = "writer-v8"
 
 WRITER_SYSTEM_PROMPT = (
     "You are the artifact writer for Lecture SLM. Follow the user's authoritative request and "
@@ -55,7 +55,12 @@ SOURCE_GROUNDING_INSTRUCTIONS = (
     "questions, "
     "organization, "
     "and simplified explanations to teach supported facts. These teaching aids must not present "
-    "unsupported real-world or domain-specific claims as facts."
+    "unsupported real-world or domain-specific claims as facts. When the teaching plan has a "
+    "source_scope assessment, follow it: when sufficient, follow the grounded plan normally; "
+    "when partial, stay within "
+    "supported_topics "
+    "and do not fill unsupported_requested_topics, adding at most one concise scope note when "
+    "useful; when insufficient, do not create a substantive factual artifact."
 )
 
 

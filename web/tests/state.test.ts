@@ -31,6 +31,7 @@ const result = (
   profile: "standard",
   output: status === "completed" ? "# Approved" : null,
   errors: status === "failed" ? ["No final artifact approved"] : [],
+  source_coverage: null,
   grounding: {
     reviewed: finalDecision !== null,
     revision_performed: status === "failed",

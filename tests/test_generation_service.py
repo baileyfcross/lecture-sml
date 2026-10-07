@@ -9,12 +9,14 @@ from lecture_slm.generation.models import (
     GenerationStatus,
     ProgressEvent,
     SourceMaterial,
+    SourceScopeAssessment,
+    SourceScopeStatus,
     StageTiming,
 )
 from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.service import GenerationService, RetrievalOptions
 from lecture_slm.knowledge.config import KnowledgeConfig
-from lecture_slm.knowledge.models import RetrievalResult
+from lecture_slm.knowledge.models import RetrievalMatch, RetrievalResult
 from lecture_slm.schemas.dataset import TaskType
 
 ROOT = Path(__file__).parents[1]
@@ -35,10 +37,21 @@ def _result(request: GenerationRequest) -> GenerationResult:
 
 
 class FakeRouter:
-    def __init__(self, **_: Any) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         self.request: GenerationRequest | None = None
+        self.expansion_callback: Any = None
+        self.expand_scope: SourceScopeAssessment | None = kwargs.get("expand_scope")
 
-    def route(self, request: GenerationRequest, *, on_progress: Any = None) -> GenerationResult:
+    def route(
+        self,
+        request: GenerationRequest,
+        *,
+        on_progress: Any = None,
+        expand_retrieval: Any = None,
+    ) -> GenerationResult:
+        self.expansion_callback = expand_retrieval
+        if expand_retrieval is not None and self.expand_scope is not None:
+            request = expand_retrieval(request, self.expand_scope) or request
         self.request = request
         if on_progress is not None:
             on_progress(
@@ -70,6 +83,7 @@ def test_generation_service_routes_the_request_through_the_pipeline() -> None:
     assert execution.request is request
     assert execution.result.final_output == "Generated output."
     assert execution.saved_run_directory is None
+    assert router.expansion_callback is None
 
 
 def test_generation_service_uses_shared_retrieval_and_saves_existing_run_format(
@@ -97,10 +111,13 @@ def test_generation_service_uses_shared_retrieval_and_saves_existing_run_format(
         request: GenerationRequest,
         retrieval_options: RetrievalOptions,
         _: KnowledgeConfig,
+        *,
+        query: Any,
     ) -> RetrievalResult:
         seen["request"] = request
         seen["options"] = retrieval_options
-        return RetrievalResult(query=request.instruction)
+        seen["query"] = query
+        return RetrievalResult(query=query.canonical)
 
     monkeypatch.setattr(service, "_retrieve", retrieve)
     monkeypatch.setattr(
@@ -113,11 +130,175 @@ def test_generation_service_uses_shared_retrieval_and_saves_existing_run_format(
 
     assert seen["request"] is request
     assert seen["options"] is options
+    assert seen["query"].original == request.instruction
+    assert seen["query"].canonical == "predicate logic"
     assert router.request is not None
     assert router.request.source_material == [source]
-    assert router.request.metadata["knowledge_retrieval"]["query"] == request.instruction
+    retrieval_diagnostics = router.request.metadata["knowledge_retrieval"]
+    assert retrieval_diagnostics["query"] == "predicate logic"
+    assert retrieval_diagnostics["canonical_query"] == "predicate logic"
+    assert retrieval_diagnostics["original_query"] == request.instruction
     assert execution.saved_run_directory is not None
     assert execution.retrieved_count == 0
     assert (execution.saved_run_directory / "request.json").is_file()
     assert (execution.saved_run_directory / "result.json").is_file()
     assert (execution.saved_run_directory / "diagnostics.md").is_file()
+    diagnostics = (execution.saved_run_directory / "diagnostics.md").read_text(encoding="utf-8")
+    assert "- Original instruction: Explain predicate logic." in diagnostics
+    assert "- Canonical query: predicate logic" in diagnostics
+
+
+def _match(chunk_id: str, *, fused_rank: int = 1) -> RetrievalMatch:
+    return RetrievalMatch(
+        chunk_id=chunk_id,
+        source_id=f"source-{chunk_id}",
+        source_title=f"Title {chunk_id}",
+        source_path=f"{chunk_id}.md",
+        text=f"Evidence for {chunk_id}.",
+        fused_rank=fused_rank,
+        fused_score=1 / fused_rank,
+    )
+
+
+def test_partial_retrieval_expands_once_and_deduplicates_chunk_matches(
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter(
+        expand_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["quantum annealing"],
+            unsupported_requested_topics=["algorithms", "error correction"],
+        )
+    )
+    service = _service(router)
+    knowledge = KnowledgeConfig()
+    options = RetrievalOptions(enabled=True, top_k=8)
+    initial = RetrievalResult(query="quantum computing", matches=[_match("A"), _match("B")])
+    expansion_results = {
+        "quantum computing algorithms": RetrievalResult(
+            query="quantum computing algorithms",
+            matches=[_match("B"), _match("C")],
+        ),
+        "quantum computing error correction": RetrievalResult(
+            query="quantum computing error correction",
+            matches=[_match("C"), _match("D")],
+        ),
+    }
+    retrieval_calls: list[tuple[str, int | None]] = []
+
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: knowledge,
+    )
+
+    def retrieve(
+        request: GenerationRequest,
+        retrieval_options: RetrievalOptions,
+        _: KnowledgeConfig,
+        *,
+        query: Any,
+        top_k: int | None = None,
+    ) -> RetrievalResult:
+        retrieval_calls.append((query.canonical, top_k))
+        return initial if len(retrieval_calls) == 1 else expansion_results[query.canonical]
+
+    def assemble(
+        self: Any,
+        result: RetrievalResult,
+        *,
+        source_context_budget: int,
+    ) -> list[SourceMaterial]:
+        return [
+            SourceMaterial(
+                source_id=match.source_id,
+                title=match.source_title,
+                text=match.text,
+                metadata={
+                    "source_origin": "retrieved_knowledge",
+                    "chunk_ids": [match.chunk_id],
+                },
+            )
+            for match in result.matches
+        ]
+
+    monkeypatch.setattr(service, "_retrieve", retrieve)
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.KnowledgeContextAssembler.assemble",
+        assemble,
+    )
+
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        instruction="Can you explain quantum computing?",
+    )
+    execution = service.generate(request, retrieval=options)
+
+    assert router.expansion_callback is not None
+    assert router.request is not None
+    expanded_request = execution.request
+    assert [query for query, _ in retrieval_calls] == [
+        "quantum computing",
+        "quantum computing algorithms",
+        "quantum computing error correction",
+    ]
+    assert [top_k for _, top_k in retrieval_calls] == [None, 2, 2]
+    assert [source.metadata["chunk_ids"][0] for source in expanded_request.source_material] == [
+        "A",
+        "B",
+        "C",
+        "D",
+    ]
+    diagnostics = expanded_request.metadata["knowledge_retrieval"]["diagnostics"]
+    assert len(diagnostics["retrieval_rounds"]) == 2
+    assert diagnostics["retrieval_rounds"][1]["retrieved_count"] == 4
+    assert diagnostics["retrieval_rounds"][1]["unique_added_count"] == 2
+    assert diagnostics["retrieval_rounds"][1]["merged_match_count"] == 4
+    assert diagnostics["context_assembly"]["candidate_chunks"] == 4
+    assert diagnostics["context_assembly"]["source_material_count"] == 4
+    assert execution.result.final_output == "Generated output."
+
+
+def test_explicit_sources_that_leave_no_room_for_retrieval_do_not_expand(
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter(
+        expand_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["manual source topic"],
+            unsupported_requested_topics=["another topic"],
+        )
+    )
+    service = _service(router)
+    knowledge = KnowledgeConfig()
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: knowledge,
+    )
+    monkeypatch.setattr(
+        service,
+        "_retrieve",
+        lambda *args, **kwargs: RetrievalResult(
+            query=kwargs["query"].canonical,
+            matches=[_match("retrieved")],
+        ),
+    )
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.estimate_tokens_from_characters",
+        lambda _: 10_000,
+    )
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        instruction="Explain the topic.",
+        source_material=[
+            SourceMaterial(
+                source_id="manual",
+                title="Manual source",
+                text="This caller-supplied evidence is authoritative.",
+            )
+        ],
+    )
+
+    execution = service.generate(request, retrieval=RetrievalOptions(enabled=True))
+
+    assert router.expansion_callback is None
+    assert execution.request.source_material == request.source_material

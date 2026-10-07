@@ -9,6 +9,8 @@ from lecture_slm.generation.models import (
     GroundingReview,
     GroundingSupportMethod,
     SourceMaterial,
+    SourceScopeAssessment,
+    SourceScopeStatus,
 )
 from lecture_slm.generation.prompts.grounding import (
     GROUNDING_REVIEW_PROMPT_VERSION,
@@ -18,6 +20,7 @@ from lecture_slm.generation.prompts.grounding import (
 )
 from lecture_slm.generation.prompts.planner import (
     PLANNER_PROMPT_VERSION,
+    STANDARD_EXPANDED_PLANNER_PROMPT_VERSION,
     STANDARD_PLANNER_PROMPT_VERSION,
     STANDARD_PLANNER_SYSTEM_PROMPT,
     build_planner_prompt,
@@ -101,10 +104,16 @@ def _contains_planner_source_policy(prompt_text: str) -> None:
     assert "authoritative for factual scope" in lowered
     assert "only around factual topics supported by those sources" in lowered
     assert "do not plan factual sections" in lowered
-    assert "do not fill factual gaps from pretrained knowledge" in lowered
     assert "worked example" in lowered
     assert "check for understanding" in lowered
     assert "hypothetical examples" in lowered
+    assert "populate source_scope" in lowered
+    assert "'sufficient'" in lowered
+    assert "'partial'" in lowered
+    assert "'insufficient'" in lowered
+    assert "do not plan a substantive factual artifact" in lowered
+    assert "do not use pretrained knowledge to fill factual gaps" in lowered
+    assert "preserve non-factual user constraints" in lowered
 
 
 def test_writer_prompt_applies_source_grounding_policy_when_sources_exist() -> None:
@@ -112,7 +121,7 @@ def test_writer_prompt_applies_source_grounding_policy_when_sources_exist() -> N
 
     _contains_source_policy(prompt.system_message)
     assert "Supplied source material" in prompt.user_message
-    assert prompt.version == WRITER_PROMPT_VERSION == "writer-v7"
+    assert prompt.version == WRITER_PROMPT_VERSION == "writer-v8"
 
 
 def test_writer_prompt_preserves_normal_behavior_without_sources() -> None:
@@ -127,6 +136,7 @@ def test_writer_prompt_keeps_grounding_policy_with_teaching_plan() -> None:
     plan = ExplanationPlan(
         task=TaskType.EXPLANATION,
         artifact_structure=["concept", "example"],
+        source_scope=None,
         concept="Predicates describe properties.",
         assumed_knowledge=[],
         explanation_sequence=["Introduce a predicate", "Apply it to an entity"],
@@ -140,12 +150,14 @@ def test_writer_prompt_keeps_grounding_policy_with_teaching_plan() -> None:
     assert "Teaching plan to follow" in prompt.user_message
     assert "Let P(x) mean" in prompt.user_message
     assert "Supplied source material" in prompt.user_message
+    assert prompt.version == "writer-v8"
 
 
 def test_writer_grounding_precedes_unsupported_teaching_plan_sections() -> None:
     plan = ExplanationPlan(
         task=TaskType.EXPLANATION,
         artifact_structure=["concept", "Applications"],
+        source_scope=None,
         concept="Predicates describe properties.",
         assumed_knowledge=[],
         explanation_sequence=["Introduce predicates", "Discuss applications"],
@@ -186,6 +198,8 @@ def test_quick_writer_prompt_uses_same_source_grounding_policy() -> None:
 
 
 def test_sourced_planner_limits_factual_scope_and_allows_pedagogical_structure() -> None:
+    assert PLANNER_PROMPT_VERSION == "planner-v3"
+    assert STANDARD_PLANNER_PROMPT_VERSION == "planner-standard-v4"
     for concise, expected_version in (
         (False, PLANNER_PROMPT_VERSION),
         (True, STANDARD_PLANNER_PROMPT_VERSION),
@@ -197,10 +211,86 @@ def test_sourced_planner_limits_factual_scope_and_allows_pedagogical_structure()
         assert prompt.version == expected_version
 
 
+def test_expanded_sourced_planner_uses_compact_reassessment_instructions() -> None:
+    request = _request().model_copy(
+        update={
+            "metadata": {
+                "knowledge_retrieval": {
+                    "diagnostics": {"scope_reassessment": True},
+                }
+            }
+        }
+    )
+
+    prompt = build_planner_prompt(request, concise=True)
+
+    assert prompt.version == STANDARD_EXPANDED_PLANNER_PROMPT_VERSION
+    assert "## Scope reassessment" in prompt.user_message
+    assert "List all supported and unsupported factual topics" in prompt.user_message
+
+
+def test_source_scope_schema_and_serialization() -> None:
+    schema = ExplanationPlan.model_json_schema()
+    scope_schema = schema["$defs"]["SourceScopeAssessment"]
+    assert "source_scope" in schema["required"]
+    status_ref = scope_schema["properties"]["status"]["$ref"]
+    assert status_ref.endswith("/SourceScopeStatus")
+    assert set(schema["$defs"]["SourceScopeStatus"]["enum"]) == {
+        "sufficient",
+        "partial",
+        "insufficient",
+    }
+    assert scope_schema["properties"]["supported_topics"]["type"] == "array"
+    assert scope_schema["properties"]["unsupported_requested_topics"]["type"] == "array"
+
+    plan = ExplanationPlan(
+        task=TaskType.EXPLANATION,
+        artifact_structure=["supported topic"],
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["quantum annealing"],
+            unsupported_requested_topics=["general quantum-computing fundamentals"],
+            scope_note="Available sources cover only specific models.",
+        ),
+        concept="Quantum annealing",
+        assumed_knowledge=[],
+        explanation_sequence=["Describe supported operation"],
+        example="A source-grounded example",
+        misconceptions=[],
+        check_for_understanding=["What topic do the sources cover?"],
+    )
+
+    assert plan.model_dump(mode="json")["source_scope"]["status"] == "partial"
+    assert plan.model_dump(mode="json")["source_scope"]["unsupported_requested_topics"] == [
+        "general quantum-computing fundamentals"
+    ]
+
+
+def test_sourced_planner_prompt_requires_partial_scope_assessment() -> None:
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        instruction="Explain quantum computing.",
+        source_material=[
+            SourceMaterial(
+                source_id="quantum",
+                title="Computing models",
+                text="Quantum annealing maps optimization problems to physical models.",
+            )
+        ],
+    )
+    planner_prompt = build_planner_prompt(request, concise=True)
+
+    assert "source_scope" in planner_prompt.system_message
+    assert "partial" in planner_prompt.system_message
+    assert "quantum annealing" in planner_prompt.user_message.lower()
+    assert "Explain quantum computing." in planner_prompt.user_message
+
+
 def test_source_free_planner_keeps_normal_prompt_behavior() -> None:
     prompt = build_planner_prompt(_request(with_source=False), concise=True)
 
     assert prompt.system_message == STANDARD_PLANNER_SYSTEM_PROMPT
+    assert "source_scope to null" in prompt.system_message
     assert PLANNER_SOURCE_GROUNDING_INSTRUCTIONS not in prompt.system_message
     assert prompt.version == STANDARD_PLANNER_PROMPT_VERSION
 

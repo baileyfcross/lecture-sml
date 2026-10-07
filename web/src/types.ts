@@ -89,6 +89,13 @@ export interface SourceSummary {
   assembled: number;
 }
 
+export interface SourceCoverage {
+  status: "sufficient" | "partial" | "insufficient";
+  supported_topics: string[];
+  unsupported_requested_topics: string[];
+  scope_note: string | null;
+}
+
 export interface TimingSummary {
   total_seconds: number;
   planner_seconds: number | null;
@@ -107,6 +114,7 @@ export interface GenerationResult {
   profile: ProfileName;
   output: string | null;
   errors: string[];
+  source_coverage: SourceCoverage | null;
   grounding: GroundingSummary;
   sources: SourceSummary;
   timing: TimingSummary;

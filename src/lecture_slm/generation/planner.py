@@ -128,7 +128,11 @@ class Planner:
                     thinking_enabled=settings.think,
                 )
                 last_timing = attempt_timing
-                plan = validate_plan_for_task(request.task, response.content)
+                plan = validate_plan_for_task(
+                    request.task,
+                    response.content,
+                    require_source_scope=bool(request.source_material),
+                )
                 return StageRecord(
                     status=GenerationStatus.COMPLETED,
                     timing=last_timing,

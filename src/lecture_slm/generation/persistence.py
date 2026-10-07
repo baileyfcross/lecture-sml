@@ -22,6 +22,7 @@ from lecture_slm.generation.prompts.grounding import (
     grounding_source_ref_map,
 )
 from lecture_slm.generation.prompts.planner import (
+    STANDARD_EXPANDED_PLANNER_PROMPT_VERSION,
     STANDARD_PLANNER_PROMPT_VERSION,
     build_planner_prompt,
 )
@@ -158,6 +159,119 @@ def _write_diagnostics(
         and writer_record.timing is not None
         and writer_record.timing.selected_context is not None
     )
+    retrieval_query_lines: list[str] = []
+    if retrieval_mapping:
+        original_query = retrieval_mapping.get("original_query", request.instruction)
+        canonical_query = retrieval_mapping.get(
+            "canonical_query",
+            retrieval_mapping.get("query", "n/a"),
+        )
+        retrieval_query_lines = [
+            f"- Original instruction: {original_query}",
+            f"- Canonical query: {canonical_query}",
+        ]
+    retrieval_diagnostics = retrieval_mapping.get("diagnostics", {})
+    retrieval_rounds = (
+        retrieval_diagnostics.get("retrieval_rounds", [])
+        if isinstance(retrieval_diagnostics, dict)
+        else []
+    )
+    retrieval_round_lines = [
+        f"- Retrieval rounds: {len(retrieval_rounds) if isinstance(retrieval_rounds, list) else 0}"
+    ]
+    if isinstance(retrieval_diagnostics, dict):
+        retrieval_round_lines.append(
+            f"- Retrieval expanded: "
+            f"{'yes' if retrieval_diagnostics.get('retrieval_expanded') else 'no'}"
+        )
+        if retrieval_diagnostics.get("expansion_retrieval_seconds") is not None:
+            retrieval_round_lines.append(
+                "- Expansion retrieval duration: "
+                f"{retrieval_diagnostics['expansion_retrieval_seconds']} seconds"
+            )
+        for label, key in (
+            ("Initial planning duration", "initial_planning_seconds"),
+            ("Final planning duration", "final_planning_seconds"),
+        ):
+            if retrieval_diagnostics.get(key) is not None:
+                retrieval_round_lines.append(f"- {label}: {retrieval_diagnostics[key]} seconds")
+        assessments = retrieval_diagnostics.get("source_scope_assessments")
+        if isinstance(assessments, dict):
+            scope_labels = (
+                ("Initial source scope", "initial"),
+                ("Final source scope", "final"),
+            )
+            for label, key in scope_labels:
+                assessment = assessments.get(key)
+                if isinstance(assessment, dict):
+                    retrieval_round_lines.append(f"- {label}: {assessment.get('status', 'n/a')}")
+                    for topic_label, topic_key in (
+                        ("supported", "supported_topics"),
+                        ("unsupported", "unsupported_requested_topics"),
+                    ):
+                        topics = assessment.get(topic_key)
+                        if isinstance(topics, list):
+                            topic_text = ", ".join(str(topic) for topic in topics) or "none"
+                            retrieval_round_lines.append(
+                                f"  - {topic_label.title()} topics: {topic_text}"
+                            )
+        expansion_plan = retrieval_diagnostics.get("expansion_plan")
+        if isinstance(expansion_plan, dict):
+            queries = expansion_plan.get("expansion_queries")
+            if isinstance(queries, list):
+                retrieval_round_lines.append(
+                    "- Expansion queries: " + (", ".join(str(query) for query in queries) or "none")
+                )
+        expansion_round = (
+            next(
+                (
+                    item
+                    for item in retrieval_rounds
+                    if isinstance(item, dict) and item.get("type") == "expansion"
+                ),
+                None,
+            )
+            if isinstance(retrieval_rounds, list)
+            else None
+        )
+        if isinstance(expansion_round, dict):
+            retrieval_round_lines.extend(
+                [
+                    f"- Unique chunks added: {expansion_round.get('unique_added_count', 0)}",
+                    f"- Merged retrieved matches: {expansion_round.get('merged_match_count', 0)}",
+                ]
+            )
+    if isinstance(retrieval_rounds, list):
+        for round_diagnostic in retrieval_rounds:
+            if isinstance(round_diagnostic, dict):
+                retrieval_round_lines.append(
+                    f"- Round {round_diagnostic.get('round', 'n/a')} "
+                    f"({round_diagnostic.get('type', 'unknown')}): "
+                    f"{round_diagnostic.get('retrieved_count', 0)} matches in "
+                    f"{round_diagnostic.get('duration_seconds', 0)} seconds"
+                )
+    source_scope_lines = ["## Source scope"]
+    source_scope = (
+        None
+        if planner_record is None or planner_record.plan is None
+        else planner_record.plan.source_scope
+    )
+    if source_scope is None:
+        source_scope_lines.append("- Assessment: not available")
+    else:
+        source_scope_lines.append(f"- Status: {source_scope.status.value}")
+        source_scope_lines.append("- Supported topics:")
+        source_scope_lines.extend(f"  - {topic}" for topic in source_scope.supported_topics)
+        if not source_scope.supported_topics:
+            source_scope_lines.append("  - none identified")
+        source_scope_lines.append("- Unsupported requested topics:")
+        source_scope_lines.extend(
+            f"  - {topic}" for topic in source_scope.unsupported_requested_topics
+        )
+        if not source_scope.unsupported_requested_topics:
+            source_scope_lines.append("  - none identified")
+        if source_scope.scope_note:
+            source_scope_lines.append(f"- Scope note: {source_scope.scope_note}")
     lines = [
         "# Generation Diagnostics",
         "",
@@ -170,6 +284,8 @@ def _write_diagnostics(
         "",
         "## Retrieval",
         f"- Retrieval enabled: {'yes' if retrieval is not None else 'no'}",
+        *retrieval_query_lines,
+        *retrieval_round_lines,
         f"- Number of retrieved matches: {len(matches) if isinstance(matches, list) else 0}",
         f"- Number of assembled source materials: {len(request.source_material)}",
         "- Retrieval warnings: "
@@ -180,6 +296,8 @@ def _write_diagnostics(
         ),
         "",
         *_stage_diagnostic("Planner", planner_record, used=planner_used),
+        "",
+        *source_scope_lines,
         "",
         *_stage_diagnostic("Writer", writer_record, used=writer_used),
         "",
@@ -231,7 +349,11 @@ def save_generation_run(
     if planner_record is not None and planner_record.prompt_version is not None:
         planner_prompt = build_planner_prompt(
             request,
-            concise=planner_record.prompt_version == STANDARD_PLANNER_PROMPT_VERSION,
+            concise=planner_record.prompt_version
+            in {
+                STANDARD_PLANNER_PROMPT_VERSION,
+                STANDARD_EXPANDED_PLANNER_PROMPT_VERSION,
+            },
         )
         timing = planner_record.timing
         _write_json(

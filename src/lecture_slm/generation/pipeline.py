@@ -17,6 +17,8 @@ from lecture_slm.generation.models import (
     GroundingReviewRecord,
     ProgressEvent,
     ReviewFeedback,
+    SourceScopeAssessment,
+    SourceScopeStatus,
     StageRecord,
     StageTiming,
 )
@@ -36,6 +38,10 @@ from lecture_slm.generation.writer import Writer
 from lecture_slm.inference.ollama_client import OllamaClient, OllamaError
 
 ProgressCallback = Callable[[ProgressEvent], None]
+RetrievalExpansionCallback = Callable[
+    [GenerationRequest, SourceScopeAssessment],
+    GenerationRequest | None,
+]
 ClientFactory = Callable[[str, float], OllamaClient]
 
 
@@ -64,6 +70,7 @@ class GenerationPipeline:
         request: GenerationRequest,
         *,
         on_progress: ProgressCallback | None = None,
+        expand_retrieval: RetrievalExpansionCallback | None = None,
     ) -> GenerationResult:
         started = time.perf_counter()
         profile = self.profiles.profiles[request.profile]
@@ -109,60 +116,57 @@ class GenerationPipeline:
                 final_output=None,
             )
 
-        if profile.planner.enabled:
-            planner_prompt = build_planner_prompt(request)
+        def run_planner(target_request: GenerationRequest) -> StageRecord:
+            planner_prompt = build_planner_prompt(target_request)
             planner_input = f"{planner_prompt.system_message}\n\n{planner_prompt.user_message}"
             try:
                 planner_selection = select_context_tier(
                     planner_input,
                     profile.planner.context_tiers,
                     safety_margin=self.profiles.context_safety_margin,
-                    output_reserve_tokens=profile.planner.output_budget(request.task),
+                    output_reserve_tokens=profile.planner.output_budget(target_request.task),
                 )
                 selected_contexts["planner"] = planner_selection.selected_context
                 estimated_inputs["planner"] = planner_selection.estimated_input_tokens
             except ValueError as error:
-                planner_record = StageRecord(
+                return StageRecord(
                     status=GenerationStatus.FAILED,
                     error_type=type(error).__name__,
                     error_message=str(error),
                 )
-            else:
-                planning_message = (
-                    "Deep planning: creating a structured teaching plan"
-                    if request.profile.value == "deep"
-                    else "Planning: creating a concise structured teaching plan"
-                )
-                self._emit_stage_start(
-                    progress,
-                    GenerationStage.PLANNING,
-                    planning_message,
-                    profile.planner.output_budget(request.task),
-                )
-                planner = Planner(
-                    client=self.client_factory(
-                        self.model_config.inference.host,
-                        profile.planner.timeout_seconds,
-                    ),
-                    model=self.model_config.ollama_name,
-                    model_config=self.model_config,
-                    profiles=self.profiles,
-                )
-                planner_record = planner.plan(request, profile.planner)
-                plan = planner_record.plan
-                selected = (
-                    None
-                    if planner_record.timing is None
-                    else planner_record.timing.selected_context
-                )
-                if selected is not None:
-                    selected_contexts["planner"] = selected
-                if (
-                    planner_record.timing
-                    and planner_record.timing.estimated_input_tokens is not None
-                ):
-                    estimated_inputs["planner"] = planner_record.timing.estimated_input_tokens
-                self._emit_stage_complete(progress, GenerationStage.PLANNING, planner_record)
+
+            planning_message = (
+                "Deep planning: creating a structured teaching plan"
+                if target_request.profile.value == "deep"
+                else "Planning: creating a concise structured teaching plan"
+            )
+            self._emit_stage_start(
+                progress,
+                GenerationStage.PLANNING,
+                planning_message,
+                profile.planner.output_budget(target_request.task),
+            )
+            planner = Planner(
+                client=self.client_factory(
+                    self.model_config.inference.host,
+                    profile.planner.timeout_seconds,
+                ),
+                model=self.model_config.ollama_name,
+                model_config=self.model_config,
+                profiles=self.profiles,
+            )
+            record = planner.plan(target_request, profile.planner)
+            selected = None if record.timing is None else record.timing.selected_context
+            if selected is not None:
+                selected_contexts["planner"] = selected
+            if record.timing and record.timing.estimated_input_tokens is not None:
+                estimated_inputs["planner"] = record.timing.estimated_input_tokens
+            self._emit_stage_complete(progress, GenerationStage.PLANNING, record)
+            return record
+
+        if profile.planner.enabled:
+            planner_record = run_planner(request)
+            plan = planner_record.plan
 
             if planner_record.status is GenerationStatus.FAILED or plan is None:
                 errors.append(
@@ -183,6 +187,114 @@ class GenerationPipeline:
                     reviewer_error=None,
                     final_output=None,
                 )
+
+            initial_scope = plan.source_scope
+            if (
+                expand_retrieval is not None
+                and initial_scope is not None
+                and initial_scope.status is SourceScopeStatus.PARTIAL
+            ):
+                initial_planner_seconds = (
+                    0.0 if planner_record.timing is None else planner_record.timing.duration_seconds
+                )
+                retrieval_diagnostics = request.metadata.get("knowledge_retrieval")
+                expanded_request = expand_retrieval(request, initial_scope)
+                if expanded_request is not None:
+                    request = expanded_request
+                    planner_record = run_planner(request)
+                    plan = planner_record.plan
+                    retrieval_diagnostics = request.metadata.get("knowledge_retrieval")
+                if isinstance(retrieval_diagnostics, dict):
+                    round_diagnostics = retrieval_diagnostics.setdefault("diagnostics", {})
+                    if isinstance(round_diagnostics, dict):
+                        round_diagnostics["source_scope_assessments"] = {
+                            "initial": initial_scope.model_dump(mode="json"),
+                            "final": (
+                                None
+                                if plan is None or plan.source_scope is None
+                                else plan.source_scope.model_dump(mode="json")
+                            ),
+                        }
+                        round_diagnostics["initial_planning_seconds"] = initial_planner_seconds
+                        round_diagnostics["final_planning_seconds"] = (
+                            initial_planner_seconds
+                            if expanded_request is None
+                            else (
+                                0.0
+                                if planner_record.timing is None
+                                else planner_record.timing.duration_seconds
+                            )
+                        )
+
+                if expanded_request is not None and (
+                    planner_record.status is GenerationStatus.FAILED or plan is None
+                ):
+                    errors.append(
+                        "Planner failed after retrieval expansion: "
+                        f"{planner_record.error_type}: {planner_record.error_message}"
+                    )
+                    progress(GenerationStage.FAILED, "Planner failed; writer was not started")
+                    return self._result(
+                        request,
+                        profile,
+                        GenerationStatus.FAILED,
+                        started,
+                        errors=errors,
+                        selected_contexts=selected_contexts,
+                        estimated_inputs=estimated_inputs,
+                        planner_record=planner_record,
+                        writer_record=None,
+                        reviewer_feedback=None,
+                        reviewer_error=None,
+                        final_output=None,
+                    )
+            elif (
+                expand_retrieval is not None
+                and initial_scope is not None
+                and isinstance(request.metadata.get("knowledge_retrieval"), dict)
+            ):
+                retrieval_diagnostics = request.metadata["knowledge_retrieval"]
+                round_diagnostics = retrieval_diagnostics.setdefault("diagnostics", {})
+                if isinstance(round_diagnostics, dict):
+                    round_diagnostics["source_scope_assessments"] = {
+                        "initial": initial_scope.model_dump(mode="json"),
+                        "final": initial_scope.model_dump(mode="json"),
+                    }
+                    round_diagnostics["initial_planning_seconds"] = (
+                        0.0
+                        if planner_record.timing is None
+                        else planner_record.timing.duration_seconds
+                    )
+                    round_diagnostics["final_planning_seconds"] = round_diagnostics[
+                        "initial_planning_seconds"
+                    ]
+
+        if (
+            request.source_material
+            and plan is not None
+            and plan.source_scope is not None
+            and plan.source_scope.status is SourceScopeStatus.INSUFFICIENT
+        ):
+            message = (
+                "Supplied sources are insufficient to support a substantive factual artifact; "
+                "the writer was not started."
+            )
+            errors.append(message)
+            progress(GenerationStage.FAILED, message)
+            return self._result(
+                request,
+                profile,
+                GenerationStatus.FAILED,
+                started,
+                errors=errors,
+                selected_contexts=selected_contexts,
+                estimated_inputs=estimated_inputs,
+                planner_record=planner_record,
+                writer_record=None,
+                reviewer_feedback=None,
+                reviewer_error=None,
+                final_output=None,
+            )
 
         writer_prompt = build_writer_prompt(request, plan)
         writer_input = f"{writer_prompt.system_message}\n\n{writer_prompt.user_message}"

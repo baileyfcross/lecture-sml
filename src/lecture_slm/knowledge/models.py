@@ -14,6 +14,21 @@ class SourceResolutionStrength(StrEnum):
     INFERRED = "inferred"
 
 
+class RetrievalQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original: str = Field(min_length=1)
+    canonical: str = Field(min_length=1)
+
+
+class RetrievalExpansionPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original_query: str = Field(min_length=1)
+    expansion_queries: list[str] = Field(default_factory=list, max_length=3)
+    missing_topics: list[str] = Field(default_factory=list, max_length=3)
+
+
 class KnowledgeChunk(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -107,6 +122,8 @@ class RetrievalResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str
+    original_query: str | None = None
+    canonical_query: str | None = None
     resolved_source: dict[str, Any] | None = None
     resolved_section: str | None = None
     matches: list[RetrievalMatch] = Field(default_factory=list)

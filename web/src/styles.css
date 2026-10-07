@@ -390,6 +390,26 @@ textarea {
   border-radius: 0.25rem;
 }
 
+.source-coverage {
+  margin: 0 0 1rem;
+  padding: 0 0 0 1rem;
+  border-left: 4px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.source-coverage strong {
+  display: block;
+  margin-bottom: 0.2rem;
+}
+
+.source-coverage p {
+  margin: 0;
+}
+
+.source-coverage[hidden] {
+  display: none;
+}
+
 .message-error {
   border-color: var(--bad);
   color: var(--bad);
@@ -417,6 +437,17 @@ textarea {
 
 .markdown-body {
   overflow-wrap: anywhere;
+}
+
+.markdown-body .katex {
+  color: inherit;
+}
+
+.markdown-body .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
 }
 
 .markdown-body > :last-child {

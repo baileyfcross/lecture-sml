@@ -80,6 +80,21 @@ class OutputPreferences(BaseModel):
     constraints: list[str] = Field(default_factory=list)
 
 
+class SourceScopeStatus(StrEnum):
+    SUFFICIENT = "sufficient"
+    PARTIAL = "partial"
+    INSUFFICIENT = "insufficient"
+
+
+class SourceScopeAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: SourceScopeStatus
+    supported_topics: list[str] = Field(default_factory=list)
+    unsupported_requested_topics: list[str] = Field(default_factory=list)
+    scope_note: str | None = None
+
+
 class GenerationRequest(BaseModel):
     """Validated generation input independent of training or transport details."""
 
@@ -133,6 +148,7 @@ class TeachingPlanBase(BaseModel):
     task: TaskType
     artifact_structure: list[str] = Field(min_length=1)
     notes_for_writer: list[str] = Field(default_factory=list)
+    source_scope: SourceScopeAssessment | None
 
 
 class ExplanationPlan(TeachingPlanBase):

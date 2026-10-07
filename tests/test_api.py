@@ -8,6 +8,7 @@ from lecture_slm.api.app import create_app
 from lecture_slm.api.models import GenerateResponse
 from lecture_slm.config.loader import load_model_config
 from lecture_slm.generation.models import (
+    ExplanationPlan,
     GenerationProfileName,
     GenerationRequest,
     GenerationResult,
@@ -20,6 +21,8 @@ from lecture_slm.generation.models import (
     GroundingReviewRecord,
     GroundingSupportMethod,
     ProgressEvent,
+    SourceScopeAssessment,
+    SourceScopeStatus,
     StageRecord,
     StageTiming,
 )
@@ -218,6 +221,63 @@ def test_generate_maps_request_and_returns_successful_result() -> None:
     )
     assert save_run is True
     assert client.get(f"/api/runs/{result['request_id']}").json() == result
+
+
+def test_generate_response_includes_source_coverage_assessment() -> None:
+    execution = FakeService().generate(
+        GenerationRequest(
+            task=TaskType.EXPLANATION,
+            profile=GenerationProfileName.STANDARD,
+            instruction="Explain quantum computing.",
+        )
+    )
+    plan = ExplanationPlan(
+        task=TaskType.EXPLANATION,
+        artifact_structure=["Quantum annealing"],
+        notes_for_writer=[],
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["quantum annealing"],
+            unsupported_requested_topics=["error correction"],
+            scope_note=(
+                "The available materials support quantum annealing, but not a complete "
+                "treatment of error correction."
+            ),
+        ),
+        concept="Quantum computing",
+        assumed_knowledge=[],
+        explanation_sequence=["Quantum annealing"],
+        example="A simple optimization example",
+        misconceptions=[],
+        check_for_understanding=["Describe quantum annealing."],
+    )
+    result = execution.result.model_copy(
+        update={
+            "planner_result": StageRecord(
+                status=GenerationStatus.COMPLETED,
+                plan=plan,
+            )
+        }
+    )
+
+    response = GenerateResponse.from_execution(
+        GenerationExecution(
+            execution.request,
+            result,
+            execution.saved_run_directory,
+            execution.retrieved_count,
+        )
+    )
+
+    assert response.model_dump(mode="json")["source_coverage"] == {
+        "status": "partial",
+        "supported_topics": ["quantum annealing"],
+        "unsupported_requested_topics": ["error correction"],
+        "scope_note": (
+            "The available materials support quantum annealing, but not a complete "
+            "treatment of error correction."
+        ),
+    }
 
 
 def test_default_profile_comes_from_generation_configuration() -> None:

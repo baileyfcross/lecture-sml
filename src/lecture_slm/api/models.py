@@ -13,6 +13,7 @@ from lecture_slm.generation.models import (
     OutputPreferences,
     PreviousCourseContext,
     SourceMaterial,
+    SourceScopeAssessment,
     StageRecord,
 )
 from lecture_slm.generation.profiles import GenerationProfiles
@@ -117,6 +118,7 @@ class GenerateResponse(BaseModel):
     profile: GenerationProfileName
     output: str | None = None
     errors: list[str] = Field(default_factory=list)
+    source_coverage: SourceScopeAssessment | None = None
     grounding: GroundingSummary
     sources: SourceSummary
     timing: TimingSummary
@@ -128,6 +130,7 @@ class GenerateResponse(BaseModel):
         result = execution.result
         initial = result.initial_grounding_review
         final = result.final_grounding_review
+        planner_result = result.planner_result
         return cls(
             request_id=result.request_id,
             status=result.status,
@@ -135,6 +138,11 @@ class GenerateResponse(BaseModel):
             profile=result.profile,
             output=result.final_output,
             errors=result.errors,
+            source_coverage=(
+                None
+                if planner_result is None or planner_result.plan is None
+                else planner_result.plan.source_scope
+            ),
             grounding=GroundingSummary(
                 reviewed=initial is not None or final is not None,
                 revision_performed=result.revision_result is not None,
