@@ -79,13 +79,13 @@ profiles:
       enabled: true
       think: true
       temperature: 0.5
-      context_tiers: [8192]
+      context_tiers: [8192, 16384]
       max_output_tokens: 3072
       task_output_tokens:
         explanation: 3072
         slides: 1536
         activity: 1536
-        instructor_guide: 2048
+        instructor_guide: 3072
         assessment: 1536
         homework: 1536
         lab: 2048

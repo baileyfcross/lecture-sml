@@ -3,6 +3,25 @@
 import { describe, expect, it } from "vitest";
 import { renderArtifactMarkdown } from "../src/markdown";
 
+function renderContainer(markdown: string): HTMLElement {
+  const container = document.createElement("div");
+  container.innerHTML = renderArtifactMarkdown(markdown);
+  return container;
+}
+
+function expectMathExpressions(container: HTMLElement, expressions: string[]): void {
+  const mathExpressions = container.querySelectorAll(".katex-mathml math");
+  expect(mathExpressions).toHaveLength(expressions.length);
+  expressions.forEach((expression, index) => {
+    expect(mathExpressions[index]?.textContent).toContain(expression);
+  });
+}
+
+function expectValidMath(container: HTMLElement, count: number): void {
+  expect(container.querySelectorAll(".katex")).toHaveLength(count);
+  expect(container.querySelectorAll(".katex-error")).toHaveLength(0);
+}
+
 describe("renderArtifactMarkdown", () => {
   it("renders inline and display math with accessible MathML", () => {
     const html = renderArtifactMarkdown(
@@ -105,5 +124,82 @@ describe("renderArtifactMarkdown", () => {
     expect(html).toContain("<hr>");
     expect(html).toContain("<code>code</code>");
     expect(html).toContain("katex");
+  });
+
+  it("renders separate inline math expressions in the live modular-arithmetic list item", () => {
+    const container = renderContainer(
+      "- **Modular arithmetic systems** (like $\\mathbb{Z}_n$) provide concrete finite examples where groups, rings, and fields emerge depending on $n$.",
+    );
+    const item = container.querySelector("li");
+
+    expect(container.querySelectorAll("li")).toHaveLength(1);
+    expect(item?.querySelector("strong")?.textContent).toBe("Modular arithmetic systems");
+    expect(item?.textContent).toContain("(like");
+    expect(item?.textContent).toContain(") provide concrete finite examples where groups, rings, and fields emerge depending on");
+    expectMathExpressions(container, ["\\mathbb{Z}_n", "n"]);
+    expectValidMath(container, 2);
+    expect(item?.textContent).not.toContain("$");
+  });
+
+  it.each([
+    ["two expressions", "$A$ and $B$", ["A", "B"], " and "],
+    ["three expressions", "$A$, $B$, and $C$", ["A", "B", "C"], ", "],
+    ["parenthesized expressions", "$(a+b)$ then $(c+d)$", ["(a+b)", "(c+d)"], " then "],
+    ["mixed inline text", "The result is $x$ and the next value is $y$.", ["x", "y"], " and the next value is "],
+    ["parenthesized math", "(like $\\mathbb{Z}_n$)", ["\\mathbb{Z}_n"], "(like"],
+  ])("tokenizes %s independently", (_label, markdown, expressions, prose) => {
+    const container = renderContainer(markdown);
+
+    expectMathExpressions(container, expressions);
+    expectValidMath(container, expressions.length);
+    expect(container.textContent).toContain(prose);
+  });
+
+  it("renders common math commands as independent expressions", () => {
+    const expressions = [
+      "\\mathbb{Z}_n",
+      "\\forall x \\, P(x)",
+      "\\exists x \\, P(x)",
+      "P(x) \\rightarrow Q(x)",
+      "\\frac{a}{b}",
+      "x_1 + x_2",
+    ];
+    const container = renderContainer(expressions.map((expression) => `$${expression}$`).join(" and "));
+
+    expectMathExpressions(container, expressions);
+    expectValidMath(container, expressions.length);
+  });
+
+  it("preserves escaped-dollar and currency text before later math", () => {
+    const cases = [
+      String.raw`The price is \$500 and the variable is $x$.`,
+      "The computer costs $500 and the variable is $x$.",
+      "The computer costs $500, the monitor costs $200, and the variable is $x$.",
+    ];
+
+    for (const markdown of cases) {
+      const container = renderContainer(markdown);
+      expectMathExpressions(container, ["x"]);
+      expectValidMath(container, 1);
+      expect(container.textContent).toContain("$500");
+      expect(container.textContent).not.toContain("$x$");
+    }
+  });
+
+  it("does not interpret math inside inline or fenced code", () => {
+    const container = renderContainer("`$A$ and $B$`\n\n```text\n$A$ and $B$\n```");
+
+    expect(container.querySelectorAll(".katex")).toHaveLength(0);
+    expect(container.querySelector("code")?.textContent).toContain("$A$ and $B$");
+    expect(container.textContent).toContain("$A$ and $B$");
+  });
+
+  it("renders display math and parenthesis delimiters without errors", () => {
+    const container = renderContainer(
+      "$$\n\\forall x \\, P(x)\n$$\n\n\\[\nP(x)\n\\]\n\n\\(P(x)\\)",
+    );
+
+    expectValidMath(container, 3);
+    expect(container.querySelectorAll(".katex-display")).toHaveLength(2);
   });
 });

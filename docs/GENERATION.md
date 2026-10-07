@@ -40,7 +40,7 @@ The grounding prompts are versioned as `grounding-review-v6` and `grounding-revi
 
 ## Rendering approved output
 
-The web UI renders approved Markdown with KaTeX for inline `$...$` and `\(...\)` math and display `$$...$$` and `\[...\]` math. KaTeX's HTML and MathML output passes through DOMPurify before insertion; untrusted generated HTML remains sanitized. For example, a universal statement can be written as:
+The web UI renders approved Markdown with KaTeX for inline `$...$` and `\(...\)` math and display `$$...$$` and `\[...\]` math. Multiple independent inline `$...$` expressions are supported on the same Markdown line. KaTeX's HTML and MathML output passes through DOMPurify before insertion; untrusted generated HTML remains sanitized. For example, a universal statement can be written as:
 
 ```latex
 \[
