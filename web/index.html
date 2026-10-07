@@ -75,6 +75,69 @@
         </form>
       </section>
 
+      <section class="panel workspace-panel" aria-labelledby="workspace-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="workspace-heading">Workspace</h2>
+            <p class="field-help">Local continuity, history, and references stay separate from the Vault.</p>
+          </div>
+          <button id="refresh-workspaces" class="button button-quiet" type="button">Refresh</button>
+        </div>
+        <label for="workspace-select">
+          Active Workspace
+          <select id="workspace-select" name="workspace_id">
+            <option value="">No Workspace</option>
+          </select>
+        </label>
+        <p id="workspace-message" class="field-help" role="status"></p>
+        <details id="workspace-manager">
+          <summary>Manage Workspace</summary>
+          <form id="workspace-create-form" class="workspace-form">
+            <label for="workspace-name">New Workspace name</label>
+            <div class="inline-controls">
+              <input id="workspace-name" name="workspace-name" maxlength="200" required />
+              <button class="button button-quiet" type="submit">Create</button>
+            </div>
+          </form>
+          <form id="workspace-folder-form" class="workspace-form">
+            <h3>Add a logical folder</h3>
+            <label for="workspace-folder-name">Folder name</label>
+            <input id="workspace-folder-name" maxlength="200" required />
+            <label for="workspace-folder-parent">Parent folder</label>
+            <select id="workspace-folder-parent">
+              <option value="">Workspace root</option>
+            </select>
+            <button class="button button-quiet" type="submit">Create folder</button>
+          </form>
+          <form id="workspace-item-form" class="workspace-form">
+            <h3>Add Workspace item</h3>
+            <label for="workspace-item-title">Title</label>
+            <input id="workspace-item-title" maxlength="300" required />
+            <label for="workspace-item-role">Role</label>
+            <select id="workspace-item-role">
+              <option value="context">Context — continuity only, not factual evidence</option>
+              <option value="history">History — prior approved work, continuity only</option>
+              <option value="reference">Reference — may support factual claims</option>
+            </select>
+            <label for="workspace-item-folder">Folder</label>
+            <select id="workspace-item-folder">
+              <option value="">Workspace root</option>
+            </select>
+            <label for="workspace-item-content">Content</label>
+            <textarea id="workspace-item-content" rows="4" required></textarea>
+            <label class="check-label" for="workspace-item-pinned">
+              <input id="workspace-item-pinned" type="checkbox" />
+              Pin for future generations
+            </label>
+            <button class="button button-quiet" type="submit">Add item</button>
+          </form>
+          <h3>Workspace items</h3>
+          <ul id="workspace-items" class="workspace-items"></ul>
+          <h3>Folders</h3>
+          <ul id="workspace-folders" class="workspace-items"></ul>
+        </details>
+      </section>
+
       <section class="panel progress-panel" aria-labelledby="progress-heading" aria-live="polite">
         <div class="section-heading">
           <h2 id="progress-heading">Progress</h2>
@@ -107,7 +170,13 @@
         <section id="panel-output" class="tab-panel" role="tabpanel" aria-labelledby="tab-output" data-panel="output">
           <div class="section-heading">
             <h2>Approved output</h2>
-            <button id="copy-output" class="button button-quiet" type="button" disabled>Copy</button>
+            <div class="inline-controls">
+              <input id="workspace-save-title" aria-label="History item title" placeholder="History title" />
+              <button id="save-output" class="button button-quiet" type="button" disabled>
+                Save to Workspace
+              </button>
+              <button id="copy-output" class="button button-quiet" type="button" disabled>Copy</button>
+            </div>
           </div>
           <aside id="source-coverage" class="source-coverage" role="status" hidden></aside>
           <p id="output-empty" class="empty-state">Your approved output will appear here.</p>

@@ -48,6 +48,7 @@ data/processed/*
 !data/processed/.gitkeep
 data/knowledge/*
 !data/knowledge/.gitkeep
+data/workspaces/
 # Includes private real-vault evaluation cases, passages, and human reviews.
 data/knowledge/evaluation/
 evaluation-results/

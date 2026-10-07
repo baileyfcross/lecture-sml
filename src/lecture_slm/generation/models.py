@@ -11,6 +11,7 @@ from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
 from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyProfile
+from lecture_slm.workspaces.models import WorkspaceContext
 
 
 class GenerationProfileName(StrEnum):
@@ -104,6 +105,8 @@ class GenerationRequest(BaseModel):
     task: TaskType
     profile: GenerationProfileName = GenerationProfileName.STANDARD
     instruction: str = Field(min_length=1)
+    workspace_id: str | None = Field(default=None, min_length=1)
+    workspace_context: WorkspaceContext | None = None
     course: CourseProfile | None = None
     pedagogy: PedagogyProfile | None = None
     source_material: list[SourceMaterial] = Field(default_factory=list)

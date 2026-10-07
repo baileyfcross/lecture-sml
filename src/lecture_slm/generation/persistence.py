@@ -372,6 +372,23 @@ def save_generation_run(
     if retrieval is not None:
         _write_json(directory / "retrieval.json", retrieval)
 
+    workspace_diagnostics = request.metadata.get("workspace")
+    if request.workspace_context is not None and workspace_diagnostics is not None:
+        workspace_references = [
+            source.model_dump(mode="json")
+            for source in request.source_material
+            if source.metadata.get("source_origin") == "workspace_reference"
+        ]
+        _write_json(
+            directory / "workspace_context.json",
+            {
+                "workspace_id": request.workspace_id,
+                "continuity": request.workspace_context.model_dump(mode="json"),
+                "selection": workspace_diagnostics,
+                "references": workspace_references,
+            },
+        )
+
     _write_json(
         directory / "sources.json",
         [source.model_dump(mode="json") for source in request.source_material],

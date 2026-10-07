@@ -36,6 +36,7 @@ from lecture_slm.knowledge.query import (
 from lecture_slm.knowledge.retrieval import KnowledgeRetriever
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vault import validate_knowledge_paths
+from lecture_slm.workspaces.service import WorkspaceService
 
 ProgressCallback = Callable[[ProgressEvent], None]
 RouterFactory = Callable[..., GenerationRouter]
@@ -190,14 +191,27 @@ class GenerationService:
         model_config: ModelConfig,
         profiles: GenerationProfiles,
         knowledge_config_path: Path = Path("configs/knowledge/default.yaml"),
+        workspace_config_path: Path = Path("configs/workspaces/default.yaml"),
         artifact_root: Path = Path("artifacts/generations"),
         router_factory: RouterFactory = GenerationRouter,
     ) -> None:
         self.model_config = model_config
         self.profiles = profiles
         self.knowledge_config_path = knowledge_config_path
+        self.workspace_config_path = workspace_config_path
         self.artifact_root = artifact_root
         self.router_factory = router_factory
+        self._workspace_service: WorkspaceService | None = None
+
+    @property
+    def workspaces(self) -> WorkspaceService:
+        if self._workspace_service is None:
+            from lecture_slm.workspaces.config import load_workspace_config
+
+            self._workspace_service = WorkspaceService(
+                load_workspace_config(self.workspace_config_path)
+            )
+        return self._workspace_service
 
     def generate(
         self,
@@ -211,16 +225,64 @@ class GenerationService:
         retrieval_result: RetrievalResult | None = None
         retrieval_expander: RetrievalExpansionCallback | None = None
         expanded_request: GenerationRequest | None = None
-        if retrieval is not None and retrieval.enabled:
+        knowledge_config: KnowledgeConfig | None = None
+        retrieval_budget = 0
+        if request.workspace_id is not None or (retrieval is not None and retrieval.enabled):
             knowledge_config = load_knowledge_config(self.knowledge_config_path)
-            retrieval_query = canonicalize_retrieval_query(request.instruction)
-            retrieval_started = time.perf_counter()
-            retrieval_result = self._retrieve(
-                request,
-                retrieval,
-                knowledge_config,
-                query=retrieval_query,
+            retrieval_budget = knowledge_config.retrieval.context_budgets[request.profile.value]
+
+        if request.workspace_id is not None:
+            explicit_material = list(request.source_material)
+            workspace_selection = self.workspaces.select_generation_context(
+                request.workspace_id,
+                request.instruction,
+                request.profile,
+                max(0, retrieval_budget - _source_material_tokens(explicit_material)),
             )
+            workspace_metadata = dict(request.metadata)
+            workspace_metadata["workspace"] = workspace_selection.diagnostics
+            active_request = request.model_copy(
+                update={
+                    "workspace_context": workspace_selection.continuity,
+                    "source_material": [*explicit_material, *workspace_selection.references],
+                    "metadata": workspace_metadata,
+                }
+            )
+
+        if retrieval is not None and retrieval.enabled and knowledge_config is not None:
+            retrieval_query = canonicalize_retrieval_query(request.instruction)
+            effective_query = retrieval_query.canonical
+            if request.workspace_id is not None and active_request.workspace_context is not None:
+                effective_query = self.workspaces.anchor_retrieval_query(
+                    retrieval_query.canonical,
+                    active_request.workspace_context.workspace_name,
+                )
+            actual_retrieval_query = RetrievalQuery(
+                original=retrieval_query.original,
+                canonical=effective_query,
+            )
+            remaining_source_budget = retrieval_budget - _source_material_tokens(
+                active_request.source_material
+            )
+            retrieval_started = time.perf_counter()
+            if remaining_source_budget > 0 or request.workspace_id is None:
+                retrieval_result = self._retrieve(
+                    request,
+                    retrieval,
+                    knowledge_config,
+                    query=actual_retrieval_query,
+                )
+            else:
+                retrieval_result = RetrievalResult(
+                    query=retrieval_query.original,
+                    original_query=retrieval_query.original,
+                    canonical_query=retrieval_query.canonical,
+                    matches=[],
+                    warnings=[
+                        "Explicit and Workspace Reference sources used the configured "
+                        "source-context budget; no global sources were retrieved."
+                    ],
+                )
             initial_retrieval_seconds = time.perf_counter() - retrieval_started
             retrieval_result = retrieval_result.model_copy(
                 update={
@@ -228,20 +290,22 @@ class GenerationService:
                     "canonical_query": retrieval_query.canonical,
                 }
             )
+            if request.workspace_id is not None:
+                retrieval_result.diagnostics["workspace_anchored_query"] = effective_query
             retrieval_result.diagnostics["retrieval_rounds"] = [
                 {
                     "round": 1,
                     "type": "initial",
-                    "query": retrieval_query.canonical,
+                    "query": effective_query,
                     "retrieved_count": len(retrieval_result.matches),
                     "duration_seconds": initial_retrieval_seconds,
                     "results": [_match_diagnostic(match) for match in retrieval_result.matches],
                 }
             ]
-            budget = knowledge_config.retrieval.context_budgets[request.profile.value]
-            explicit_material = list(request.source_material)
+            budget = retrieval_budget
+            explicit_material = list(active_request.source_material)
             remaining_budget = budget - _source_material_tokens(explicit_material)
-            source_material = list(request.source_material)
+            source_material = list(active_request.source_material)
             retrieved_material: list[SourceMaterial] = []
             if remaining_budget > 0:
                 retrieved_material = KnowledgeContextAssembler().assemble(
@@ -254,9 +318,9 @@ class GenerationService:
                     "Explicit source material used the configured source-context budget; "
                     "no retrieved material was added."
                 )
-            metadata = dict(request.metadata)
+            metadata = dict(active_request.metadata)
             metadata["knowledge_retrieval"] = retrieval_result.model_dump(mode="json")
-            active_request = request.model_copy(
+            active_request = active_request.model_copy(
                 update={"source_material": source_material, "metadata": metadata}
             )
 
@@ -289,6 +353,14 @@ class GenerationService:
                         _match_identity(match) for match in initial_retrieval_result.matches
                     }
                     for expansion_query in plan.expansion_queries:
+                        if (
+                            request.workspace_id is not None
+                            and active_request.workspace_context is not None
+                        ):
+                            expansion_query = self.workspaces.anchor_retrieval_query(
+                                expansion_query,
+                                active_request.workspace_context.workspace_name,
+                            )
                         result = self._retrieve(
                             request,
                             retrieval,

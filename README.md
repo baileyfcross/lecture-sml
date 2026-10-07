@@ -130,8 +130,9 @@ The web interface lets you:
 - Inspect source counts, grounding decisions, timings, errors, and saved-run paths.
 - Distinguish grounding failures (where no output is approved) from API or connection errors.
 - See API, model, and knowledge-index readiness.
+- Select an optional local Workspace, manage its folders and typed Context/History/Reference items, and explicitly save approved output to Workspace History.
 
-The browser communicates with the Lecture SLM API only; it does not call Ollama directly or store prompts and generated output in browser storage. Retrieval and generation settings remain governed by the backend. See [docs/GENERATION.md](docs/GENERATION.md) for the API contract and frontend development details.
+The browser communicates with the Lecture SLM API only; it does not call Ollama directly or store prompts and generated output in browser storage. Only the selected Workspace ID is persisted as a browser preference. Workspace content remains in the separate, Git-ignored Workspace SQLite store; see [docs/GENERATION.md](docs/GENERATION.md) for role boundaries, budgets, API routes, and frontend development details.
 
 ## Local Knowledge
 

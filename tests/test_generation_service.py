@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from lecture_slm.config.loader import load_model_config
 from lecture_slm.generation.models import (
     GenerationRequest,
@@ -14,10 +16,13 @@ from lecture_slm.generation.models import (
     StageTiming,
 )
 from lecture_slm.generation.profiles import load_generation_profiles
+from lecture_slm.generation.prompts.base import request_blocks
 from lecture_slm.generation.service import GenerationService, RetrievalOptions
 from lecture_slm.knowledge.config import KnowledgeConfig
 from lecture_slm.knowledge.models import RetrievalMatch, RetrievalResult
 from lecture_slm.schemas.dataset import TaskType
+from lecture_slm.workspaces.models import WorkspaceItemInput, WorkspaceItemRole
+from lecture_slm.workspaces.service import WorkspaceService
 
 ROOT = Path(__file__).parents[1]
 
@@ -86,6 +91,169 @@ def test_generation_service_routes_the_request_through_the_pipeline() -> None:
     assert router.expansion_callback is None
 
 
+def test_generation_materializes_reference_sources_and_continuity_only_workspace_items(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter()
+    service = _service(router)
+    service.artifact_root = tmp_path / "runs"
+    service._workspace_service = WorkspaceService(database_path=tmp_path / "workspaces.sqlite")
+    workspace = service.workspaces.store.create_workspace("CSC 220 Logic")
+    context = service.workspaces.store.create_item(
+        workspace.id,
+        WorkspaceItemInput(
+            title="Course terminology",
+            role=WorkspaceItemRole.CONTEXT,
+            content="Learners call truth tables valuation tables.",
+        ),
+    )
+    history = service.workspaces.store.create_item(
+        workspace.id,
+        WorkspaceItemInput(
+            title="Prior lesson",
+            role=WorkspaceItemRole.HISTORY,
+            content="Previously introduced propositions and connectives.",
+        ),
+    )
+    reference = service.workspaces.store.create_item(
+        workspace.id,
+        WorkspaceItemInput(
+            title="Logic reference",
+            role=WorkspaceItemRole.REFERENCE,
+            content="A proposition has a truth value.",
+        ),
+    )
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: KnowledgeConfig(),
+    )
+
+    execution = service.generate(
+        GenerationRequest(
+            task=TaskType.EXPLANATION,
+            instruction="Explain a proposition using a truth table.",
+            workspace_id=workspace.id,
+        ),
+        save_run=True,
+    )
+
+    assert router.request is not None
+    assert router.request.workspace_context is not None
+    assert {item.id for item in router.request.workspace_context.items} == {
+        context.id,
+        history.id,
+    }
+    assert [
+        material.metadata["workspace_item_id"] for material in router.request.source_material
+    ] == [reference.id]
+    prompt = "\n".join(request_blocks(router.request))
+    assert "Course terminology" in prompt
+    assert "Prior lesson" in prompt
+    assert "truth value" in prompt
+    assert router.request.source_material[0].metadata["source_origin"] == "workspace_reference"
+    assert execution.saved_run_directory is not None
+    snapshot_path = execution.saved_run_directory / "workspace_context.json"
+    snapshot = snapshot_path.read_text(encoding="utf-8")
+    assert context.id in snapshot and history.id in snapshot and reference.id in snapshot
+
+
+def test_workspace_name_anchors_global_retrieval_without_replacing_canonical_query(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter()
+    service = _service(router)
+    service._workspace_service = WorkspaceService(database_path=tmp_path / "workspaces.sqlite")
+    workspace = service.workspaces.store.create_workspace("CSC 220 Logic")
+    knowledge = KnowledgeConfig()
+    seen_queries: list[Any] = []
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: knowledge,
+    )
+
+    def retrieve(
+        request: GenerationRequest,
+        retrieval_options: RetrievalOptions,
+        _: KnowledgeConfig,
+        *,
+        query: Any,
+        top_k: int | None = None,
+    ) -> RetrievalResult:
+        del request, retrieval_options, top_k
+        seen_queries.append(query)
+        return RetrievalResult(query=query.canonical)
+
+    monkeypatch.setattr(service, "_retrieve", retrieve)
+
+    execution = service.generate(
+        GenerationRequest(
+            task=TaskType.EXPLANATION,
+            instruction="Explain predicate logic.",
+            workspace_id=workspace.id,
+        ),
+        retrieval=RetrievalOptions(enabled=True),
+    )
+
+    assert len(seen_queries) == 1
+    assert seen_queries[0].canonical == "CSC 220 Logic predicate logic"
+    retrieval_diagnostics = execution.request.metadata["knowledge_retrieval"]
+    assert retrieval_diagnostics["canonical_query"] == "predicate logic"
+    assert (
+        retrieval_diagnostics["diagnostics"]["workspace_anchored_query"]
+        == seen_queries[0].canonical
+    )
+
+
+def test_explicit_sources_take_budget_before_workspace_references_and_global_retrieval(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter()
+    service = _service(router)
+    service._workspace_service = WorkspaceService(database_path=tmp_path / "workspaces.sqlite")
+    workspace = service.workspaces.store.create_workspace("CSC 220")
+    service.workspaces.store.create_item(
+        workspace.id,
+        WorkspaceItemInput(
+            title="Relevant reference",
+            role=WorkspaceItemRole.REFERENCE,
+            pinned=True,
+            content="Predicate logic extends propositional logic.",
+        ),
+    )
+    explicit = SourceMaterial(
+        source_id="explicit",
+        title="Instructor source",
+        text="Explicit instructor material. " * 2000,
+    )
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: KnowledgeConfig(),
+    )
+
+    def fail_global_retrieval(*args: Any, **kwargs: Any) -> RetrievalResult:
+        del args, kwargs
+        pytest.fail("global retrieval exceeded the source budget")
+
+    monkeypatch.setattr(service, "_retrieve", fail_global_retrieval)
+
+    execution = service.generate(
+        GenerationRequest(
+            task=TaskType.EXPLANATION,
+            instruction="Explain predicate logic.",
+            workspace_id=workspace.id,
+            source_material=[explicit],
+        ),
+        retrieval=RetrievalOptions(enabled=True),
+    )
+
+    assert [material.source_id for material in execution.request.source_material] == ["explicit"]
+    assert execution.request.metadata["workspace"]["reference_selected_item_ids"] == []
+    assert execution.request.metadata["knowledge_retrieval"]["matches"] == []
+
+
 def test_generation_service_uses_shared_retrieval_and_saves_existing_run_format(
     tmp_path: Path,
     monkeypatch: Any,
@@ -146,6 +314,50 @@ def test_generation_service_uses_shared_retrieval_and_saves_existing_run_format(
     diagnostics = (execution.saved_run_directory / "diagnostics.md").read_text(encoding="utf-8")
     assert "- Original instruction: Explain predicate logic." in diagnostics
     assert "- Canonical query: predicate logic" in diagnostics
+
+
+def test_no_workspace_keeps_existing_retrieval_when_explicit_sources_fill_budget(
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter()
+    service = _service(router)
+    knowledge = KnowledgeConfig()
+    knowledge.retrieval.context_budgets["standard"] = 1
+    retrieval_calls: list[str] = []
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: knowledge,
+    )
+
+    def retrieve(
+        request: GenerationRequest,
+        retrieval_options: RetrievalOptions,
+        _: KnowledgeConfig,
+        *,
+        query: Any,
+        top_k: int | None = None,
+    ) -> RetrievalResult:
+        del request, retrieval_options, top_k
+        retrieval_calls.append(query.canonical)
+        return RetrievalResult(query=query.canonical)
+
+    monkeypatch.setattr(service, "_retrieve", retrieve)
+    service.generate(
+        GenerationRequest(
+            task=TaskType.EXPLANATION,
+            instruction="Explain predicate logic.",
+            source_material=[
+                SourceMaterial(
+                    source_id="explicit",
+                    title="Instructor source",
+                    text="Explicit source content " * 100,
+                )
+            ],
+        ),
+        retrieval=RetrievalOptions(enabled=True),
+    )
+
+    assert retrieval_calls == ["predicate logic"]
 
 
 def _match(chunk_id: str, *, fused_rank: int = 1) -> RetrievalMatch:

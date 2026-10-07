@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, generateStream } from "../src/api";
+import {
+  ApiError,
+  generateStream,
+  getWorkspaces,
+  saveOutputToWorkspace,
+} from "../src/api";
 import { applyTransportError, initialGenerationState } from "../src/state";
 import type { GenerationRequest, GenerationResult } from "../src/types";
 
@@ -55,6 +60,7 @@ describe("generateStream", () => {
         controller.close();
       },
     });
+
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
     const onProgress = vi.fn();
 
@@ -90,5 +96,48 @@ describe("generateStream", () => {
     );
     expect(state.failureKind).toBe("transport");
     expect(state.result).toBeNull();
+  });
+});
+
+describe("Workspace API", () => {
+  it("loads workspaces from the local API", async () => {
+    const response = [{ id: "workspace-1", name: "CSC 220" }];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getWorkspaces()).resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith("/api/workspaces", {
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("saves a generated result through the explicit History endpoint", async () => {
+    const saved = { id: "item-1", role: "history", title: "Approved output" };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(saved), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      saveOutputToWorkspace("workspace/1", "request-1", "Approved output"),
+    ).resolves.toEqual(saved);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/workspace%2F1/history",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          request_id: "request-1",
+          title: "Approved output",
+        }),
+      }),
+    );
   });
 });

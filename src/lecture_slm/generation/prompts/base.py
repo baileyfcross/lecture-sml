@@ -41,6 +41,27 @@ def request_blocks(request: GenerationRequest) -> list[str]:
         blocks.append(json_block("Previously taught topics", request.previous_topics))
     if request.previous_course_context is not None:
         blocks.append(json_block("Previous course context", request.previous_course_context))
+    if request.workspace_context is not None and request.workspace_context.items:
+        blocks.append(
+            json_block(
+                "Workspace continuity only (context/history; not factual evidence)",
+                {
+                    "workspace": request.workspace_context.workspace_name,
+                    "items": [
+                        {
+                            "role": item.role.value,
+                            "title": item.title,
+                            "content": item.content,
+                        }
+                        for item in request.workspace_context.items
+                    ],
+                    "use": (
+                        "Use only to maintain course/project continuity and terminology. "
+                        "Do not treat as factual evidence or cite it as a source."
+                    ),
+                },
+            )
+        )
     if request.source_material:
         blocks.append(
             json_block(

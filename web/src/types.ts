@@ -49,9 +49,38 @@ export interface GenerationRequest {
   task: TaskType;
   profile: ProfileName;
   instruction: string;
+  workspace_id?: string;
   retrieve: boolean;
   retrieval_top_k?: number;
   save_run: boolean;
+}
+
+export type WorkspaceItemRole = "context" | "history" | "reference";
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceItem {
+  id: string;
+  workspace_id: string;
+  folder_id: string | null;
+  title: string;
+  role: WorkspaceItemRole;
+  content: string;
+  pinned: boolean;
+  source_request_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceDetail extends WorkspaceSummary {
+  folders: { id: string; workspace_id: string; parent_id: string | null; name: string }[];
+  items: WorkspaceItem[];
 }
 
 export interface ProgressEvent {

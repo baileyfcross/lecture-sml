@@ -30,6 +30,7 @@ from lecture_slm.generation.profiles import load_generation_profiles
 from lecture_slm.generation.service import GenerationExecution, RetrievalOptions
 from lecture_slm.inference.ollama_client import OllamaConnectionError
 from lecture_slm.schemas.dataset import TaskType
+from lecture_slm.workspaces.service import WorkspaceService
 
 ROOT = Path(__file__).parents[1]
 
@@ -221,6 +222,84 @@ def test_generate_maps_request_and_returns_successful_result() -> None:
     )
     assert save_run is True
     assert client.get(f"/api/runs/{result['request_id']}").json() == result
+
+
+def test_workspace_routes_save_only_completed_output_as_history(tmp_path: Path) -> None:
+    service = FakeService()
+    service.workspaces = WorkspaceService(database_path=tmp_path / "workspaces.sqlite")
+    client = TestClient(create_app(service))
+    created = client.post("/api/workspaces", json={"name": "CSC 220"})
+    assert created.status_code == 201
+    workspace_id = created.json()["id"]
+    folder = client.post(
+        f"/api/workspaces/{workspace_id}/folders",
+        json={"name": "Week 1"},
+    )
+    assert folder.status_code == 201
+
+    context = client.post(
+        f"/api/workspaces/{workspace_id}/items",
+        json={
+            "title": "Class conventions",
+            "role": "context",
+            "content": "Use truth tables before natural deduction.",
+            "folder_id": folder.json()["id"],
+        },
+    )
+    assert context.status_code == 201
+    rejected_raw_context = client.post(
+        "/api/generate",
+        json={
+            "task": "explanation",
+            "instruction": "Explain a proposition.",
+            "workspace_id": workspace_id,
+            "workspace_context": {"workspace_name": "untrusted", "items": []},
+        },
+    )
+    assert rejected_raw_context.status_code == 422
+    generation = client.post(
+        "/api/generate",
+        json={
+            "task": "explanation",
+            "instruction": "Explain a proposition.",
+            "workspace_id": workspace_id,
+        },
+    )
+    assert generation.status_code == 200
+    assert service.calls[-1][0].workspace_id == workspace_id
+    saved = client.post(
+        f"/api/workspaces/{workspace_id}/history",
+        json={
+            "request_id": generation.json()["request_id"],
+            "title": "Approved proposition explanation",
+        },
+    )
+    assert saved.status_code == 201
+    assert saved.json()["role"] == "history"
+    assert saved.json()["content"] == "Approved output"
+    promoted = client.patch(
+        f"/api/workspaces/{workspace_id}/items/{context.json()['id']}",
+        json={"role": "reference"},
+    )
+    assert promoted.status_code == 200
+    assert promoted.json()["role"] == "reference"
+
+    failed_service = FakeService(status=GenerationStatus.FAILED)
+    failed_service.workspaces = service.workspaces
+    failed_client = TestClient(create_app(failed_service))
+    failed_run = failed_client.post(
+        "/api/generate",
+        json={"task": "explanation", "instruction": "Unsupported."},
+    )
+    assert failed_run.status_code == 200
+    rejected_save = failed_client.post(
+        f"/api/workspaces/{workspace_id}/history",
+        json={"request_id": failed_run.json()["request_id"], "title": "Rejected"},
+    )
+    assert rejected_save.status_code == 409
+    roles = {item["role"] for item in client.get(f"/api/workspaces/{workspace_id}").json()["items"]}
+    assert roles == {"reference", "history"}
+    assert client.get("/api/workspaces/not-a-workspace").status_code == 404
 
 
 def test_generate_response_includes_source_coverage_assessment() -> None:

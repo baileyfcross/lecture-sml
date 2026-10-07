@@ -6,6 +6,10 @@ import type {
   ProgressEvent,
   SseMessage,
   TaskType,
+  WorkspaceDetail,
+  WorkspaceItem,
+  WorkspaceItemRole,
+  WorkspaceSummary,
 } from "./types";
 import { SseParser } from "./sse";
 
@@ -33,6 +37,103 @@ async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" } });
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
   return (await response.json()) as T;
+}
+
+async function sendJson<T>(path: string, method: "POST" | "PATCH", body: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
+  return (await response.json()) as T;
+}
+
+async function sendNoContent(path: string, method: "DELETE"): Promise<void> {
+  const response = await fetch(path, { method, headers: { Accept: "application/json" } });
+  if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
+}
+
+export function getWorkspaces(): Promise<WorkspaceSummary[]> {
+  return getJson<WorkspaceSummary[]>("/api/workspaces");
+}
+
+export function getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
+  return getJson<WorkspaceDetail>(`/api/workspaces/${encodeURIComponent(workspaceId)}`);
+}
+
+export function createWorkspace(name: string): Promise<WorkspaceSummary> {
+  return sendJson<WorkspaceSummary>("/api/workspaces", "POST", { name });
+}
+
+export function createWorkspaceItem(
+  workspaceId: string,
+  item: {
+    title: string;
+    role: WorkspaceItemRole;
+    content: string;
+    pinned: boolean;
+    folder_id: string | null;
+  },
+): Promise<WorkspaceItem> {
+  return sendJson<WorkspaceItem>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/items`,
+    "POST",
+    item,
+  );
+}
+
+export function createWorkspaceFolder(
+  workspaceId: string,
+  name: string,
+  parentId: string | null,
+): Promise<{ id: string; name: string }> {
+  return sendJson(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/folders`,
+    "POST",
+    { name, parent_id: parentId },
+  );
+}
+
+export function deleteWorkspaceFolder(workspaceId: string, folderId: string): Promise<void> {
+  return sendNoContent(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/folders/${encodeURIComponent(folderId)}`,
+    "DELETE",
+  );
+}
+
+export function updateWorkspaceItem(
+  workspaceId: string,
+  itemId: string,
+  changes: { role?: WorkspaceItemRole; pinned?: boolean },
+): Promise<WorkspaceItem> {
+  return sendJson<WorkspaceItem>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/items/${encodeURIComponent(itemId)}`,
+    "PATCH",
+    changes,
+  );
+}
+
+export function deleteWorkspaceItem(workspaceId: string, itemId: string): Promise<void> {
+  return sendNoContent(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/items/${encodeURIComponent(itemId)}`,
+    "DELETE",
+  );
+}
+
+export function saveOutputToWorkspace(
+  workspaceId: string,
+  requestId: string,
+  title: string,
+): Promise<WorkspaceItem> {
+  return sendJson<WorkspaceItem>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/history`,
+    "POST",
+    { request_id: requestId, title },
+  );
 }
 
 export function getHealth(): Promise<HealthResponse> {

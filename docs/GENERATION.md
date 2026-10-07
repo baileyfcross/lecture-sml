@@ -80,6 +80,22 @@ When retrieved sources produce a partial first-pass scope assessment, generation
 
 Saved `retrieval.json` and `diagnostics.md` record retrieval rounds, per-query result summaries and timings, expansion topics and queries, unique added chunks, and initial/final scope assessments.
 
+## Local Workspaces
+
+Workspaces provide explicit local continuity for a course or project. Their SQLite database defaults to `data/workspaces/workspaces.sqlite` and is ignored by Git. Workspace data is separate from the Obsidian Vault and the global knowledge index; creating, editing, searching, or deleting Workspace items never indexes or mutates either system.
+
+Each item has one role:
+
+- **Context** describes continuity such as course conventions. It can guide planning and wording but is not factual evidence.
+- **History** stores previously approved work or prior-session context. It can guide continuity but is not factual evidence.
+- **Reference** is the only Workspace role converted to `SourceMaterial`, and therefore the only Workspace role that may support factual claims or appear in grounding citations.
+
+Context and History are selected by pinned status, recent History (two by default), and Workspace-local FTS5 matches, then bounded by the profile budgets in `configs/workspaces/default.yaml` (Quick 2048, Standard 4096, Deep 8192 estimated tokens). Workspace References share the existing factual source budget: caller-supplied sources take precedence, then pinned/matching Workspace References, and global Vault retrieval uses only any remaining budget. When a Workspace is selected, its name is prepended to the effective global retrieval query only if it is not already present; the original canonical query remains in retrieval diagnostics.
+
+Pass only a `workspace_id` to the generation API or `scripts/generate.py --workspace-id`. The service loads and materializes Workspace content internally; API clients cannot send arbitrary raw Workspace context. Workspace selection and exact selected Context/History/Reference snapshots are included in opt-in saved runs as `workspace_context.json`.
+
+The API exposes `GET/POST /api/workspaces`, `GET/PATCH/DELETE /api/workspaces/{workspace_id}`, and scoped folder/item routes below `/api/workspaces/{workspace_id}/folders` and `/items`. Folder deletion is limited to empty folders, and cross-Workspace folder/item references are rejected. `POST /api/workspaces/{workspace_id}/history` saves only a completed approved API result; saving is explicit and creates a History item. Promote an existing item to Reference explicitly with `PATCH /api/workspaces/{workspace_id}/items/{item_id}` and `{"role":"reference"}`.
+
 ## Training boundary
 
 This runtime does not train models or create adapters. Fine-tuning teaches how the instructor teaches; course profiles/context define who is being taught; retrieved sources supply factual knowledge; and caller-provided previous-course context describes where the class currently is. Knowledge indexing/retrieval and the later training pipeline remain separate systems. Retrieval is opt-in with `--retrieve`; existing commands and explicit `--source-file` behavior remain available without it.

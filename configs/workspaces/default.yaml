@@ -1,0 +1,12 @@
+storage:
+  database_path: data/workspaces/workspaces.sqlite
+
+context_budgets:
+  quick: 2048
+  standard: 4096
+  deep: 8192
+
+selection:
+  recent_history_items: 2
+  search_top_k: 6
+  max_pinned_items: 8

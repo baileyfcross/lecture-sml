@@ -51,6 +51,7 @@ def main() -> int:
         choices=[profile.value for profile in GenerationProfileName],
     )
     parser.add_argument("--instruction", required=True)
+    parser.add_argument("--workspace-id")
     parser.add_argument("--model-config", type=Path, default=Path("configs/models/qwen35-9b.yaml"))
     parser.add_argument(
         "--generation-config",
@@ -117,6 +118,7 @@ def main() -> int:
             task=TaskType(args.task),
             profile=profile,
             instruction=args.instruction,
+            workspace_id=args.workspace_id,
             course=course,
             pedagogy=pedagogy,
             source_material=source_material,

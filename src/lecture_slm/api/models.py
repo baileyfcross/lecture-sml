@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from lecture_slm.generation.models import (
     GenerationProfileName,
@@ -21,6 +21,7 @@ from lecture_slm.generation.service import GenerationExecution, RetrievalOptions
 from lecture_slm.schemas.course import CourseProfile
 from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyProfile
+from lecture_slm.workspaces.models import WorkspaceItemRole
 
 
 class GenerateRequest(BaseModel):
@@ -29,6 +30,7 @@ class GenerateRequest(BaseModel):
     task: TaskType
     profile: GenerationProfileName | None = None
     instruction: str = Field(min_length=1)
+    workspace_id: str | None = Field(default=None, min_length=1)
     retrieve: bool = False
     retrieval_top_k: int | None = Field(default=None, gt=0)
     source_title: str | None = None
@@ -53,6 +55,7 @@ class GenerateRequest(BaseModel):
             task=self.task,
             profile=self.profile or default_profile,
             instruction=self.instruction,
+            workspace_id=self.workspace_id,
             course=self.course,
             pedagogy=self.pedagogy,
             source_material=self.source_material,
@@ -219,6 +222,75 @@ class StageProgress(BaseModel):
     estimate_seconds_remaining: float | None = None
     estimate_rate_source: str | None = None
     estimate_is_approximate: bool
+
+
+class WorkspaceHistorySave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=300)
+    folder_id: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must contain non-whitespace characters")
+        return value
+
+
+class WorkspaceFolderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    parent_id: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def name_is_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("name must contain non-whitespace characters")
+        return None if value is None else value.strip()
+
+    @model_validator(mode="after")
+    def has_changes(self) -> "WorkspaceFolderUpdate":
+        if not self.model_fields_set:
+            raise ValueError("at least one folder field must be provided")
+        return self
+
+
+class WorkspaceItemUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    folder_id: str | None = None
+    role: WorkspaceItemRole | None = None
+    content: str | None = Field(default=None, min_length=1)
+    pinned: bool | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_is_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("title must contain non-whitespace characters")
+        return None if value is None else value.strip()
+
+    @field_validator("content")
+    @classmethod
+    def content_is_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("content must contain non-whitespace characters")
+        return value
+
+    @model_validator(mode="after")
+    def has_changes(self) -> "WorkspaceItemUpdate":
+        changes = self.model_dump(exclude_unset=True)
+        if not changes:
+            raise ValueError("at least one item field must be provided")
+        if any(value is None for key, value in changes.items() if key != "folder_id"):
+            raise ValueError("only folder_id may be cleared")
+        return self
 
 
 def _duration(record: StageRecord | GroundingReviewRecord | None) -> float | None:
