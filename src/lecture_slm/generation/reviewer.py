@@ -3,6 +3,7 @@
 import json
 import re
 import time
+from dataclasses import dataclass
 from typing import Protocol
 
 from pydantic import ValidationError
@@ -24,10 +25,13 @@ from lecture_slm.generation.models import (
     GroundingReviewerResponse,
     GroundingReviewRecord,
     GroundingSupportMethod,
+    PedagogicalReviewerClaim,
     ReviewFeedback,
     StageRecord,
     StageTiming,
+    SupportedReviewerClaim,
     TeachingPlan,
+    UnsupportedReviewerClaim,
 )
 from lecture_slm.generation.profiles import GenerationProfiles, StageProfile
 from lecture_slm.generation.prompts.grounding import (
@@ -38,7 +42,38 @@ from lecture_slm.generation.prompts.grounding import (
 from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
-GROUNDING_REVIEW_OUTPUT_TOKENS = 4096
+GROUNDING_REVIEW_NORMAL_OUTPUT_TOKENS = 4096
+GROUNDING_REVIEW_LARGE_OUTPUT_TOKENS = 8192
+GROUNDING_REVIEW_LARGE_CLAIM_THRESHOLD = 40
+
+
+def grounding_review_output_budget(unresolved_claim_count: int) -> int:
+    if unresolved_claim_count < 0:
+        raise ValueError("unresolved claim count must not be negative")
+    if unresolved_claim_count > GROUNDING_REVIEW_LARGE_CLAIM_THRESHOLD:
+        return GROUNDING_REVIEW_LARGE_OUTPUT_TOKENS
+    return GROUNDING_REVIEW_NORMAL_OUTPUT_TOKENS
+
+
+@dataclass(frozen=True)
+class GroundingReviewPreparation:
+    all_claims: list[GroundingClaimInput]
+    direct_claims: list[GroundingClaimAssessment]
+    unresolved_claims: list[GroundingClaimInput]
+    evidence_ledger: list[EvidenceSpan]
+    output_budget: int | None
+
+    @property
+    def claims_extracted(self) -> int:
+        return len(self.all_claims)
+
+    @property
+    def direct_supported_claim_count(self) -> int:
+        return len(self.direct_claims)
+
+    @property
+    def unresolved_claim_count(self) -> int:
+        return len(self.unresolved_claims)
 
 
 def _normalize_grounding_review(content: str) -> GroundingReviewerResponse:
@@ -249,6 +284,14 @@ def prepare_grounding_claims(
 ) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
     """Assign stable IDs and deterministically resolve obvious source-text matches."""
     evidence_ledger = build_evidence_ledger(request)
+    return _prepare_grounding_claims(request, artifact, evidence_ledger)
+
+
+def _prepare_grounding_claims(
+    request: GenerationRequest,
+    artifact: str,
+    evidence_ledger: list[EvidenceSpan],
+) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
     inputs = [
         GroundingClaimInput(claim_id=f"C{index:03d}", text=text)
         for index, text in enumerate(_factual_sentence_excerpts(artifact), start=1)
@@ -318,8 +361,19 @@ def merge_grounding_review(
             if invalid_evidence_ids:
                 claim_evidence_failures += 1
         classification = assessment.classification
-        reason = assessment.reason
-        category = assessment.category
+        if isinstance(assessment, SupportedReviewerClaim):
+            reason = (
+                f"Supported by reviewer-selected evidence {', '.join(assessment.evidence_ids)}."
+            )
+            category = None
+        elif isinstance(assessment, PedagogicalReviewerClaim):
+            reason = "Reviewer classified this claim as a pedagogical example or setup."
+            category = None
+        elif isinstance(assessment, UnsupportedReviewerClaim):
+            reason = assessment.reason
+            category = assessment.category
+        else:
+            raise TypeError("Unknown grounding reviewer claim type")
         if invalid_evidence_ids:
             claim_evidence_failures += 1
             classification = GroundingClaimClassification.UNSUPPORTED
@@ -427,13 +481,40 @@ class GroundingStageRunner:
         self.profiles = profiles
         self.settings = settings
 
+    def prepare_review(
+        self,
+        request: GenerationRequest,
+        artifact: str,
+    ) -> GroundingReviewPreparation:
+        evidence_ledger = build_evidence_ledger(request)
+        all_claims, direct_claims, unresolved_claims = _prepare_grounding_claims(
+            request,
+            artifact,
+            evidence_ledger,
+        )
+        return GroundingReviewPreparation(
+            all_claims=all_claims,
+            direct_claims=direct_claims,
+            unresolved_claims=unresolved_claims,
+            evidence_ledger=evidence_ledger,
+            output_budget=(
+                grounding_review_output_budget(len(unresolved_claims))
+                if unresolved_claims
+                else None
+            ),
+        )
+
     def review(
         self,
         request: GenerationRequest,
         artifact: str,
+        preparation: GroundingReviewPreparation | None = None,
     ) -> GroundingReviewRecord:
-        all_claims, direct_claims, unresolved_claims = prepare_grounding_claims(request, artifact)
-        evidence_ledger = build_evidence_ledger(request)
+        prepared = preparation or self.prepare_review(request, artifact)
+        all_claims = prepared.all_claims
+        direct_claims = prepared.direct_claims
+        unresolved_claims = prepared.unresolved_claims
+        evidence_ledger = prepared.evidence_ledger
         if not unresolved_claims:
             try:
                 direct_review = merge_grounding_review(
@@ -448,15 +529,25 @@ class GroundingStageRunner:
                     status=GenerationStatus.FAILED,
                     error_type=type(error).__name__,
                     error_message=self._safe_error(str(error)),
+                    claims_extracted=prepared.claims_extracted,
+                    direct_supported_claim_count=prepared.direct_supported_claim_count,
+                    unresolved_claim_count=prepared.unresolved_claim_count,
+                    review_output_budget=prepared.output_budget,
                 )
             return GroundingReviewRecord(
                 status=GenerationStatus.COMPLETED,
                 review=direct_review,
                 prompt_version=GROUNDING_REVIEW_PROMPT_VERSION,
+                claims_extracted=prepared.claims_extracted,
+                direct_supported_claim_count=prepared.direct_supported_claim_count,
+                unresolved_claim_count=prepared.unresolved_claim_count,
+                review_output_budget=prepared.output_budget,
             )
 
         prompt = build_grounding_review_prompt(request, unresolved_claims)
-        budget = GROUNDING_REVIEW_OUTPUT_TOKENS
+        budget = prepared.output_budget
+        if budget is None:
+            raise RuntimeError("grounding review preparation has no output budget")
         try:
             selection = select_context_tier(
                 f"{prompt.system_message}\n\n{prompt.user_message}",
@@ -470,6 +561,10 @@ class GroundingStageRunner:
                 prompt_version=prompt.version,
                 error_type=type(error).__name__,
                 error_message=str(error),
+                claims_extracted=prepared.claims_extracted,
+                direct_supported_claim_count=prepared.direct_supported_claim_count,
+                unresolved_claim_count=prepared.unresolved_claim_count,
+                review_output_budget=prepared.output_budget,
             )
 
         started = time.perf_counter()
@@ -500,6 +595,13 @@ class GroundingStageRunner:
             )
             _validate_claim_coverage(artifact, review)
         except (OllamaError, ValidationError, ValueError) as error:
+            truncated = (
+                isinstance(error, (ValidationError, ValueError))
+                and response is not None
+                and response.completion_reason == "length"
+                and response.completion_tokens is not None
+                and response.completion_tokens >= budget
+            )
             return GroundingReviewRecord(
                 status=GenerationStatus.FAILED,
                 review=review,
@@ -512,8 +614,20 @@ class GroundingStageRunner:
                 ),
                 raw_response=None if response is None else response.content,
                 prompt_version=prompt.version,
-                error_type=type(error).__name__,
-                error_message=self._safe_error(str(error)),
+                error_type=("GroundingReviewTruncatedError" if truncated else type(error).__name__),
+                error_message=(
+                    self._safe_error(
+                        "Grounding review output was truncated after reaching its "
+                        f"{budget:,}-token generation budget. The incomplete structured review "
+                        "could not be validated."
+                    )
+                    if truncated
+                    else self._safe_error(str(error))
+                ),
+                claims_extracted=prepared.claims_extracted,
+                direct_supported_claim_count=prepared.direct_supported_claim_count,
+                unresolved_claim_count=prepared.unresolved_claim_count,
+                review_output_budget=prepared.output_budget,
             )
         return GroundingReviewRecord(
             status=GenerationStatus.COMPLETED,
@@ -527,6 +641,10 @@ class GroundingStageRunner:
             ),
             raw_response=response.content,
             prompt_version=prompt.version,
+            claims_extracted=prepared.claims_extracted,
+            direct_supported_claim_count=prepared.direct_supported_claim_count,
+            unresolved_claim_count=prepared.unresolved_claim_count,
+            review_output_budget=prepared.output_budget,
         )
 
     def revise(

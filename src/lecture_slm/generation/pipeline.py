@@ -30,7 +30,6 @@ from lecture_slm.generation.prompts.writer import (
     build_writer_prompt,
 )
 from lecture_slm.generation.reviewer import (
-    GROUNDING_REVIEW_OUTPUT_TOKENS,
     GenerationReviewer,
     GroundingStageRunner,
 )
@@ -370,16 +369,21 @@ class GenerationPipeline:
                 profiles=self.profiles,
                 settings=profile.writer,
             )
+            initial_review_preparation = grounding_runner.prepare_review(
+                request,
+                writer_record.raw_response or "",
+            )
             self._emit_stage_start(
                 progress,
                 GenerationStage.REVIEWING,
                 "Grounding review: checking claims against supplied sources",
-                GROUNDING_REVIEW_OUTPUT_TOKENS,
+                initial_review_preparation.output_budget or 0,
                 previous_record=writer_record,
             )
             initial_grounding_review = grounding_runner.review(
                 request,
                 writer_record.raw_response or "",
+                preparation=initial_review_preparation,
             )
             self._emit_stage_complete(
                 progress,
@@ -451,16 +455,21 @@ class GenerationPipeline:
                         )
                     else:
                         revised_output = revision_record.raw_response or ""
+                        final_review_preparation = grounding_runner.prepare_review(
+                            request,
+                            revised_output,
+                        )
                         self._emit_stage_start(
                             progress,
                             GenerationStage.REVIEWING,
                             "Final grounding review: validating the revised artifact",
-                            GROUNDING_REVIEW_OUTPUT_TOKENS,
+                            final_review_preparation.output_budget or 0,
                             previous_record=revision_record,
                         )
                         final_grounding_review = grounding_runner.review(
                             request,
                             revised_output,
+                            preparation=final_review_preparation,
                         )
                         self._emit_stage_complete(
                             progress,

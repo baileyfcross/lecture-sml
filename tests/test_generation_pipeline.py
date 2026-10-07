@@ -35,6 +35,7 @@ from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import (
     _factual_sentence_excerpts,
     _validate_claim_coverage,
+    grounding_review_output_budget,
     merge_grounding_review,
     prepare_grounding_claims,
 )
@@ -54,7 +55,6 @@ def _passing_review() -> str:
                 {
                     "claim_id": "C001",
                     "classification": "supported",
-                    "reason": "The source directly states this mapping.",
                     "evidence_ids": ["S01-E001"],
                 }
             ],
@@ -84,7 +84,6 @@ def _default_grounding_review(user_message: str) -> str:
                 {
                     "claim_id": claim["claim_id"],
                     "classification": "supported",
-                    "reason": "The cited source is the supplied supporting evidence.",
                     "evidence_ids": [evidence_id],
                 }
                 for claim in claims
@@ -131,6 +130,7 @@ class FakeOllamaClient:
         planner_tokens: int = 80,
         planner_eval_duration_ns: int | None = 2_000_000_000,
         grounding_responses: list[str] | None = None,
+        grounding_chat_responses: list[ChatResponse] | None = None,
         grounding_failure_at: int | None = None,
         revision_output: str = "# DNS: revised explanation\n\nA domain name maps to an IP address.",
         revision_failure: bool = False,
@@ -147,6 +147,7 @@ class FakeOllamaClient:
         self.planner_tokens = planner_tokens
         self.planner_eval_duration_ns = planner_eval_duration_ns
         self.grounding_responses = grounding_responses or []
+        self.grounding_chat_responses = grounding_chat_responses or []
         self.grounding_failure_at = grounding_failure_at
         self.grounding_response_count = 0
         self.revision_output = revision_output
@@ -191,6 +192,8 @@ class FakeOllamaClient:
                 self.grounding_response_count += 1
                 if self.grounding_failure_at == self.grounding_response_count:
                     raise OllamaTimeoutError("grounding review timed out")
+                if self.grounding_response_count <= len(self.grounding_chat_responses):
+                    return self.grounding_chat_responses[self.grounding_response_count - 1]
                 content = (
                     self.grounding_responses[self.grounding_response_count - 1]
                     if self.grounding_response_count <= len(self.grounding_responses)
@@ -1647,9 +1650,6 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
                 {
                     "claim_id": "C001",
                     "classification": "supported",
-                    "reason": (
-                        "The source says binding variables lets logic express general claims."
-                    ),
                     "evidence_ids": ["S01-E001"],
                 }
             ]
@@ -1673,6 +1673,9 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
     assert review.decision is GroundingDecision.PASS
     assert review.claim_assessments[0].classification is GroundingClaimClassification.SUPPORTED
     assert review.claim_assessments[0].evidence_ids == ["S01-E001"]
+    assert review.claim_assessments[0].reason == (
+        "Supported by reviewer-selected evidence S01-E001."
+    )
 
 
 def test_reviewer_response_models_require_classification_specific_evidence_ids() -> None:
@@ -1681,7 +1684,6 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
             "claim_id": "C001",
             "classification": "supported",
             "evidence_ids": ["S01-E001"],
-            "reason": "The selected evidence supports the claim.",
         },
         {
             "claim_id": "C002",
@@ -1693,7 +1695,6 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
             "claim_id": "C003",
             "classification": "pedagogical",
             "evidence_ids": [],
-            "reason": "This is a hypothetical teaching example.",
         },
     ]
     response = GroundingReviewerResponse.model_validate({"claims": valid_claims})
@@ -1709,7 +1710,12 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
             "claim_id": "C001",
             "classification": "supported",
             "evidence_ids": [],
-            "reason": "Supported.",
+        },
+        {
+            "claim_id": "C001",
+            "classification": "supported",
+            "evidence_ids": ["S01-E001"],
+            "reason": "The selected evidence supports the claim.",
         },
         {
             "claim_id": "C001",
@@ -1721,7 +1727,6 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
             "claim_id": "C001",
             "classification": "pedagogical",
             "evidence_ids": ["S01-E001"],
-            "reason": "Example.",
         },
         {
             "claim_id": "C001",
@@ -1734,6 +1739,19 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
         with pytest.raises(ValidationError):
             GroundingReviewerResponse.model_validate({"claims": [claim]})
 
+    with pytest.raises(ValidationError):
+        GroundingReviewerResponse.model_validate(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C004",
+                        "classification": "unsupported",
+                        "evidence_ids": [],
+                    }
+                ]
+            }
+        )
+
 
 def test_reviewer_response_json_schema_requires_evidence_ids_by_classification() -> None:
     schema = GroundingReviewerResponse.model_json_schema()
@@ -1745,14 +1763,249 @@ def test_reviewer_response_json_schema_requires_evidence_ids_by_classification()
     supported = definitions["SupportedReviewerClaim"]
     assert "evidence_ids" in supported["required"]
     assert supported["properties"]["evidence_ids"]["minItems"] == 1
+    assert "reason" not in supported["properties"]
+    assert "category" not in supported["properties"]
     pedagogical = definitions["PedagogicalReviewerClaim"]
     assert "evidence_ids" in pedagogical["required"]
     assert pedagogical["properties"]["evidence_ids"]["minItems"] == 0
     assert pedagogical["properties"]["evidence_ids"]["maxItems"] == 0
+    assert "reason" not in pedagogical["properties"]
+    assert "category" not in pedagogical["properties"]
     unsupported = definitions["UnsupportedReviewerClaim"]
     assert "evidence_ids" in unsupported["required"]
     assert unsupported["properties"]["evidence_ids"]["minItems"] == 0
     assert unsupported["properties"]["evidence_ids"]["maxItems"] == 0
+    assert "reason" in unsupported["required"]
+
+
+@pytest.mark.parametrize(
+    ("count", "expected_budget"),
+    [(0, 4096), (1, 4096), (40, 4096), (41, 8192), (69, 8192)],
+)
+def test_grounding_review_output_budget_tiers(count: int, expected_budget: int) -> None:
+    assert grounding_review_output_budget(count) == expected_budget
+
+
+def test_grounding_review_output_budget_rejects_negative_count() -> None:
+    with pytest.raises(ValueError, match="must not be negative"):
+        grounding_review_output_budget(-1)
+
+
+def test_grounding_review_context_selection_reserves_selected_budget() -> None:
+    input_text = "x" * 24_000
+    tiers = [8192, 16384, 32768]
+
+    normal = select_context_tier(
+        input_text,
+        tiers,
+        safety_margin=1.5,
+        output_reserve_tokens=grounding_review_output_budget(40),
+    )
+    large = select_context_tier(
+        input_text,
+        tiers,
+        safety_margin=1.5,
+        output_reserve_tokens=grounding_review_output_budget(41),
+    )
+
+    assert normal.selected_context == 16384
+    assert large.selected_context == 32768
+
+
+@pytest.mark.parametrize(
+    ("direct_count", "unresolved_count", "expected_budget"),
+    [(10, 35, 4096), (3, 42, 8192)],
+)
+def test_grounding_pipeline_budgets_actual_unresolved_claim_count(
+    configs: tuple[Any, Any],
+    direct_count: int,
+    unresolved_count: int,
+    expected_budget: int,
+) -> None:
+    model, profiles = configs
+    candidate_claims = [
+        f"Claim {index} describes a concrete fact."
+        for index in range(direct_count + unresolved_count)
+    ]
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(
+                    source_id="direct-notes",
+                    title="Direct claims",
+                    text=" ".join(candidate_claims[:direct_count]),
+                )
+            ]
+        }
+    )
+    fake = FakeOllamaClient(writer_output=" ".join(candidate_claims))
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is not None
+    review_record = result.initial_grounding_review
+    assert review_record.claims_extracted == direct_count + unresolved_count
+    assert review_record.direct_supported_claim_count == direct_count
+    assert review_record.unresolved_claim_count == unresolved_count
+    assert review_record.review_output_budget == expected_budget
+    grounding_request = next(
+        request_record
+        for request_record in fake.requests
+        if request_record["format"] is not None
+        and request_record["format"].get("title") == "GroundingReviewerResponse"
+    )
+    assert grounding_request["options"]["num_predict"] == expected_budget
+    assert review_record.timing is not None
+    expected_selection = select_context_tier(
+        f"{grounding_request['system_message']}\n\n{grounding_request['user_message']}",
+        profiles.profiles[GenerationProfileName.STANDARD].writer.context_tiers,
+        safety_margin=profiles.context_safety_margin,
+        output_reserve_tokens=expected_budget,
+    )
+    assert review_record.timing.selected_context == expected_selection.selected_context
+
+
+@pytest.mark.parametrize(
+    ("unresolved_count", "budget"),
+    [(1, 4096), (41, 8192)],
+)
+def test_grounding_review_truncation_is_reported_and_preserved(
+    configs: tuple[Any, Any],
+    unresolved_count: int,
+    budget: int,
+) -> None:
+    model, profiles = configs
+    raw_response = (
+        '{\n  "claims": [{"claim_id":"C001","classification":"unsupported",'
+        '"evidence_ids":[],"reason":"This string never closes'
+    )
+    fake = FakeOllamaClient(
+        writer_output=" ".join(
+            f"Claim {index} describes a concrete fact." for index in range(unresolved_count)
+        ),
+        grounding_chat_responses=[
+            ChatResponse(
+                model=model.ollama_name,
+                content=raw_response,
+                prompt_tokens=7569,
+                completion_tokens=budget,
+                completion_reason="length",
+            )
+        ],
+    )
+
+    result = make_pipeline(model, profiles, fake).route(sample_request(GenerationProfileName.DEEP))
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.initial_grounding_review is not None
+    failed_review = result.initial_grounding_review
+    assert failed_review.error_type == "GroundingReviewTruncatedError"
+    assert f"{budget:,}" in (failed_review.error_message or "")
+    assert "JSONDecodeError" not in (failed_review.error_message or "")
+    assert failed_review.raw_response == raw_response
+    assert failed_review.unresolved_claim_count == unresolved_count
+    assert failed_review.review_output_budget == budget
+    assert failed_review.timing is not None
+    assert failed_review.timing.output_budget == budget
+    assert failed_review.timing.generated_tokens == budget
+    assert failed_review.timing.stop_reason == "length"
+    assert failed_review.timing.output_limit_reached is True
+    assert failed_review.timing.potentially_truncated is True
+
+
+def test_grounding_malformed_json_without_length_stop_is_not_truncation(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(
+            writer_output="Predicate logic is essential to computer science.",
+            grounding_chat_responses=[
+                ChatResponse(
+                    model=model.ollama_name,
+                    content="not valid JSON",
+                    completion_tokens=4096,
+                    completion_reason="stop",
+                )
+            ],
+        ),
+    ).route(sample_request(GenerationProfileName.STANDARD))
+
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.error_type == "JSONDecodeError"
+    assert "truncated" not in (result.initial_grounding_review.error_message or "").lower()
+
+
+def test_large_compact_reviewer_response_merges_all_claims_once(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    candidate_claims = [f"Claim {index} describes a concrete fact." for index in range(69)]
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(writer_output=" ".join(candidate_claims)),
+    ).route(sample_request(GenerationProfileName.DEEP))
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is not None
+    record = result.initial_grounding_review
+    assert record.review_output_budget == 8192
+    assert record.review is not None
+    assert record.review.decision is GroundingDecision.PASS
+    assert [claim.claim_id for claim in record.review.claim_assessments] == [
+        f"C{index:03d}" for index in range(1, 70)
+    ]
+    raw_claims = json.loads(record.raw_response or "{}")["claims"]
+    assert all(set(claim) == {"claim_id", "classification", "evidence_ids"} for claim in raw_claims)
+    assert all(
+        claim.reason == "Supported by reviewer-selected evidence S01-E001."
+        for claim in record.review.claim_assessments
+    )
+
+
+def test_final_grounding_review_recalculates_budget_after_revision(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    initial_claims = [
+        {
+            "claim_id": f"C{index:03d}",
+            "classification": "unsupported",
+            "evidence_ids": [],
+            "reason": "The source does not establish this claim.",
+        }
+        for index in range(1, 42)
+    ]
+    revised_output = " ".join(
+        f"Revised claim {index} describes a concrete fact." for index in range(28)
+    )
+    fake = FakeOllamaClient(
+        writer_output=" ".join(
+            f"Initial claim {index} describes a concrete fact." for index in range(41)
+        ),
+        revision_output=revised_output,
+        grounding_responses=[json.dumps({"claims": initial_claims})],
+    )
+
+    result = make_pipeline(model, profiles, fake).route(sample_request(GenerationProfileName.DEEP))
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.initial_grounding_review is not None
+    assert result.final_grounding_review is not None
+    assert result.initial_grounding_review.unresolved_claim_count == 41
+    assert result.initial_grounding_review.review_output_budget == 8192
+    assert result.final_grounding_review.unresolved_claim_count == 28
+    assert result.final_grounding_review.review_output_budget == 4096
+    review_requests = [
+        item
+        for item in fake.requests
+        if item["format"] is not None and item["format"].get("title") == "GroundingReviewerResponse"
+    ]
+    assert [item["options"]["num_predict"] for item in review_requests] == [8192, 4096]
 
 
 @pytest.mark.parametrize(
@@ -1771,7 +2024,6 @@ def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
                 {
                     "claim_id": "C001",
                     "classification": "supported",
-                    "reason": "The reviewer claims support.",
                     "evidence_ids": evidence_ids,
                 }
             ]
@@ -1824,13 +2076,11 @@ def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_cl
                 {
                     "claim_id": "C002",
                     "classification": "supported",
-                    "reason": "The source explains quantifier binding.",
                     "evidence_ids": ["S01-E001"],
                 },
                 {
                     "claim_id": "C003",
                     "classification": "pedagogical",
-                    "reason": "This is a stipulated illustrative predicate.",
                     "evidence_ids": [],
                 },
                 {
@@ -1864,7 +2114,15 @@ def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_cl
         "pedagogical",
         "unsupported",
     ]
+    assert review.claim_assessments[1].reason == (
+        "Supported by reviewer-selected evidence S01-E001."
+    )
+    assert review.claim_assessments[2].reason == (
+        "Reviewer classified this claim as a pedagogical example or setup."
+    )
+    assert review.claim_assessments[3].reason == ("The source does not establish essential status.")
     assert [issue.claim_id for issue in review.issues] == ["C004"]
+    assert review.issues[0].reason == "The source does not establish essential status."
 
 
 def test_grounding_review_revises_once_and_validates_revised_output(
@@ -2321,8 +2579,22 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_review_prompt = json.loads(
         (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_review_prompt["prompt_version"] == "grounding-review-v6"
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v7"
     assert "Unresolved factual claims to adjudicate" in saved_review_prompt["user_message"]
+    assert saved_review_prompt["claims_extracted"] == 1
+    assert saved_review_prompt["direct_supported_claim_count"] == 0
+    assert saved_review_prompt["unresolved_claim_count"] == 1
+    assert saved_review_prompt["output_budget"] == 4096
+    saved_reviewer_response = json.loads(
+        json.loads((run_dir / "grounding_review_initial.json").read_text(encoding="utf-8"))[
+            "raw_response"
+        ]
+    )
+    assert saved_reviewer_response["claims"][0] == {
+        "claim_id": "C001",
+        "classification": "supported",
+        "evidence_ids": ["S01-E001"],
+    }
     saved_review = json.loads((run_dir / "grounding_review.json").read_text(encoding="utf-8"))
     saved_claim = saved_review["review"]["claim_assessments"][0]
     assert saved_claim["claim_id"] == "C001"
@@ -2340,7 +2612,12 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert "- Number of assembled source materials: 1" in diagnostics
     assert "Initial grounding review" in diagnostics
     assert "- Claims extracted: 1" in diagnostics
-    assert "- Direct source matches: 0" in diagnostics
+    assert "- Direct-supported claims: 0" in diagnostics
+    assert "- Unresolved reviewer claims: 1" in diagnostics
+    assert "- Review output budget: 4096" in diagnostics
+    assert "- Selected context: " in diagnostics
+    assert "- Generated tokens: 24" in diagnostics
+    assert "- Stop reason: stop" in diagnostics
     assert "- Reviewer-supported claims: 1" in diagnostics
     assert "- Evidence validation failures / unknown evidence IDs: 0" in diagnostics
     assert "- Coverage complete: yes" in diagnostics

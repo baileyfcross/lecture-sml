@@ -337,9 +337,7 @@ class SupportedReviewerClaim(BaseModel):
 
     claim_id: str = Field(pattern=r"^C\d{3,}$")
     classification: Literal[GroundingClaimClassification.SUPPORTED]
-    reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
-    category: GroundingIssueCategory | None = None
 
 
 class PedagogicalReviewerClaim(BaseModel):
@@ -347,9 +345,7 @@ class PedagogicalReviewerClaim(BaseModel):
 
     claim_id: str = Field(pattern=r"^C\d{3,}$")
     classification: Literal[GroundingClaimClassification.PEDAGOGICAL]
-    reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=0, max_length=0)
-    category: GroundingIssueCategory | None = None
 
 
 class UnsupportedReviewerClaim(BaseModel):
@@ -460,6 +456,10 @@ class GroundingReviewRecord(BaseModel):
     status: GenerationStatus
     review: GroundingReview | None = None
     timing: StageTiming | None = None
+    claims_extracted: int | None = Field(default=None, ge=0)
+    direct_supported_claim_count: int | None = Field(default=None, ge=0)
+    unresolved_claim_count: int | None = Field(default=None, ge=0)
+    review_output_budget: int | None = Field(default=None, ge=0)
     raw_response: str | None = None
     prompt_version: str | None = None
     error_type: str | None = None

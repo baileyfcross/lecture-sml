@@ -123,12 +123,33 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
     lines = [f"## {name}", f"- Used: {'yes' if record is not None else 'no'}"]
     if record is None:
         return lines
+    timing = record.timing
+    claims_extracted = record.claims_extracted
+    direct_count = record.direct_supported_claim_count
+    unresolved_count = record.unresolved_claim_count
+    output_budget = record.review_output_budget
+    selected_context = None if timing is None else timing.selected_context
+    generated_tokens = None if timing is None else timing.generated_tokens
+    stop_reason = None if timing is None else timing.stop_reason
+    output_limit_reached = None if timing is None else timing.output_limit_reached
     lines.extend(
         [
             f"- Status: {record.status.value}",
             f"- Decision: {record.review.decision.value if record.review is not None else 'n/a'}",
             f"- Prompt version: {record.prompt_version or 'n/a'}",
-            f"- Duration: {record.timing.duration_seconds if record.timing is not None else 'n/a'}",
+            f"- Duration: {timing.duration_seconds if timing is not None else 'n/a'}",
+            f"- Claims extracted: {claims_extracted if claims_extracted is not None else 'n/a'}",
+            f"- Direct-supported claims: {direct_count if direct_count is not None else 'n/a'}",
+            f"- Unresolved reviewer claims: "
+            f"{unresolved_count if unresolved_count is not None else 'n/a'}",
+            f"- Review output budget: {output_budget if output_budget is not None else 'n/a'}",
+            f"- Selected context: {selected_context if selected_context is not None else 'n/a'}",
+            f"- Generated tokens: {generated_tokens if generated_tokens is not None else 'n/a'}",
+            f"- Stop reason: {stop_reason if stop_reason is not None else 'n/a'}",
+            (
+                "- Output limit reached: "
+                f"{output_limit_reached if output_limit_reached is not None else 'n/a'}"
+            ),
         ]
     )
     if record.review is not None:
@@ -141,8 +162,6 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
         lines.extend(
             [
                 f"- Evidence ledger spans: {len(record.review.evidence_ledger)}",
-                f"- Claims extracted: {len(assessments)}",
-                f"- Direct source matches: {counts[GroundingClaimClassification.DIRECT_SUPPORTED]}",
                 f"- Reviewer-supported claims: {counts[GroundingClaimClassification.SUPPORTED]}",
                 f"- Pedagogical claims: {counts[GroundingClaimClassification.PEDAGOGICAL]}",
                 f"- Unsupported claims: {counts[GroundingClaimClassification.UNSUPPORTED]}",
@@ -443,7 +462,10 @@ def save_generation_run(
                 "estimated_input_tokens": (
                     None if timing is None else timing.estimated_input_tokens
                 ),
-                "output_budget": None if timing is None else timing.output_budget,
+                "output_budget": initial_review.review_output_budget,
+                "claims_extracted": initial_review.claims_extracted,
+                "direct_supported_claim_count": initial_review.direct_supported_claim_count,
+                "unresolved_claim_count": initial_review.unresolved_claim_count,
             },
         )
 
@@ -501,7 +523,10 @@ def save_generation_run(
                 "estimated_input_tokens": (
                     None if timing is None else timing.estimated_input_tokens
                 ),
-                "output_budget": None if timing is None else timing.output_budget,
+                "output_budget": final_review.review_output_budget,
+                "claims_extracted": final_review.claims_extracted,
+                "direct_supported_claim_count": final_review.direct_supported_claim_count,
+                "unresolved_claim_count": final_review.unresolved_claim_count,
             },
         )
 

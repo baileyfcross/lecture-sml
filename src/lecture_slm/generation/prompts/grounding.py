@@ -8,7 +8,7 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.prompts.base import PromptPackage, json_block
 
-GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v6"
+GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v7"
 GROUNDING_REVISION_PROMPT_VERSION = "grounding-revision-v2"
 
 GROUNDING_REVIEW_SYSTEM_PROMPT = (
@@ -18,30 +18,25 @@ GROUNDING_REVIEW_SYSTEM_PROMPT = (
     "evidence ledger states or reasonably entails it. Claims already confirmed by deterministic "
     "direct matching have been removed from this review request. Review only the unresolved "
     "claims listed below and return exactly one decision for each claim_id. Do not add claims, "
-    "omit IDs, duplicate IDs, or use claim text as the review key. Every adjudication MUST "
-    "include evidence_ids: supported claims need one or more ledger IDs; pedagogical and "
-    "unsupported claims need an empty list. Put IDs in evidence_ids, not only in the reason. "
-    "Never invent IDs. Classify each claim as supported, pedagogical, or unsupported. Reasonable "
+    "omit IDs, duplicate IDs, or use claim text as the review key. Classify each claim as "
+    "supported, pedagogical, or unsupported. For supported claims return only claim_id, "
+    "classification, and one or more valid evidence_ids; do not include a reason. For "
+    "pedagogical claims return only claim_id, classification, and evidence_ids: []. Do not "
+    "include a reason. For unsupported claims return claim_id, classification, evidence_ids: [], "
+    "a concise reason, and category when applicable. Never invent evidence IDs. Reasonable "
     "paraphrase does not need to match source wording exactly. Do not require exact lexical "
     "identity. Do not inflate a technical statement into importance, significance, historical "
     "cause, foundational status, broader application, or general necessity unless the evidence "
     "establishes that stronger claim. Pedagogical claims may remain pedagogical when they are "
-    "stipulated examples or illustrative setups. General model knowledge is not evidence. Return "
-    "compact JSON only.\n\n"
-    "Example 1:\n"
-    "Evidence:\n"
-    "[E001] Variables remain free until a universal or existential quantifier binds them.\n"
-    "[E002] This lets logic express general claims.\n"
-    "Claim: Quantifiers bind free variables so that general claims can be expressed.\n"
-    "Correct: supported with evidence_ids [E001, E002].\n\n"
-    "Example 2:\n"
-    "Evidence:\n"
-    "[E001] Predicate logic extends propositional logic.\n"
-    "Claim: Predicate logic is essential to modern computer science.\n"
-    "Correct: unsupported.\n\n"
-    "Example 3:\n"
-    "Claim: Let P(x) mean 'x is wise.'\n"
-    "Correct: pedagogical."
+    "stipulated examples or illustrative setups. General model knowledge is not evidence. "
+    "Return only the JSON structure, with no commentary outside it.\n\n"
+    "Supported:\n"
+    '{"claim_id":"C001","classification":"supported","evidence_ids":["S01-E001"]}\n\n'
+    "Pedagogical:\n"
+    '{"claim_id":"C002","classification":"pedagogical","evidence_ids":[]}\n\n'
+    "Unsupported:\n"
+    '{"claim_id":"C003","classification":"unsupported","evidence_ids":[],'
+    '"reason":"The evidence does not establish the broader significance claimed."}'
 )
 
 GROUNDING_REVISION_SYSTEM_PROMPT = (
