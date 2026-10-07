@@ -257,6 +257,8 @@ class StageTiming(BaseModel):
     thinking_enabled: bool | None = None
     thinking_characters: int | None = Field(default=None, ge=0)
     thinking_token_count: int | None = Field(default=None, ge=0)
+    thinking_reserve_tokens: int | None = Field(default=None, ge=0)
+    generation_budget: int | None = Field(default=None, ge=0)
     selected_context: int | None = Field(default=None, gt=0)
     estimated_input_tokens: int | None = Field(default=None, ge=0)
     output_budget: int | None = Field(default=None, ge=0)

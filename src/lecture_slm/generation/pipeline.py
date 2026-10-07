@@ -124,7 +124,7 @@ class GenerationPipeline:
                     planner_input,
                     profile.planner.context_tiers,
                     safety_margin=self.profiles.context_safety_margin,
-                    output_reserve_tokens=profile.planner.output_budget(target_request.task),
+                    output_reserve_tokens=profile.planner.generation_budget(target_request.task),
                 )
                 selected_contexts["planner"] = planner_selection.selected_context
                 estimated_inputs["planner"] = planner_selection.estimated_input_tokens
@@ -144,7 +144,7 @@ class GenerationPipeline:
                 progress,
                 GenerationStage.PLANNING,
                 planning_message,
-                profile.planner.output_budget(target_request.task),
+                profile.planner.generation_budget(target_request.task),
             )
             planner = Planner(
                 client=self.client_factory(

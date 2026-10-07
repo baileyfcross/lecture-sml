@@ -29,7 +29,7 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
 from lecture_slm.generation.plan_schemas import plan_schema_for_task
-from lecture_slm.generation.profiles import load_generation_profiles
+from lecture_slm.generation.profiles import StageProfile, load_generation_profiles
 from lecture_slm.generation.prompts.planner import build_planner_prompt
 from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import (
@@ -136,6 +136,7 @@ class FakeOllamaClient:
         revision_failure: bool = False,
         source_scope_status: str = "sufficient",
         source_scope_statuses: list[str] | None = None,
+        planner_response: ChatResponse | None = None,
         writer_output: str = (
             "# DNS: a concise explanation\n\nDNS maps a domain name to an IP address."
         ),
@@ -152,6 +153,7 @@ class FakeOllamaClient:
         self.revision_failure = revision_failure
         self.source_scope_status = source_scope_status
         self.source_scope_statuses = source_scope_statuses or []
+        self.planner_response = planner_response
         self.planner_response_count = 0
         self.writer_output = writer_output
         self.requests: list[dict[str, Any]] = []
@@ -217,6 +219,8 @@ class FakeOllamaClient:
                 content = "not valid JSON"
             elif self.planner_failure == "invalid_schema":
                 content = json.dumps({"task": "lecture", "sequence": [{"unexpected": True}]})
+            elif self.planner_response is not None:
+                return self.planner_response
             elif format.get("title") == "ExplanationPlan":
                 source_scope = (
                     {
@@ -444,7 +448,13 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert planner_request["options"]["temperature"] == 0.0
     assert "Do not explain your reasoning" in planner_request["system_message"]
     assert "step by step" not in planner_request["system_message"].lower()
-    assert planner_request["options"]["num_predict"] == 384
+    standard_planner_budget = profiles.profiles[
+        GenerationProfileName.STANDARD
+    ].planner.output_budget(TaskType.EXPLANATION)
+    assert planner_request["options"]["num_predict"] == standard_planner_budget
+    assert result.planner_result.timing.output_budget == standard_planner_budget
+    assert result.planner_result.timing.thinking_reserve_tokens == 0
+    assert result.planner_result.timing.generation_budget == standard_planner_budget
     assert profiles.profiles[GenerationProfileName.STANDARD].planner.context_tiers == [
         4096,
         8192,
@@ -577,7 +587,9 @@ def test_explanation_uses_compact_task_specific_plan(configs: tuple[Any, Any]) -
     assert result.status is GenerationStatus.COMPLETED
     assert isinstance(result.planner_result.plan, ExplanationPlan)
     assert fake.requests[0]["format"]["title"] == "ExplanationPlan"
-    assert fake.requests[0]["options"]["num_predict"] == 384
+    assert fake.requests[0]["options"]["num_predict"] == profiles.profiles[
+        GenerationProfileName.STANDARD
+    ].planner.output_budget(TaskType.EXPLANATION)
     assert fake.requests[0]["think"] is False
 
 
@@ -603,12 +615,15 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert result.status is GenerationStatus.COMPLETED
     assert fake.requests[0]["format"]["title"] == "LecturePlan"
     assert fake.requests[0]["think"] is True
-    assert fake.requests[0]["options"]["num_predict"] == 3072
+    assert fake.requests[0]["options"]["num_predict"] == 6144
     assert fake.requests[0]["options"]["temperature"] == 0.5
     assert result.planner_result is not None
     assert result.planner_result.timing.selected_context == 8192
     assert result.planner_result.prompt_version == "planner-v3"
     assert result.planner_result.timing.thinking_enabled is True
+    assert result.planner_result.timing.output_budget == 3072
+    assert result.planner_result.timing.thinking_reserve_tokens == 3072
+    assert result.planner_result.timing.generation_budget == 6144
     assert result.planner_result.timing.thinking_characters == len(
         "private planner trace for metadata test"
     )
@@ -621,6 +636,301 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert result.writer_result.timing.selected_context in {8192, 16384, 32768}
     assert profiles.profiles[GenerationProfileName.DEEP].review_enabled is False
     assert result.reviewer_result is None
+
+
+def test_stage_profile_generation_budget_and_thinking_reserve_validation(
+    configs: tuple[Any, Any],
+) -> None:
+    _, profiles = configs
+    standard = profiles.profiles[GenerationProfileName.STANDARD].planner.model_copy(
+        update={
+            "task_output_tokens": {TaskType.EXPLANATION: 512},
+            "thinking_reserve_tokens": 0,
+        }
+    )
+    deep = profiles.profiles[GenerationProfileName.DEEP].planner
+
+    assert standard.think is False
+    assert standard.output_budget(TaskType.EXPLANATION) == 512
+    assert standard.generation_budget(TaskType.EXPLANATION) == 512
+    assert deep.output_budget(TaskType.INSTRUCTOR_GUIDE) == 3072
+    assert deep.generation_budget(TaskType.INSTRUCTOR_GUIDE) == 6144
+    assert deep.output_budget(TaskType.SLIDES) == 1536
+    assert deep.generation_budget(TaskType.SLIDES) == 4608
+
+    invalid = standard.model_dump(mode="python") | {
+        "think": False,
+        "thinking_reserve_tokens": 1024,
+    }
+    with pytest.raises(ValidationError, match="thinking reserve must be zero"):
+        StageProfile.model_validate(invalid)
+    negative = standard.model_dump(mode="python") | {"thinking_reserve_tokens": -1}
+    with pytest.raises(ValidationError):
+        StageProfile.model_validate(negative)
+
+
+def test_deep_planner_context_selection_reserves_structured_and_thinking_budgets(
+    configs: tuple[Any, Any],
+) -> None:
+    _, profiles = configs
+    deep = profiles.profiles[GenerationProfileName.DEEP].planner
+    structured_budget = deep.output_budget(TaskType.SLIDES)
+    generation_budget = deep.generation_budget(TaskType.SLIDES)
+
+    without_thinking_reserve = select_context_tier(
+        "x" * 10_000,
+        deep.context_tiers,
+        safety_margin=profiles.context_safety_margin,
+        output_reserve_tokens=structured_budget,
+    )
+    with_thinking_reserve = select_context_tier(
+        "x" * 10_000,
+        deep.context_tiers,
+        safety_margin=profiles.context_safety_margin,
+        output_reserve_tokens=generation_budget,
+    )
+
+    assert without_thinking_reserve.required_tokens_with_margin < 8192
+    assert without_thinking_reserve.selected_context == 8192
+    assert with_thinking_reserve.required_tokens_with_margin > 8192
+    assert with_thinking_reserve.selected_context == 16384
+
+
+def test_deep_slides_planner_receives_combined_generation_budget(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(planner_failure="invalid_json")
+    request = GenerationRequest(
+        task=TaskType.SLIDES,
+        profile=GenerationProfileName.DEEP,
+        instruction="Create slides introducing C Sharp.",
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.FAILED
+    planner_request = fake.requests[0]
+    assert planner_request["format"]["title"] == "SlidesPlan"
+    assert planner_request["think"] is True
+    assert planner_request["options"]["num_predict"] == 4608
+    assert result.planner_result is not None and result.planner_result.timing is not None
+    assert result.planner_result.timing.output_budget == 1536
+    assert result.planner_result.timing.thinking_reserve_tokens == 3072
+    assert result.planner_result.timing.generation_budget == 4608
+
+
+def test_deep_slides_plan_can_exceed_structured_budget_without_hitting_total_limit(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    plan_payload = {
+        "task": "slides",
+        "artifact_structure": ["Title", "Concept", "Practice"],
+        "notes_for_writer": [],
+        "source_scope": None,
+        "objectives": ["Explain C Sharp variables."],
+        "prior_knowledge": ["Basic programming concepts."],
+        "slide_sequence": [
+            {
+                "title": "Variables",
+                "purpose": "Introduce named values.",
+                "concepts": ["declaration", "assignment"],
+            },
+            {
+                "title": "Practice",
+                "purpose": "Apply variable declarations.",
+                "concepts": ["types"],
+            },
+        ],
+        "examples": [],
+        "exercises": ["Declare an integer variable."],
+        "synthesis": ["Variables associate names with values."],
+        "source_coverage": [],
+    }
+    fake = FakeOllamaClient(
+        planner_response=ChatResponse(
+            model=model.ollama_name,
+            content=json.dumps(plan_payload),
+            completion_tokens=3000,
+            completion_reason="stop",
+        )
+    )
+    request = GenerationRequest(
+        task=TaskType.SLIDES,
+        profile=GenerationProfileName.DEEP,
+        instruction="Create slides introducing C Sharp variables.",
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED, result.errors
+    assert result.planner_result is not None and result.planner_result.timing is not None
+    assert result.planner_result.timing.output_budget == 1536
+    assert result.planner_result.timing.generation_budget == 4608
+    assert result.planner_result.timing.generated_tokens == 3000
+    assert result.planner_result.timing.output_limit_reached is False
+
+
+def test_deep_instructor_guide_planner_can_reason_and_validate_a_plan(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    plan_payload = {
+        "task": "instructor_guide",
+        "artifact_structure": ["Overview", "Key explanations"],
+        "notes_for_writer": [],
+        "source_scope": None,
+        "objectives": ["Explain the .NET course overview."],
+        "key_explanations": ["Describe the module sequence."],
+        "misconceptions": [],
+        "worked_solutions": [],
+        "alternate_examples": [],
+        "instructor_questions": ["What prior knowledge is needed?"],
+        "source_coverage": [],
+    }
+    planner_response = ChatResponse(
+        model=model.ollama_name,
+        content=json.dumps(plan_payload),
+        completion_tokens=3000,
+        completion_reason="stop",
+        thinking_content="private reasoning",
+    )
+    fake = FakeOllamaClient(planner_response=planner_response)
+    request = GenerationRequest(
+        task=TaskType.INSTRUCTOR_GUIDE,
+        profile=GenerationProfileName.DEEP,
+        instruction="Create an instructor guide for the C Sharp and .NET course overview.",
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED, result.errors
+    assert result.planner_result is not None and result.planner_result.plan is not None
+    assert result.planner_result.plan.task is TaskType.INSTRUCTOR_GUIDE
+    planner_request = fake.requests[0]
+    assert planner_request["think"] is True
+    assert planner_request["options"]["num_predict"] == 6144
+    assert planner_request["options"]["num_ctx"] == result.planner_result.timing.selected_context
+    assert result.planner_result.timing.output_budget == 3072
+    assert result.planner_result.timing.thinking_reserve_tokens == 3072
+    assert result.planner_result.timing.generation_budget == 6144
+    assert result.planner_result.timing.output_limit_reached is False
+    assert result.planner_result.timing.thinking_characters == len("private reasoning")
+    assert "private reasoning" not in result.model_dump_json()
+
+
+def test_deep_planner_reports_reasoning_budget_exhaustion_without_exposing_reasoning(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    planner_response = ChatResponse(
+        model=model.ollama_name,
+        content="",
+        completion_tokens=6144,
+        completion_reason="length",
+        thinking_content="private reasoning used the entire generation allowance",
+    )
+    fake = FakeOllamaClient(planner_response=planner_response)
+    request = GenerationRequest(
+        task=TaskType.INSTRUCTOR_GUIDE,
+        profile=GenerationProfileName.DEEP,
+        instruction="Create an instructor guide for the C Sharp and .NET course overview.",
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_result is not None
+    assert result.planner_result.plan is None
+    assert result.planner_result.raw_response == ""
+    assert result.planner_result.error_type == "PlannerThinkingBudgetExhaustedError"
+    assert "exhausted its generation budget during reasoning" in (
+        result.planner_result.error_message or ""
+    )
+    assert "ValidationError" not in (result.planner_result.error_message or "")
+    assert result.planner_result.timing is not None
+    assert result.planner_result.timing.output_budget == 3072
+    assert result.planner_result.timing.thinking_reserve_tokens == 3072
+    assert result.planner_result.timing.generation_budget == 6144
+    assert result.planner_result.timing.generated_tokens == 6144
+    assert result.planner_result.timing.thinking_characters == len(
+        "private reasoning used the entire generation allowance"
+    )
+    assert result.planner_result.timing.stop_reason == "length"
+    assert result.planner_result.timing.output_limit_reached is True
+    assert "private reasoning used" not in result.model_dump_json()
+    assert len(fake.requests) == 1
+    run_directory = tmp_path / "deep-budget-exhaustion"
+    save_generation_run(run_directory, request, result)
+    diagnostics = (run_directory / "diagnostics.md").read_text(encoding="utf-8")
+    planner_prompt = json.loads((run_directory / "planner_prompt.json").read_text(encoding="utf-8"))
+    assert "- Structured output budget: 3072" in diagnostics
+    assert "- Thinking reserve: 3072" in diagnostics
+    assert "- Total generation budget: 6144" in diagnostics
+    assert "- Generated tokens: 6144" in diagnostics
+    assert "- Thinking characters: " in diagnostics
+    assert "- Stop reason: length" in diagnostics
+    assert "private reasoning used" not in diagnostics
+    assert planner_prompt["output_budget"] == 3072
+    assert planner_prompt["thinking_reserve_tokens"] == 3072
+    assert planner_prompt["generation_budget"] == 6144
+
+
+def test_planner_reports_truncated_json_only_when_generation_budget_was_reached(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    truncated = ChatResponse(
+        model=model.ollama_name,
+        content='{"task":"explanation","concept":"test"',
+        completion_tokens=6144,
+        completion_reason="length",
+    )
+    fake = FakeOllamaClient(planner_response=truncated)
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        profile=GenerationProfileName.DEEP,
+        instruction="Explain a concept.",
+    )
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_result is not None
+    assert result.planner_result.raw_response == truncated.content
+    assert result.planner_result.error_type == "PlannerOutputTruncatedError"
+    assert "truncated after reaching its generation budget" in (
+        result.planner_result.error_message or ""
+    )
+    assert result.planner_result.timing is not None
+    assert result.planner_result.timing.output_limit_reached is True
+
+
+def test_malformed_planner_json_without_length_stop_keeps_validation_error(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(
+        planner_response=ChatResponse(
+            model=model.ollama_name,
+            content="not JSON",
+            completion_tokens=100,
+            completion_reason="stop",
+        )
+    )
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        profile=GenerationProfileName.DEEP,
+        instruction="Explain a concept.",
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.planner_result is not None
+    assert result.planner_result.error_type == "ValidationError"
+    assert result.planner_result.error_message is not None
+    assert "truncated after reaching" not in result.planner_result.error_message
 
 
 def test_planner_and_writer_limit_statuses_are_recorded_separately(

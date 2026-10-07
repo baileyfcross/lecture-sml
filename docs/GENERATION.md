@@ -52,7 +52,7 @@ Copy continues to copy the original Markdown and LaTeX delimiters.
 
 ## Task budgets and context selection
 
-Each generation profile has a global stage output fallback and optional canonical-task overrides. Writer always uses `think: false`; planning consumes its separate reasoning/output budget. Values are in YAML, not scattered Python constants.
+Each generation profile has a global stage output fallback and optional canonical-task overrides. For thinking-enabled Planner stages, the structured output budget remains the expected final plan size; the separate thinking reserve provides additional reasoning capacity. The total generation budget is the structured output budget plus the thinking reserve, and context selection reserves that total. Writer always uses `think: false` and continues to use only its task output budget. Values are in YAML, not scattered Python constants.
 
 For each stage, context selection estimates assembled prompt tokens using approximately one token per four characters, multiplies the estimate by the configured safety margin, reserves the stage output budget, then chooses the smallest configured context tier that can fit the result. If no tier can accommodate it, the stage fails explicitly instead of silently sending an undersized context. The estimate and chosen tier are recorded. This is a planning heuristic, not tokenizer integration.
 

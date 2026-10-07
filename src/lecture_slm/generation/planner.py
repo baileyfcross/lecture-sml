@@ -20,13 +20,23 @@ from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
 
+class PlannerThinkingBudgetExhaustedError(RuntimeError):
+    """Thinking consumed the full generation allowance before a plan was emitted."""
+
+
+class PlannerOutputTruncatedError(RuntimeError):
+    """The generation allowance ended before the structured plan could be validated."""
+
+
 def _stage_timing(
     response: ChatResponse,
     *,
     elapsed: float,
     selected_context: int,
     estimated_input_tokens: int,
-    budget: int,
+    structured_output_budget: int,
+    thinking_reserve_tokens: int,
+    generation_budget: int,
     thinking_enabled: bool,
 ) -> StageTiming:
     rate = None
@@ -46,12 +56,12 @@ def _stage_timing(
         output_limit_reached=detect_output_limit(
             stop_reason=response.completion_reason,
             generated_tokens=response.completion_tokens,
-            output_budget=budget,
+            output_budget=generation_budget,
         ),
         potentially_truncated=detect_output_limit(
             stop_reason=response.completion_reason,
             generated_tokens=response.completion_tokens,
-            output_budget=budget,
+            output_budget=generation_budget,
         ),
         thinking_enabled=thinking_enabled,
         thinking_characters=(
@@ -61,7 +71,9 @@ def _stage_timing(
         ),
         selected_context=selected_context,
         estimated_input_tokens=estimated_input_tokens,
-        output_budget=budget,
+        output_budget=structured_output_budget,
+        thinking_reserve_tokens=thinking_reserve_tokens,
+        generation_budget=generation_budget,
     )
 
 
@@ -84,15 +96,19 @@ class Planner:
     def plan(self, request: GenerationRequest, settings: StageProfile) -> StageRecord:
         prompt = build_planner_prompt(request, concise=not settings.think)
         assembled = f"{prompt.system_message}\n\n{prompt.user_message}"
+        structured_output_budget = settings.output_budget(request.task)
+        thinking_reserve_tokens = settings.thinking_reserve_tokens if settings.think else 0
+        generation_budget = settings.generation_budget(request.task)
         selection = select_context_tier(
             assembled,
             settings.context_tiers,
             safety_margin=self.profiles.context_safety_margin,
-            output_reserve_tokens=settings.output_budget(request.task),
+            output_reserve_tokens=generation_budget,
         )
         last_raw: str | None = None
         last_error: Exception | None = None
         last_timing: StageTiming | None = None
+        last_response: ChatResponse | None = None
         plan_schema = plan_schema_for_task(request.task)
 
         for _attempt in range(settings.retry_count + 1):
@@ -112,19 +128,22 @@ class Planner:
                         "top_p": self.model_config.inference.top_p,
                         "seed": self.model_config.inference.seed,
                         "num_ctx": selection.selected_context,
-                        "num_predict": settings.output_budget(request.task),
+                        "num_predict": generation_budget,
                     },
                     think=settings.think,
                     keep_alive=self.model_config.inference.keep_alive,
                     format=plan_schema.model_json_schema(),
                 )
+                last_response = response
                 last_raw = response.content
                 attempt_timing = _stage_timing(
                     response,
                     elapsed=time.perf_counter() - started,
                     selected_context=selection.selected_context,
                     estimated_input_tokens=selection.estimated_input_tokens,
-                    budget=settings.output_budget(request.task),
+                    structured_output_budget=structured_output_budget,
+                    thinking_reserve_tokens=thinking_reserve_tokens,
+                    generation_budget=generation_budget,
                     thinking_enabled=settings.think,
                 )
                 last_timing = attempt_timing
@@ -142,12 +161,44 @@ class Planner:
                 )
             except (OllamaError, ValidationError, json.JSONDecodeError, ValueError) as error:
                 last_error = error
+                if (
+                    last_response is not None
+                    and last_response.completion_reason == "length"
+                    and last_response.completion_tokens is not None
+                    and last_response.completion_tokens >= generation_budget
+                ):
+                    budget_details = (
+                        f"Structured output budget: {structured_output_budget}; "
+                        f"thinking reserve: {thinking_reserve_tokens}; "
+                        f"total generation budget: {generation_budget}; "
+                        f"generated tokens: {last_response.completion_tokens}; "
+                        f"thinking characters: "
+                        f"{len(last_response.thinking_content or '') if settings.think else 0}; "
+                        f"stop reason: {last_response.completion_reason}."
+                    )
+                    if (
+                        settings.think
+                        and not last_response.content.strip()
+                        and (last_response.thinking_content or "").strip()
+                    ):
+                        last_error = PlannerThinkingBudgetExhaustedError(
+                            "Deep Planner exhausted its generation budget during reasoning "
+                            f"before producing the structured plan. {budget_details}"
+                        )
+                    elif last_response.content.strip():
+                        last_error = PlannerOutputTruncatedError(
+                            "Planner output was truncated after reaching its generation "
+                            "budget; the incomplete structured plan could not be validated. "
+                            f"{budget_details} Validation error: {error}"
+                        )
                 if attempt_timing is None:
                     last_timing = StageTiming(
                         duration_seconds=time.perf_counter() - started,
                         selected_context=selection.selected_context,
                         estimated_input_tokens=selection.estimated_input_tokens,
-                        output_budget=settings.output_budget(request.task),
+                        output_budget=structured_output_budget,
+                        thinking_reserve_tokens=thinking_reserve_tokens,
+                        generation_budget=generation_budget,
                     )
 
         return StageRecord(
@@ -157,7 +208,9 @@ class Planner:
                 duration_seconds=0.0,
                 selected_context=selection.selected_context,
                 estimated_input_tokens=selection.estimated_input_tokens,
-                output_budget=settings.output_budget(request.task),
+                output_budget=structured_output_budget,
+                thinking_reserve_tokens=thinking_reserve_tokens,
+                generation_budget=generation_budget,
             ),
             raw_response=last_raw,
             prompt_version=prompt.version,

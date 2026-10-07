@@ -86,16 +86,35 @@ def _source_markdown(request: GenerationRequest) -> str:
 def _stage_diagnostic(name: str, record: StageRecord | None, *, used: bool) -> list[str]:
     lines = [f"## {name}", f"- Used: {'yes' if used else 'no'}"]
     timing = None if record is None else record.timing
-    values = [
+    values: list[tuple[str, object | None]] = [
         ("Context", None if timing is None else timing.selected_context),
         ("Estimated input tokens", None if timing is None else timing.estimated_input_tokens),
-        ("Output budget", None if timing is None else timing.output_budget),
-        ("Generated tokens", None if timing is None else timing.generated_tokens),
-        ("Duration", None if timing is None else timing.duration_seconds),
-        ("Tokens/sec", None if timing is None else timing.tokens_per_second),
-        ("Stop reason", None if timing is None else timing.stop_reason),
-        ("Output limit reached", None if timing is None else timing.output_limit_reached),
     ]
+    if timing is not None and timing.thinking_enabled is True:
+        values.extend(
+            [
+                ("Structured output budget", timing.output_budget),
+                ("Thinking reserve", timing.thinking_reserve_tokens),
+                ("Total generation budget", timing.generation_budget),
+                ("Generated tokens", timing.generated_tokens),
+                ("Thinking characters", timing.thinking_characters),
+            ]
+        )
+    else:
+        values.extend(
+            [
+                ("Output budget", None if timing is None else timing.output_budget),
+                ("Generated tokens", None if timing is None else timing.generated_tokens),
+            ]
+        )
+    values.extend(
+        [
+            ("Duration", None if timing is None else timing.duration_seconds),
+            ("Tokens/sec", None if timing is None else timing.tokens_per_second),
+            ("Stop reason", None if timing is None else timing.stop_reason),
+            ("Output limit reached", None if timing is None else timing.output_limit_reached),
+        ]
+    )
     lines.extend(f"- {label}: {value if value is not None else 'n/a'}" for label, value in values)
     return lines
 
@@ -367,6 +386,10 @@ def save_generation_run(
                     None if timing is None else timing.estimated_input_tokens
                 ),
                 "output_budget": None if timing is None else timing.output_budget,
+                "thinking_reserve_tokens": (
+                    None if timing is None else timing.thinking_reserve_tokens
+                ),
+                "generation_budget": None if timing is None else timing.generation_budget,
             },
         )
 

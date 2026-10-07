@@ -17,6 +17,7 @@ class StageProfile(BaseModel):
 
     enabled: bool = True
     think: bool
+    thinking_reserve_tokens: int = Field(default=0, ge=0)
     temperature: float | None = Field(default=None, ge=0.0)
     context_tiers: list[int] = Field(min_length=1)
     max_output_tokens: int = Field(gt=0)
@@ -30,6 +31,8 @@ class StageProfile(BaseModel):
             raise ValueError("context tiers must be selected from 4096, 8192, 16384, 32768")
         if self.context_tiers != sorted(set(self.context_tiers)):
             raise ValueError("context tiers must be unique and ascending")
+        if not self.think and self.thinking_reserve_tokens:
+            raise ValueError("thinking reserve must be zero when thinking is disabled")
         if any(limit <= 0 for limit in self.task_output_tokens.values()):
             raise ValueError("task-specific stage output budgets must be positive")
         return self
@@ -38,6 +41,11 @@ class StageProfile(BaseModel):
         """Resolve a per-task stage budget or the profile-level fallback."""
 
         return self.task_output_tokens.get(task, self.max_output_tokens)
+
+    def generation_budget(self, task: TaskType) -> int:
+        """Resolve total generation allowance, including reasoning when enabled."""
+
+        return self.output_budget(task) + (self.thinking_reserve_tokens if self.think else 0)
 
 
 class GenerationProfile(BaseModel):
