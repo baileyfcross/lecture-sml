@@ -8,7 +8,7 @@ from lecture_slm.generation.models import (
 )
 from lecture_slm.generation.prompts.base import PromptPackage, json_block
 
-GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v5"
+GROUNDING_REVIEW_PROMPT_VERSION = "grounding-review-v6"
 GROUNDING_REVISION_PROMPT_VERSION = "grounding-revision-v2"
 
 GROUNDING_REVIEW_SYSTEM_PROMPT = (
@@ -18,9 +18,10 @@ GROUNDING_REVIEW_SYSTEM_PROMPT = (
     "evidence ledger states or reasonably entails it. Claims already confirmed by deterministic "
     "direct matching have been removed from this review request. Review only the unresolved "
     "claims listed below and return exactly one decision for each claim_id. Do not add claims, "
-    "omit IDs, duplicate IDs, or use claim text as the review key. For each remaining claim, "
-    "classify it as supported, pedagogical, or unsupported. A supported claim must include one "
-    "or more evidence_ids that actually support or reasonably entail the claim. Reasonable "
+    "omit IDs, duplicate IDs, or use claim text as the review key. Every adjudication MUST "
+    "include evidence_ids: supported claims need one or more ledger IDs; pedagogical and "
+    "unsupported claims need an empty list. Put IDs in evidence_ids, not only in the reason. "
+    "Never invent IDs. Classify each claim as supported, pedagogical, or unsupported. Reasonable "
     "paraphrase does not need to match source wording exactly. Do not require exact lexical "
     "identity. Do not inflate a technical statement into importance, significance, historical "
     "cause, foundational status, broader application, or general necessity unless the evidence "

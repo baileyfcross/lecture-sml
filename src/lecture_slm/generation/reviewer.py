@@ -132,8 +132,13 @@ def _factual_sentence_excerpts(artifact: str) -> list[str]:
         ):
             continue
         line = re.sub(r"^(?:[-*+]\s+|\d+\.\s+)", "", line)
-        line = re.sub(r"\b(?:e\.g|i\.e)\.", lambda match: match.group().replace(".", "<DOT>"), line)
-        parts = re.split(r'(?<=[.!?])["”’)]*\s+(?=[A-Z0-9“"($\[])', line)
+        line = re.sub(
+            r"\b(?:e\.g|i\.e|vs)\.",
+            lambda match: match.group().replace(".", "<DOT>"),
+            line,
+            flags=re.IGNORECASE,
+        )
+        parts = _split_grounding_sentences(line)
         for part in parts:
             excerpt = part.replace("<DOT>", ".").strip()
             normalized = _sentence_key(excerpt)
@@ -142,17 +147,40 @@ def _factual_sentence_excerpts(artifact: str) -> list[str]:
                 r"^\*{0,2}\$?[A-Za-z]\w*(?:\([^)]*\))?\$?\*{0,2}:",
                 excerpt,
             )
+            is_labeled_relation_prompt = re.match(
+                r"^\*[^*\r\n]{1,60}\*:\s*consider the relation\b",
+                excerpt,
+                flags=re.IGNORECASE,
+            )
             if (
                 not normalized
                 or "?" in excerpt
                 or normalized_for_filter.startswith(ignored_prefixes)
                 or (normalized_for_filter.startswith("for example") and "$" in excerpt)
                 or is_symbol_definition is not None
+                or is_labeled_relation_prompt is not None
             ):
                 continue
             if any(character.isalpha() for character in excerpt):
                 sentences.append(excerpt)
     return sentences
+
+
+def _split_grounding_sentences(line: str) -> list[str]:
+    boundaries = [
+        match.start(2)
+        for match in re.finditer(
+            r'(?<=[.!?])(["”’)]*)(\s+)(?=[A-Z0-9“"($\[])',
+            line,
+        )
+    ]
+    parts: list[str] = []
+    start = 0
+    for boundary in boundaries:
+        parts.append(line[start:boundary].rstrip())
+        start = boundary
+    parts.append(line[start:].strip())
+    return parts
 
 
 def _validate_claim_coverage(artifact: str, review: GroundingReview) -> None:
@@ -173,9 +201,20 @@ def _claim_covers_sentence(claim: str, sentence: str) -> bool:
 
 
 def _direct_match_key(text: str) -> str:
+    text = _strip_presentation_prefix(text)
     text = _sentence_key(text)
     text = re.sub(r"(?<!\d)[,:;.!?]+|[,:;.!?]+(?!\d)", " ", text)
     return " ".join(text.split())
+
+
+def _strip_presentation_prefix(text: str) -> str:
+    """Remove a short emphasized Markdown label without changing factual wording."""
+    return re.sub(
+        r"^\s*>?\s*(\*\*|__|\*|_)([^*_:\r\n]{1,60})\1\s*:\s*",
+        "",
+        text,
+        count=1,
+    )
 
 
 def _evidence_ids_for_direct_claim(

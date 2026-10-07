@@ -793,6 +793,34 @@ def test_factual_sentence_extraction_skips_labeled_formal_examples() -> None:
     assert _factual_sentence_excerpts(artifact) == ["This foundation supports rigorous reasoning."]
 
 
+def test_factual_sentence_extraction_does_not_split_vs_abbreviation() -> None:
+    artifact = (
+        "**Free vs. Bound Variables**: In an open statement, variables remain free "
+        "until a quantifier binds them."
+    )
+
+    claims = _factual_sentence_excerpts(artifact)
+
+    assert claims == [
+        "**Free vs. Bound Variables**: In an open statement, variables remain free "
+        "until a quantifier binds them."
+    ]
+    assert "**Free vs." not in claims
+    assert not any(claim.startswith("Bound Variables**") for claim in claims)
+
+
+def test_factual_sentence_extraction_preserves_and_excludes_labeled_quoted_relation() -> None:
+    artifact = (
+        '*Multi-Place*: Consider the relation "is taller than." '
+        "Predicates with several places express relations among several entities."
+    )
+
+    claims = _factual_sentence_excerpts(artifact)
+
+    assert claims == ["Predicates with several places express relations among several entities."]
+    assert not any("is taller than." in claim for claim in claims)
+
+
 def test_factual_sentence_extraction_skips_instructional_question_stems() -> None:
     artifact = (
         'Consider the statement "All swans are white." How do quantifiers express "all"?\n'
@@ -892,6 +920,75 @@ def test_direct_source_matches_use_stable_ids_and_bypass_reviewer(
     assert direct[0].evidence_ids == ["S01-E001"]
 
 
+@pytest.mark.parametrize(
+    ("artifact_claim", "source_text"),
+    [
+        (
+            "**Core Definition**: Predicate logic extends propositional logic.",
+            "Predicate logic extends propositional logic.",
+        ),
+        (
+            "**The Decision Problem**: The later decision problem asked whether a procedure "
+            "could decide every proposition.",
+            "The later decision problem asked whether a procedure could decide every proposition.",
+        ),
+        (
+            "> **Key Distinction**: Variables remain free until a quantifier binds them.",
+            "Variables remain free until a quantifier binds them.",
+        ),
+        (
+            "*Multi-Place*: Predicates with several places express relations among "
+            "several entities.",
+            "Predicates with several places express relations among several entities.",
+        ),
+    ],
+)
+def test_presentation_labels_do_not_prevent_direct_source_matches(
+    artifact_claim: str,
+    source_text: str,
+) -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(source_id="source-1", title="Logic notes", text=source_text)
+            ]
+        }
+    )
+
+    claims, direct, unresolved = prepare_grounding_claims(request, artifact_claim)
+
+    assert len(claims) == 1
+    assert direct[0].classification is GroundingClaimClassification.DIRECT_SUPPORTED
+    assert direct[0].evidence_ids == ["S01-E001"]
+    assert unresolved == []
+    assert claims[0].text == artifact_claim
+
+
+def test_presentation_label_does_not_strip_factual_qualifiers() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(
+                    source_id="source-1",
+                    title="Logic notes",
+                    text="Predicate logic extends propositional logic.",
+                )
+            ]
+        }
+    )
+
+    _, direct, unresolved = prepare_grounding_claims(
+        request,
+        "**Important Fact**: Predicate logic is essential to computer science.",
+    )
+
+    assert direct == []
+    assert len(unresolved) == 1
+    assert unresolved[0].text == (
+        "**Important Fact**: Predicate logic is essential to computer science."
+    )
+
+
 def test_evidence_ledger_is_deterministic_and_ordered() -> None:
     request = sample_request(GenerationProfileName.STANDARD).model_copy(
         update={
@@ -967,6 +1064,40 @@ def test_verbatim_historical_source_match_cannot_be_overturned_by_reviewer(
     )
 
 
+def test_presentation_labeled_direct_match_bypasses_reviewer(
+    configs: tuple[Any, Any],
+) -> None:
+    source_sentence = (
+        "Predicate logic extends propositional logic by representing properties and relations "
+        "that become propositions when applied to entities."
+    )
+    artifact = f"**Core Definition**: {source_sentence}"
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(source_id="logic", title="Logic notes", text=source_sentence)
+            ]
+        }
+    )
+    model, profiles = configs
+    fake = FakeOllamaClient(writer_output=artifact)
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.final_output == artifact
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.review is not None
+    claim = result.initial_grounding_review.review.claim_assessments[0]
+    assert claim.classification is GroundingClaimClassification.DIRECT_SUPPORTED
+    assert claim.evidence_ids == ["S01-E001"]
+    assert not any(
+        record["format"] is not None
+        and record["format"].get("title") == "GroundingReviewerResponse"
+        for record in fake.requests
+    )
+
+
 def test_reviewer_entailment_requires_verifiable_evidence() -> None:
     source_text = (
         "Variables in an open statement remain free until a Universal Quantifier or Existential "
@@ -1010,10 +1141,89 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
     assert review.claim_assessments[0].evidence_ids == ["S01-E001"]
 
 
+def test_reviewer_response_models_require_classification_specific_evidence_ids() -> None:
+    valid_claims = [
+        {
+            "claim_id": "C001",
+            "classification": "supported",
+            "evidence_ids": ["S01-E001"],
+            "reason": "The selected evidence supports the claim.",
+        },
+        {
+            "claim_id": "C002",
+            "classification": "unsupported",
+            "evidence_ids": [],
+            "reason": "No supplied evidence establishes the claim.",
+        },
+        {
+            "claim_id": "C003",
+            "classification": "pedagogical",
+            "evidence_ids": [],
+            "reason": "This is a hypothetical teaching example.",
+        },
+    ]
+    response = GroundingReviewerResponse.model_validate({"claims": valid_claims})
+    assert len(response.claim_assessments) == 3
+
+    invalid_claims = [
+        {
+            "claim_id": "C001",
+            "classification": "supported",
+            "reason": "Supported.",
+        },
+        {
+            "claim_id": "C001",
+            "classification": "supported",
+            "evidence_ids": [],
+            "reason": "Supported.",
+        },
+        {
+            "claim_id": "C001",
+            "classification": "unsupported",
+            "evidence_ids": ["S01-E001"],
+            "reason": "Unsupported.",
+        },
+        {
+            "claim_id": "C001",
+            "classification": "pedagogical",
+            "evidence_ids": ["S01-E001"],
+            "reason": "Example.",
+        },
+        {
+            "claim_id": "C001",
+            "classification": "direct_supported",
+            "evidence_ids": ["S01-E001"],
+            "reason": "Directly supported.",
+        },
+    ]
+    for claim in invalid_claims:
+        with pytest.raises(ValidationError):
+            GroundingReviewerResponse.model_validate({"claims": [claim]})
+
+
+def test_reviewer_response_json_schema_requires_evidence_ids_by_classification() -> None:
+    schema = GroundingReviewerResponse.model_json_schema()
+    definitions = schema["$defs"]
+    claim_items = schema["properties"]["claims"]["items"]
+    assert claim_items["discriminator"]["propertyName"] == "classification"
+    assert len(claim_items["oneOf"]) == 3
+
+    supported = definitions["SupportedReviewerClaim"]
+    assert "evidence_ids" in supported["required"]
+    assert supported["properties"]["evidence_ids"]["minItems"] == 1
+    pedagogical = definitions["PedagogicalReviewerClaim"]
+    assert "evidence_ids" in pedagogical["required"]
+    assert pedagogical["properties"]["evidence_ids"]["minItems"] == 0
+    assert pedagogical["properties"]["evidence_ids"]["maxItems"] == 0
+    unsupported = definitions["UnsupportedReviewerClaim"]
+    assert "evidence_ids" in unsupported["required"]
+    assert unsupported["properties"]["evidence_ids"]["minItems"] == 0
+    assert unsupported["properties"]["evidence_ids"]["maxItems"] == 0
+
+
 @pytest.mark.parametrize(
     ("evidence_ids",),
     [
-        ([],),
         (["unknown-ref"],),
     ],
 )
@@ -1087,12 +1297,14 @@ def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_cl
                     "claim_id": "C003",
                     "classification": "pedagogical",
                     "reason": "This is a stipulated illustrative predicate.",
+                    "evidence_ids": [],
                 },
                 {
                     "claim_id": "C004",
                     "classification": "unsupported",
                     "reason": "The source does not establish essential status.",
                     "category": "unsupported_significance",
+                    "evidence_ids": [],
                 },
             ]
         }
@@ -1282,6 +1494,40 @@ def test_grounding_stage_errors_fail_closed(
         assert result.final_grounding_review.status is GenerationStatus.FAILED
 
 
+def test_reviewer_omitting_evidence_ids_fails_schema_validation_closed(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    raw_response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "reason": "Directly matches S01-E001.",
+                }
+            ]
+        }
+    )
+    result = make_pipeline(
+        model,
+        profiles,
+        FakeOllamaClient(
+            writer_output="Predicate logic is essential to computer science.",
+            grounding_responses=[raw_response],
+        ),
+    ).route(sample_request(GenerationProfileName.STANDARD))
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_output is None
+    assert result.initial_grounding_review is not None
+    assert result.initial_grounding_review.status is GenerationStatus.FAILED
+    assert result.initial_grounding_review.error_type == "ValidationError"
+    assert result.initial_grounding_review.raw_response == raw_response
+    assert result.initial_grounding_review.review is None
+    assert "evidence_ids" in (result.initial_grounding_review.error_message or "")
+
+
 def test_grounding_ledger_combines_direct_and_reviewer_claims(
     configs: tuple[Any, Any],
 ) -> None:
@@ -1381,7 +1627,9 @@ def test_generation_keeps_model_defaults_separate_from_profile(configs: tuple[An
     assert model.model_dump(mode="json") == original_defaults
     assert result.model_defaults["inference"]["context_length"] == 32768
     assert result.model_defaults["inference"]["think"] is True
-    assert result.profile_configuration["writer"]["context_tiers"] == [4096, 8192]
+    assert result.profile_configuration["writer"]["context_tiers"] == (
+        profiles.profiles[GenerationProfileName.STANDARD].writer.context_tiers
+    )
     assert result.selected_contexts["planner"] == 4096
     assert (
         result.selected_contexts["writer"]
@@ -1536,7 +1784,7 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_review_prompt = json.loads(
         (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_review_prompt["prompt_version"] == "grounding-review-v5"
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v6"
     assert "Unresolved factual claims to adjudicate" in saved_review_prompt["user_message"]
     saved_review = json.loads((run_dir / "grounding_review.json").read_text(encoding="utf-8"))
     saved_claim = saved_review["review"]["claim_assessments"][0]

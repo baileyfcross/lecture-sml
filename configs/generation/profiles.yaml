@@ -57,7 +57,7 @@ profiles:
     writer:
       enabled: true
       think: false
-      context_tiers: [4096, 8192]
+      context_tiers: [4096, 8192, 16384]
       max_output_tokens: 2048
       task_output_tokens:
         explanation: 1280

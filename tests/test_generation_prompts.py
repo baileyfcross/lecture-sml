@@ -264,10 +264,12 @@ def test_grounding_review_and_revision_prompts_are_versioned_and_structured() ->
         review,
     )
 
-    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v5"
+    assert review_prompt.version == GROUNDING_REVIEW_PROMPT_VERSION == "grounding-review-v6"
     assert "evidence ledger" in review_prompt.system_message.lower()
     assert "deterministic evidence ledger" in review_prompt.system_message
     assert "claim_id" in review_prompt.user_message
+    assert "every adjudication must include evidence_ids" in review_prompt.system_message.lower()
+    assert "supported claims need one or more ledger ids" in review_prompt.system_message.lower()
     assert "reasonable paraphrase" in review_prompt.system_message.lower()
     assert "S01-E001" in review_prompt.user_message
     assert revision_prompt.version == GROUNDING_REVISION_PROMPT_VERSION

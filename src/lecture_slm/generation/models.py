@@ -2,10 +2,10 @@
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
@@ -314,28 +314,46 @@ class GroundingClaimInput(BaseModel):
     text: str = Field(min_length=1)
 
 
-class GroundingReviewerAssessment(BaseModel):
+class SupportedReviewerClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     claim_id: str = Field(pattern=r"^C\d{3,}$")
-    classification: Literal[
-        GroundingClaimClassification.SUPPORTED,
-        GroundingClaimClassification.PEDAGOGICAL,
-        GroundingClaimClassification.UNSUPPORTED,
-    ]
+    classification: Literal[GroundingClaimClassification.SUPPORTED]
     reason: str = Field(min_length=1)
-    evidence_ids: list[str] = Field(
-        default_factory=list,
-        validation_alias=AliasChoices("evidence_ids", "source_refs", "source_ids"),
-        serialization_alias="evidence_ids",
-    )
+    evidence_ids: list[str] = Field(min_length=1)
     category: GroundingIssueCategory | None = None
+
+
+class PedagogicalReviewerClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    classification: Literal[GroundingClaimClassification.PEDAGOGICAL]
+    reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=0, max_length=0)
+    category: GroundingIssueCategory | None = None
+
+
+class UnsupportedReviewerClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    classification: Literal[GroundingClaimClassification.UNSUPPORTED]
+    reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=0, max_length=0)
+    category: GroundingIssueCategory | None = None
+
+
+ReviewerClaimAssessment = Annotated[
+    SupportedReviewerClaim | PedagogicalReviewerClaim | UnsupportedReviewerClaim,
+    Field(discriminator="classification"),
+]
 
 
 class GroundingReviewerResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    claim_assessments: list[GroundingReviewerAssessment] = Field(alias="claims", min_length=1)
+    claim_assessments: list[ReviewerClaimAssessment] = Field(alias="claims", min_length=1)
 
 
 class GroundingClaimAssessment(BaseModel):
