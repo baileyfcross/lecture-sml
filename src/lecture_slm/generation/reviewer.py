@@ -12,6 +12,7 @@ from lecture_slm.config.loader import ModelConfig
 from lecture_slm.generation.context import select_context_tier
 from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
+    ContinuitySupportedReviewerClaim,
     EvidenceSpan,
     GenerationRequest,
     GenerationStatus,
@@ -32,6 +33,7 @@ from lecture_slm.generation.models import (
     SupportedReviewerClaim,
     TeachingPlan,
     UnsupportedReviewerClaim,
+    WorkspaceContinuitySpan,
 )
 from lecture_slm.generation.profiles import GenerationProfiles, StageProfile
 from lecture_slm.generation.prompts.grounding import (
@@ -40,6 +42,11 @@ from lecture_slm.generation.prompts.grounding import (
     build_grounding_revision_prompt,
 )
 from lecture_slm.generation.timing import detect_output_limit
+from lecture_slm.generation.workspace_continuity import (
+    is_mixed_continuity_domain_claim,
+    is_workspace_continuity_claim,
+    select_workspace_continuity_support,
+)
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
 GROUNDING_REVIEW_NORMAL_OUTPUT_TOKENS = 4096
@@ -61,6 +68,10 @@ class GroundingReviewPreparation:
     direct_claims: list[GroundingClaimAssessment]
     unresolved_claims: list[GroundingClaimInput]
     evidence_ledger: list[EvidenceSpan]
+    continuity_ledger: list[WorkspaceContinuitySpan]
+    continuity_eligible_claim_ids: list[str]
+    continuity_reviewable_claim_ids: list[str]
+    continuity_diagnostics: dict[str, object]
     output_budget: int | None
 
     @property
@@ -242,6 +253,56 @@ def _direct_match_key(text: str) -> str:
     return " ".join(text.split())
 
 
+def _continuity_failure_reason(code: str) -> str:
+    return {
+        "claim_not_continuity_eligible": (
+            "Workspace continuity may support only course/project history or sequence claims; "
+            "this claim is not an eligible continuity-only claim."
+        ),
+        "claim_not_continuity_reviewable": (
+            "No selected Workspace continuity evidence was available for this claim."
+        ),
+        "unknown_continuity_id": (
+            "Reviewer cited a Workspace continuity ID that was not valid selected evidence "
+            "for this claim."
+        ),
+        "continuity_id_not_selected_for_claim": (
+            "Reviewer cited Workspace continuity evidence that was not selected for this claim."
+        ),
+        "mixed_continuity_domain_claim": (
+            "Workspace continuity may only support claims about course/project history or "
+            "sequence; this claim mixes continuity framing with domain factual assertions."
+        ),
+    }[code]
+
+
+def _continuity_revision_guidance(code: str) -> str:
+    return {
+        "mixed_continuity_domain_claim": (
+            "Remove or separate the course-history framing. Keep only factual statements that "
+            "are independently supported by factual SourceMaterial. Retain a course-history "
+            "statement only as a standalone claim when selected Workspace continuity evidence "
+            "supports it."
+        ),
+        "claim_not_continuity_reviewable": (
+            "Remove the unsupported course-history or future-sequence assertion unless "
+            "Workspace continuity evidence establishes it."
+        ),
+        "unknown_continuity_id": (
+            "Do not rely on Workspace continuity for this claim unless one of the supplied "
+            "continuity IDs supports it."
+        ),
+        "continuity_id_not_selected_for_claim": (
+            "Use only Workspace continuity IDs selected for this claim, or remove the "
+            "unsupported course-history assertion."
+        ),
+        "claim_not_continuity_eligible": (
+            "Remove the unsupported course-history framing unless selected Workspace "
+            "continuity evidence supports a continuity-only statement."
+        ),
+    }[code]
+
+
 def _strip_presentation_prefix(text: str) -> str:
     """Remove a short emphasized Markdown label without changing factual wording."""
     return re.sub(
@@ -321,8 +382,14 @@ def merge_grounding_review(
     direct_claims: list[GroundingClaimAssessment],
     reviewer_response: GroundingReviewerResponse | None,
     evidence_ledger: list[EvidenceSpan],
+    continuity_ledger: list[WorkspaceContinuitySpan] | None = None,
+    continuity_reviewable_claim_ids: set[str] | None = None,
+    continuity_diagnostics: dict[str, object] | None = None,
 ) -> GroundingReview:
     """Validate reviewer IDs/evidence and assemble the authoritative complete ledger."""
+    continuity_ledger = [] if continuity_ledger is None else continuity_ledger
+    if continuity_reviewable_claim_ids is None:
+        continuity_reviewable_claim_ids = set()
     unresolved_ids = {claim.claim_id for claim in all_claims} - {
         claim.claim_id for claim in direct_claims
     }
@@ -342,17 +409,37 @@ def merge_grounding_review(
 
     inputs_by_id = {claim.claim_id: claim for claim in all_claims}
     evidence_by_id = {span.evidence_id: span for span in evidence_ledger}
+    continuity_by_id = {span.continuity_id: span for span in continuity_ledger}
+    continuity_candidates = (
+        continuity_diagnostics.get("selected_by_claim", {})
+        if isinstance(continuity_diagnostics, dict)
+        else {}
+    )
     merged = list(direct_claims)
     evidence_failures = 0
+    continuity_failures = 0
+    issue_sources_by_claim: dict[str, list[str]] = {}
     for assessment in adjudications:
         claim = inputs_by_id[assessment.claim_id]
         valid_evidence_ids = [
-            evidence_id for evidence_id in assessment.evidence_ids if evidence_id in evidence_by_id
+            evidence_id
+            for evidence_id in getattr(assessment, "evidence_ids", [])
+            if evidence_id in evidence_by_id
         ]
         invalid_evidence_ids = [
             evidence_id
-            for evidence_id in assessment.evidence_ids
+            for evidence_id in getattr(assessment, "evidence_ids", [])
             if evidence_id not in evidence_by_id
+        ]
+        valid_continuity_ids = [
+            continuity_id
+            for continuity_id in getattr(assessment, "continuity_ids", [])
+            if continuity_id in continuity_by_id
+        ]
+        invalid_continuity_ids = [
+            continuity_id
+            for continuity_id in getattr(assessment, "continuity_ids", [])
+            if continuity_id not in continuity_by_id
         ]
         claim_evidence_failures = 0
         if assessment.classification is GroundingClaimClassification.SUPPORTED:
@@ -361,10 +448,15 @@ def merge_grounding_review(
             if invalid_evidence_ids:
                 claim_evidence_failures += 1
         classification = assessment.classification
+        continuity_failure_reason: str | None = None
+        revision_guidance: str | None = None
         if isinstance(assessment, SupportedReviewerClaim):
             reason = (
                 f"Supported by reviewer-selected evidence {', '.join(assessment.evidence_ids)}."
             )
+            category = None
+        elif isinstance(assessment, ContinuitySupportedReviewerClaim):
+            reason = f"Supported by workspace continuity {', '.join(assessment.continuity_ids)}."
             category = None
         elif isinstance(assessment, PedagogicalReviewerClaim):
             reason = "Reviewer classified this claim as a pedagogical example or setup."
@@ -374,6 +466,54 @@ def merge_grounding_review(
             category = assessment.category
         else:
             raise TypeError("Unknown grounding reviewer claim type")
+        if (
+            classification is GroundingClaimClassification.UNSUPPORTED
+            and is_mixed_continuity_domain_claim(claim.text)
+        ):
+            continuity_failure_reason = "mixed_continuity_domain_claim"
+            reason = f"{reason} {_continuity_failure_reason(continuity_failure_reason)}"
+        elif (
+            classification is GroundingClaimClassification.UNSUPPORTED
+            and continuity_failure_reason is None
+            and is_workspace_continuity_claim(claim.text)
+            and claim.claim_id not in continuity_reviewable_claim_ids
+        ):
+            continuity_failure_reason = "claim_not_continuity_reviewable"
+        if isinstance(assessment, ContinuitySupportedReviewerClaim):
+            if not is_workspace_continuity_claim(claim.text):
+                classification = GroundingClaimClassification.UNSUPPORTED
+                continuity_failure_reason = (
+                    "mixed_continuity_domain_claim"
+                    if is_mixed_continuity_domain_claim(claim.text)
+                    else "claim_not_continuity_eligible"
+                )
+                reason = _continuity_failure_reason(continuity_failure_reason)
+                continuity_failures += 1
+            elif assessment.claim_id not in continuity_reviewable_claim_ids:
+                classification = GroundingClaimClassification.UNSUPPORTED
+                continuity_failure_reason = "claim_not_continuity_reviewable"
+                reason = _continuity_failure_reason(continuity_failure_reason)
+                continuity_failures += 1
+            elif not valid_continuity_ids:
+                classification = GroundingClaimClassification.UNSUPPORTED
+                continuity_failure_reason = "unknown_continuity_id"
+                reason = _continuity_failure_reason(continuity_failure_reason)
+                continuity_failures += 1
+            elif invalid_continuity_ids:
+                classification = GroundingClaimClassification.UNSUPPORTED
+                continuity_failure_reason = "unknown_continuity_id"
+                reason = (
+                    f"{_continuity_failure_reason(continuity_failure_reason)} "
+                    "Invalid IDs: " + ", ".join(invalid_continuity_ids)
+                )
+                continuity_failures += 1
+            elif isinstance(continuity_candidates, dict):
+                selected_for_claim = set(continuity_candidates.get(assessment.claim_id, []))
+                if not set(valid_continuity_ids).issubset(selected_for_claim):
+                    classification = GroundingClaimClassification.UNSUPPORTED
+                    continuity_failure_reason = "continuity_id_not_selected_for_claim"
+                    reason = _continuity_failure_reason(continuity_failure_reason)
+                    continuity_failures += 1
         if invalid_evidence_ids:
             claim_evidence_failures += 1
             classification = GroundingClaimClassification.UNSUPPORTED
@@ -385,14 +525,28 @@ def merge_grounding_review(
             evidence_failures += 1
         if classification is GroundingClaimClassification.UNSUPPORTED and category is None:
             category = GroundingIssueCategory.UNSUPPORTED_FACT
+        if valid_evidence_ids:
+            issue_sources_by_claim[claim.claim_id] = list(
+                dict.fromkeys(
+                    evidence_by_id[evidence_id].source_id for evidence_id in valid_evidence_ids
+                )
+            )
+        if continuity_failure_reason is not None:
+            revision_guidance = _continuity_revision_guidance(continuity_failure_reason)
         method = {
             GroundingClaimClassification.SUPPORTED: GroundingSupportMethod.REVIEWER_ENTAILMENT,
+            GroundingClaimClassification.CONTINUITY_SUPPORTED: (
+                GroundingSupportMethod.WORKSPACE_CONTINUITY
+            ),
             GroundingClaimClassification.PEDAGOGICAL: GroundingSupportMethod.PEDAGOGICAL,
             GroundingClaimClassification.UNSUPPORTED: GroundingSupportMethod.UNSUPPORTED,
         }[classification]
         mapped_evidence_ids = valid_evidence_ids
         if classification is GroundingClaimClassification.UNSUPPORTED:
             mapped_evidence_ids = []
+        mapped_continuity_ids = valid_continuity_ids
+        if classification is not GroundingClaimClassification.CONTINUITY_SUPPORTED:
+            mapped_continuity_ids = []
         merged.append(
             GroundingClaimAssessment(
                 claim_id=claim.claim_id,
@@ -400,8 +554,11 @@ def merge_grounding_review(
                 classification=classification,
                 support_method=method,
                 evidence_ids=mapped_evidence_ids,
+                continuity_ids=mapped_continuity_ids,
                 reason=reason,
                 category=category,
+                continuity_failure_reason=continuity_failure_reason,
+                revision_guidance=revision_guidance,
             )
         )
 
@@ -421,10 +578,10 @@ def merge_grounding_review(
             kind=claim.category or GroundingIssueCategory.UNSUPPORTED_FACT,
             why=claim.reason,
             sources=[
-                evidence_by_id[evidence_id].source_id
-                for evidence_id in claim.evidence_ids
-                if evidence_id in evidence_by_id
+                *issue_sources_by_claim.get(claim.claim_id, []),
             ],
+            continuity_failure_reason=claim.continuity_failure_reason,
+            revision_guidance=claim.revision_guidance,
         )
         for claim in merged
         if claim.classification is GroundingClaimClassification.UNSUPPORTED
@@ -434,6 +591,11 @@ def merge_grounding_review(
         notes.append(
             f"{evidence_failures} reviewer support decision(s) failed "
             "programmatic evidence validation."
+        )
+    if continuity_failures:
+        notes.append(
+            f"{continuity_failures} reviewer continuity decision(s) failed "
+            "programmatic continuity validation."
         )
     decision = GroundingDecision.REVISION_REQUIRED if issues else GroundingDecision.PASS
     return GroundingReview(
@@ -448,6 +610,8 @@ def merge_grounding_review(
         ),
         notes=notes,
         evidence_validation_failures=evidence_failures,
+        continuity_validation_failures=continuity_failures,
+        continuity_selection=({} if continuity_diagnostics is None else continuity_diagnostics),
         coverage_complete=True,
     )
 
@@ -492,11 +656,16 @@ class GroundingStageRunner:
             artifact,
             evidence_ledger,
         )
+        continuity_selection = select_workspace_continuity_support(request, unresolved_claims)
         return GroundingReviewPreparation(
             all_claims=all_claims,
             direct_claims=direct_claims,
             unresolved_claims=unresolved_claims,
             evidence_ledger=evidence_ledger,
+            continuity_ledger=continuity_selection.selected_spans,
+            continuity_eligible_claim_ids=continuity_selection.eligible_claim_ids,
+            continuity_reviewable_claim_ids=continuity_selection.reviewable_claim_ids,
+            continuity_diagnostics=continuity_selection.diagnostics,
             output_budget=(
                 grounding_review_output_budget(len(unresolved_claims))
                 if unresolved_claims
@@ -515,6 +684,8 @@ class GroundingStageRunner:
         direct_claims = prepared.direct_claims
         unresolved_claims = prepared.unresolved_claims
         evidence_ledger = prepared.evidence_ledger
+        continuity_ledger = prepared.continuity_ledger
+        continuity_reviewable_claim_ids = set(prepared.continuity_reviewable_claim_ids)
         if not unresolved_claims:
             try:
                 direct_review = merge_grounding_review(
@@ -522,6 +693,9 @@ class GroundingStageRunner:
                     direct_claims,
                     None,
                     evidence_ledger,
+                    continuity_ledger,
+                    continuity_reviewable_claim_ids,
+                    prepared.continuity_diagnostics,
                 )
                 _validate_claim_coverage(artifact, direct_review)
             except (ValidationError, ValueError) as error:
@@ -544,7 +718,12 @@ class GroundingStageRunner:
                 review_output_budget=prepared.output_budget,
             )
 
-        prompt = build_grounding_review_prompt(request, unresolved_claims)
+        prompt = build_grounding_review_prompt(
+            request,
+            unresolved_claims,
+            continuity_ledger=continuity_ledger,
+            continuity_reviewable_claim_ids=prepared.continuity_reviewable_claim_ids,
+        )
         budget = prepared.output_budget
         if budget is None:
             raise RuntimeError("grounding review preparation has no output budget")
@@ -592,6 +771,9 @@ class GroundingStageRunner:
                 direct_claims,
                 reviewer_response,
                 evidence_ledger,
+                continuity_ledger,
+                continuity_reviewable_claim_ids,
+                prepared.continuity_diagnostics,
             )
             _validate_claim_coverage(artifact, review)
         except (OllamaError, ValidationError, ValueError) as error:

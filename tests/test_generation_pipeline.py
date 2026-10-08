@@ -24,13 +24,19 @@ from lecture_slm.generation.models import (
     GroundingSupportMethod,
     PreviousCourseContext,
     SourceMaterial,
+    SourceScopeAssessment,
     SourceScopeStatus,
     TeachingPlan,
+    WorkspaceContext,
 )
 from lecture_slm.generation.persistence import create_generation_run_directory, save_generation_run
 from lecture_slm.generation.plan_schemas import plan_schema_for_task
 from lecture_slm.generation.profiles import StageProfile, load_generation_profiles
-from lecture_slm.generation.prompts.planner import build_planner_prompt
+from lecture_slm.generation.prompts.grounding import build_grounding_review_prompt
+from lecture_slm.generation.prompts.planner import (
+    build_planner_prompt,
+    build_planner_reassessment_prompt,
+)
 from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import (
     _factual_sentence_excerpts,
@@ -40,10 +46,23 @@ from lecture_slm.generation.reviewer import (
     prepare_grounding_claims,
 )
 from lecture_slm.generation.router import GenerationRouter
+from lecture_slm.generation.source_scope import (
+    normalize_source_scope,
+    normalize_source_scope_with_diagnostics,
+)
+from lecture_slm.generation.workspace_continuity import (
+    MAX_CONTINUITY_SPANS_PER_CLAIM,
+    MAX_CONTINUITY_SPANS_TOTAL,
+    build_workspace_continuity_ledger,
+    is_workspace_continuity_claim,
+    meaningful_continuity_terms,
+    select_workspace_continuity_support,
+)
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaTimeoutError
 from lecture_slm.schemas.course import CourseProfile
 from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyPrinciple, PedagogyProfile
+from lecture_slm.workspaces.models import WorkspaceContextItem, WorkspaceItemRole
 
 ROOT = Path(__file__).parents[1]
 
@@ -64,7 +83,7 @@ def _passing_review() -> str:
 
 def _default_grounding_review(user_message: str) -> str:
     claims_match = re.search(
-        r"## Unresolved factual claims to adjudicate\n```json\n(.*?)\n```",
+        r"## Unresolved claims to adjudicate\n```json\n(.*?)\n```",
         user_message,
         flags=re.DOTALL,
     )
@@ -98,11 +117,15 @@ def _assessment(
     *,
     classification: str = "supported",
     evidence_ids: list[str] | None = None,
+    continuity_ids: list[str] | None = None,
     reason: str = "The supplied evidence supports the decision.",
 ) -> dict[str, Any]:
     resolved_evidence_ids = evidence_ids
+    resolved_continuity_ids = continuity_ids
     if classification == "supported":
         resolved_evidence_ids = ["S01-E001"] if evidence_ids is None else evidence_ids
+    elif classification == "continuity_supported":
+        resolved_continuity_ids = ["W01-C001"] if continuity_ids is None else continuity_ids
     return {
         "claim_id": claim_id,
         "text": text,
@@ -110,11 +133,14 @@ def _assessment(
         "support_method": (
             "reviewer_entailment"
             if classification == "supported"
+            else "workspace_continuity"
+            if classification == "continuity_supported"
             else "pedagogical"
             if classification == "pedagogical"
             else "unsupported"
         ),
         "evidence_ids": resolved_evidence_ids or [],
+        "continuity_ids": resolved_continuity_ids or [],
         "reason": reason,
         "category": "unsupported_fact" if classification == "unsupported" else None,
     }
@@ -137,6 +163,7 @@ class FakeOllamaClient:
         source_scope_status: str = "sufficient",
         source_scope_statuses: list[str] | None = None,
         planner_response: ChatResponse | None = None,
+        planner_responses: dict[int, ChatResponse] | None = None,
         writer_output: str = (
             "# DNS: a concise explanation\n\nDNS maps a domain name to an IP address."
         ),
@@ -155,6 +182,7 @@ class FakeOllamaClient:
         self.source_scope_status = source_scope_status
         self.source_scope_statuses = source_scope_statuses or []
         self.planner_response = planner_response
+        self.planner_responses = planner_responses or {}
         self.planner_response_count = 0
         self.writer_output = writer_output
         self.requests: list[dict[str, Any]] = []
@@ -216,6 +244,8 @@ class FakeOllamaClient:
                 else self.source_scope_status
             )
             self.planner_response_count += 1
+            if self.planner_response_count in self.planner_responses:
+                return self.planner_responses[self.planner_response_count]
             if self.planner_failure == "timeout":
                 raise OllamaTimeoutError("planner timed out")
             if self.planner_failure == "invalid_json":
@@ -314,7 +344,7 @@ class FakeOllamaClient:
                 completion_reason="stop",
                 thinking_content="private planner trace for metadata test",
             )
-        if system_message and "Revise the supplied complete artifact" in system_message:
+        if system_message and "targeted editor of the supplied complete artifact" in system_message:
             if self.revision_failure:
                 raise OllamaTimeoutError("grounding revision timed out")
             return ChatResponse(
@@ -498,7 +528,7 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert result.writer_result.timing.generated_tokens == 64
     assert result.writer_result.timing.potentially_truncated is False
     assert result.metadata["planner_prompt_version"] == "planner-standard-v4"
-    assert result.metadata["writer_prompt_version"] == "writer-v8"
+    assert result.metadata["writer_prompt_version"] == "writer-v11"
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
         GenerationStage.PLANNING,
@@ -903,7 +933,7 @@ def test_planner_reports_truncated_json_only_when_generation_budget_was_reached(
     assert result.planner_result is not None
     assert result.planner_result.raw_response == truncated.content
     assert result.planner_result.error_type == "PlannerOutputTruncatedError"
-    assert "truncated after reaching its generation budget" in (
+    assert "truncated after reaching its 6,144-token generation budget" in (
         result.planner_result.error_message or ""
     )
     assert result.planner_result.timing is not None
@@ -1128,7 +1158,35 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
     ]
     assert len(planner_requests) == 2
     assert "Expanded DNS source" in planner_requests[1]["user_message"]
-    assert "## Scope reassessment" in planner_requests[1]["user_message"]
+    assert "## Existing validated teaching plan" in planner_requests[1]["user_message"]
+    assert "## Reassessment task" in planner_requests[1]["user_message"]
+    assert result.planner_initial_result is not None
+    assert result.planner_reassessment_result is not None
+    assert result.planner_initial_result.timing is not None
+    assert result.planner_reassessment_result.timing is not None
+    assert result.planner_initial_result.prompt_version == "planner-standard-v4"
+    assert result.planner_reassessment_result.prompt_version == "planner-reassessment-v1"
+    assert planner_requests[0]["think"] is False
+    assert planner_requests[1]["think"] is False
+    assert planner_requests[1]["options"]["temperature"] == 0
+    assert (
+        result.planner_reassessment_result.timing.output_budget
+        == result.planner_initial_result.timing.output_budget
+    )
+    assert result.planner_reassessment_result.timing.thinking_reserve_tokens == 0
+    assert (
+        result.planner_reassessment_result.timing.generation_budget
+        == result.planner_reassessment_result.timing.output_budget
+    )
+    assert planner_requests[1]["options"]["num_predict"] == (
+        result.planner_reassessment_result.timing.generation_budget
+    )
+    assert result.selected_contexts["planner_initial"] == (
+        result.planner_initial_result.timing.selected_context
+    )
+    assert result.selected_contexts["planner_reassessment"] == (
+        result.planner_reassessment_result.timing.selected_context
+    )
     assert (result.writer_result is not None) is writer_runs
     final_scope = result.planner_result.plan.source_scope
     assert final_scope is not None and final_scope.status.value == final_status
@@ -1136,6 +1194,290 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
     assert diagnostics["source_scope_assessments"]["initial"]["status"] == "partial"
     assert diagnostics["source_scope_assessments"]["final"]["status"] == final_status
     assert len(diagnostics["retrieval_rounds"]) == 2
+    assert diagnostics["planner_stages"]["planner_initial"]["prompt_version"] == (
+        "planner-standard-v4"
+    )
+    assert diagnostics["planner_stages"]["planner_reassessment"]["prompt_version"] == (
+        "planner-reassessment-v1"
+    )
+    assert "planner_initial_source_scope_normalization" in diagnostics
+    assert "planner_reassessment_source_scope_normalization" in diagnostics
+
+
+def test_deep_reassessment_is_non_thinking_and_keeps_initial_budget(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_statuses=["partial", "sufficient"])
+    request = sample_request(GenerationProfileName.DEEP, TaskType.LECTURE)
+    events = []
+    expanded_requests: list[GenerationRequest] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: Any,
+    ) -> GenerationRequest:
+        assert scope.status is SourceScopeStatus.PARTIAL
+        expanded = sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="lecture-expansion",
+                        title="Expanded lecture source",
+                        text="Additional requested facts supported by retrieval.",
+                    ),
+                ]
+            }
+        )
+        expanded_requests.append(expanded)
+        return expanded
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        on_progress=events.append,
+        expand_retrieval=expand,
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    initial = result.planner_initial_result
+    reassessment = result.planner_reassessment_result
+    assert initial is not None and initial.timing is not None and initial.plan is not None
+    assert reassessment is not None and reassessment.timing is not None
+    planner_requests = [
+        item
+        for item in fake.requests
+        if item["format"] is not None and item["format"].get("title") == "LecturePlan"
+    ]
+    assert len(planner_requests) == 2
+    initial_request, reassessment_request = planner_requests
+    assert initial_request["think"] is True
+    assert initial_request["options"]["num_predict"] == 6144
+    assert initial.timing.output_budget == 3072
+    assert initial.timing.thinking_reserve_tokens == 3072
+    assert initial.timing.generation_budget == 6144
+    deep_planner_settings = profiles.profiles[GenerationProfileName.DEEP].planner
+    assert deep_planner_settings.think is True
+    assert deep_planner_settings.temperature == 0.5
+    assert deep_planner_settings.thinking_reserve_tokens == 3072
+    assert reassessment_request["think"] is False
+    assert reassessment_request["options"]["temperature"] == 0
+    assert reassessment_request["options"]["num_predict"] == 3072
+    assert reassessment.timing.output_budget == 3072
+    assert reassessment.timing.thinking_reserve_tokens == 0
+    assert reassessment.timing.generation_budget == 3072
+    assert reassessment.timing.thinking_enabled is False
+    assert reassessment.timing.thinking_characters is None
+    assert reassessment_request["options"]["num_ctx"] == reassessment.timing.selected_context
+    reassessment_prompt = build_planner_reassessment_prompt(
+        expanded_requests[0],
+        initial.plan,
+    )
+    expected_reassessment_context = select_context_tier(
+        f"{reassessment_prompt.system_message}\n\n{reassessment_prompt.user_message}",
+        profiles.profiles[GenerationProfileName.DEEP].planner.context_tiers,
+        safety_margin=profiles.context_safety_margin,
+        output_reserve_tokens=3072,
+    )
+    assert reassessment.timing.selected_context == expected_reassessment_context.selected_context
+    assert reassessment.timing.selected_context == result.selected_contexts["planner_reassessment"]
+    reassessment_start = next(
+        event
+        for event in events
+        if event.message == "Reassessing the teaching plan after retrieval expansion"
+    )
+    assert reassessment_start.estimate_seconds_remaining == pytest.approx(
+        3072 / profiles.estimated_fallback_tokens_per_second
+    )
+    assert result.planner_result is not None and result.planner_result.plan is not None
+    assert result.writer_result is not None
+    assert result.planner_result.plan.concept_sequence == (
+        result.planner_initial_result.plan.concept_sequence
+    )
+    writer_request = next(item for item in fake.requests if item["format"] is None)
+    assert "Expanded lecture source" in writer_request["user_message"]
+
+
+def test_partial_scope_without_expansion_result_does_not_reassess(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient(source_scope_status="partial")
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+    expansion_calls: list[int] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: Any,
+    ) -> None:
+        expansion_calls.append(1)
+        assert scope.status is SourceScopeStatus.PARTIAL
+        return None
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert expansion_calls == [1]
+    assert result.planner_initial_result is not None
+    assert result.planner_reassessment_result is None
+    assert result.planner_result is not None
+    assert result.planner_result.plan == result.planner_initial_result.plan
+    assert (
+        len(
+            [
+                item
+                for item in fake.requests
+                if item["format"] is not None and item["format"].get("title") == "ExplanationPlan"
+            ]
+        )
+        == 1
+    )
+
+
+def test_reassessment_truncation_fails_closed_and_persists_initial_plan(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    truncated = ChatResponse(
+        model="test-model",
+        content='{"task":"lecture","artifact_structure":["objectives"',
+        prompt_tokens=1000,
+        completion_tokens=3072,
+        total_duration_ns=2_000_000_000,
+        eval_duration_ns=1_000_000_000,
+        completion_reason="length",
+        thinking_content="not used when thinking is disabled",
+    )
+    fake = FakeOllamaClient(
+        source_scope_statuses=["partial", "partial"],
+        planner_responses={2: truncated},
+    )
+    request = sample_request(GenerationProfileName.DEEP, TaskType.LECTURE)
+    expanded_requests: list[GenerationRequest] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: Any,
+    ) -> GenerationRequest:
+        expanded = sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="lecture-expansion",
+                        title="Expanded lecture source",
+                        text="Additional requested facts supported by retrieval.",
+                    ),
+                ],
+                "metadata": {
+                    **sourced_request.metadata,
+                    "knowledge_retrieval": {"diagnostics": {"retrieval_expanded": True}},
+                },
+            }
+        )
+        expanded_requests.append(expanded)
+        return expanded
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_initial_result is not None
+    assert result.planner_initial_result.plan is not None
+    assert result.planner_reassessment_result is not None
+    assert result.planner_reassessment_result.error_type == "PlannerOutputTruncatedError"
+    assert "Planner reassessment output was truncated" in (
+        result.planner_reassessment_result.error_message or ""
+    )
+    assert "3,072-token generation budget" in (
+        result.planner_reassessment_result.error_message or ""
+    )
+    assert result.planner_reassessment_result.timing is not None
+    assert result.planner_reassessment_result.timing.thinking_enabled is False
+    assert result.planner_reassessment_result.timing.thinking_characters is None
+    assert result.planner_result is not None and result.planner_result.plan is None
+    assert result.writer_result is None
+    assert len([item for item in fake.requests if item["format"] is not None]) == 2
+
+    run_dir = create_generation_run_directory(tmp_path, request.request_id)
+    save_generation_run(run_dir, expanded_requests[0], result)
+    names = {path.name for path in run_dir.iterdir()}
+    assert {
+        "planner_initial_prompt.json",
+        "planner_initial_plan.json",
+        "planner_initial_raw_response.txt",
+        "planner_reassessment_prompt.json",
+        "planner_reassessment_raw_response.txt",
+        "planner_reassessment_error.json",
+        "planner_prompt.json",
+        "diagnostics.md",
+    } <= names
+    assert "plan.json" not in names
+    assert "writer_prompt.json" not in names
+    assert "writer_output.md" not in names
+    saved_prompt = json.loads(
+        (run_dir / "planner_reassessment_prompt.json").read_text(encoding="utf-8")
+    )
+    assert saved_prompt["prompt_version"] == "planner-reassessment-v1"
+    assert saved_prompt["thinking_enabled"] is False
+    assert saved_prompt["generation_budget"] == 3072
+    diagnostic_text = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
+    assert "## Planner initial" in diagnostic_text
+    assert "## Planner reassessment" in diagnostic_text
+    assert "PlannerOutputTruncatedError" in diagnostic_text
+
+
+def test_malformed_reassessment_stop_is_not_classified_as_truncation(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    malformed = ChatResponse(
+        model="test-model",
+        content="not valid JSON",
+        prompt_tokens=1000,
+        completion_tokens=40,
+        total_duration_ns=1_000_000_000,
+        eval_duration_ns=500_000_000,
+        completion_reason="stop",
+    )
+    fake = FakeOllamaClient(
+        source_scope_statuses=["partial", "partial"],
+        planner_responses={2: malformed},
+    )
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION)
+
+    def expand(sourced_request: GenerationRequest, scope: Any) -> GenerationRequest:
+        return sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="dns-expansion",
+                        title="Expanded DNS source",
+                        text="Expanded source details about DNS.",
+                    ),
+                ]
+            }
+        )
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_reassessment_result is not None
+    assert result.planner_reassessment_result.error_type == "ValidationError"
+    assert "truncated after reaching" not in (
+        result.planner_reassessment_result.error_message or ""
+    )
+    assert result.writer_result is None
 
 
 @pytest.mark.parametrize("first_status", ["sufficient", "insufficient"])
@@ -1176,6 +1518,8 @@ def test_non_partial_initial_scope_does_not_expand(
         if item["format"] is not None and item["format"].get("title") == "ExplanationPlan"
     ]
     assert len(planner_requests) == 1
+    assert result.planner_initial_result is not None
+    assert result.planner_reassessment_result is None
     assert (result.writer_result is not None) is (first_status == "sufficient")
     diagnostics = request.metadata["knowledge_retrieval"]["diagnostics"]
     assert diagnostics["source_scope_assessments"]["initial"]["status"] == first_status
@@ -1678,6 +2022,1099 @@ def test_reviewer_entailment_requires_verifiable_evidence() -> None:
     )
 
 
+def test_workspace_continuity_support_requires_matching_claim_and_ledger() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We explored reusable type-safe abstractions.",
+                    )
+                ],
+            )
+        }
+    )
+    continuity_ledger = build_workspace_continuity_ledger(request)
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our previous session, we explored Generic Methods.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": [continuity_ledger[0].continuity_id],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_ledger,
+        continuity_reviewable_claim_ids={"C001"},
+        continuity_diagnostics={
+            "selected_by_claim": {
+                "C001": [continuity_ledger[0].continuity_id],
+            }
+        },
+    )
+
+    assert review.decision is GroundingDecision.PASS
+    assert review.claim_assessments[0].classification is (
+        GroundingClaimClassification.CONTINUITY_SUPPORTED
+    )
+    assert review.claim_assessments[0].support_method is GroundingSupportMethod.WORKSPACE_CONTINUITY
+    assert review.claim_assessments[0].continuity_ids == [continuity_ledger[0].continuity_id]
+    assert review.claim_assessments[0].evidence_ids == []
+
+
+def test_workspace_continuity_support_is_rejected_for_domain_facts() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We explored reusable type-safe abstractions.",
+                    )
+                ],
+            )
+        }
+    )
+    continuity_ledger = build_workspace_continuity_ledger(request)
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="Generic methods provide reusable type-safe behavior.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": [continuity_ledger[0].continuity_id],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_ledger,
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    assert "course/project history or sequence" in review.claim_assessments[0].reason
+
+
+def test_mixed_unsupported_claim_gets_continuity_revision_guidance() -> None:
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text=(
+            "Earlier lectures explored how interfaces define contracts that allow code "
+            "to depend on capabilities."
+        ),
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "unsupported",
+                    "evidence_ids": [],
+                    "reason": "No supplied source establishes the domain assertion.",
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review([claim], [], response, [])
+
+    assert review.issues[0].continuity_failure_reason == "mixed_continuity_domain_claim"
+    assert review.issues[0].revision_guidance is not None
+    assert "Remove or separate the course-history framing" in review.issues[0].revision_guidance
+
+
+def test_unsupported_unreviewable_continuity_claim_gets_deletion_guidance() -> None:
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our previous session, we explored Sealed Classes.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "unsupported",
+                    "evidence_ids": [],
+                    "reason": "The selected Workspace evidence does not establish this topic.",
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_reviewable_claim_ids=set(),
+    )
+
+    assert review.issues[0].continuity_failure_reason == "claim_not_continuity_reviewable"
+    assert "Remove the unsupported course-history" in review.issues[0].revision_guidance
+
+
+def test_continuity_ids_must_be_selected_for_the_citing_claim() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We explored reusable type-safe abstractions.",
+                    )
+                ],
+            )
+        }
+    )
+    continuity_ledger = build_workspace_continuity_ledger(request)
+    assert len(continuity_ledger) > 1
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our previous session, we explored Generic Methods.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": [
+                        continuity_ledger[0].continuity_id,
+                        continuity_ledger[1].continuity_id,
+                    ],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_ledger,
+        continuity_reviewable_claim_ids={"C001"},
+        continuity_diagnostics={
+            "selected_by_claim": {"C001": [continuity_ledger[0].continuity_id]}
+        },
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.continuity_validation_failures == 1
+    assert review.issues[0].continuity_failure_reason == ("continuity_id_not_selected_for_claim")
+
+
+def test_workspace_continuity_support_is_rejected_for_ineligible_claim_id() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We explored reusable type-safe abstractions.",
+                    )
+                ],
+            )
+        }
+    )
+    continuity_ledger = build_workspace_continuity_ledger(request)
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our previous session, we explored Generic Methods.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": [continuity_ledger[0].continuity_id],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_ledger,
+        continuity_reviewable_claim_ids=set(),
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    assert "No selected Workspace continuity evidence" in review.claim_assessments[0].reason
+    assert review.continuity_validation_failures == 1
+    assert review.issues[0].continuity_failure_reason == "claim_not_continuity_reviewable"
+
+
+def test_unreviewable_future_continuity_claim_rejects_invented_id() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Advanced Delegates",
+                        content="We covered delegates and lambda expressions.",
+                    )
+                ],
+            )
+        }
+    )
+    continuity_ledger = build_workspace_continuity_ledger(request)
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="The next lecture will cover advanced delegates.",
+    )
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": ["W01-C999"],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        continuity_ledger,
+        continuity_reviewable_claim_ids=set(),
+    )
+
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.continuity_validation_failures == 1
+    assert review.claim_assessments[0].continuity_failure_reason == (
+        "claim_not_continuity_reviewable"
+    )
+    assert review.issues[0].revision_guidance
+
+
+def test_future_context_can_support_course_sequence_claim() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="context-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title="Lecture 5 - Advanced Delegates",
+                        content="The next lecture covers advanced delegates.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="The next lecture will cover advanced delegates.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.reviewable_claim_ids == ["C001"]
+    assert selection.diagnostics["selected_by_claim"]["C001"]
+
+
+def test_future_claim_requires_explicit_sequence_evidence() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="context-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title="Advanced Delegates",
+                        content="Advanced delegates and lambda expressions.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="The next lecture will cover advanced delegates.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.reviewable_claim_ids == []
+    assert selection.selected_spans == []
+
+
+def test_history_future_marker_does_not_apply_to_other_item_spans() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 4 - Generic Methods",
+                        content=(
+                            "In our next session, we will explore testing strategies. "
+                            "Generic methods support type-safe reusable algorithms."
+                        ),
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our next session, we will explore generic methods.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.selected_spans == []
+    assert selection.reviewable_claim_ids == []
+
+
+def test_future_claim_requires_coverage_for_each_specific_topic() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 4 - C#",
+                        content="In our next session, we will explore testing strategies.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text=(
+            "In our next session, we will explore system architecture, type modifiers, and "
+            "testing strategies."
+        ),
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.reviewable_claim_ids == []
+    assert selection.selected_spans == []
+    assert selection.diagnostics["rejected_incomplete_future_claims"] == [
+        {
+            "claim_id": "C001",
+            "missing_topic_terms": ["architecture", "modifier", "system"],
+        }
+    ]
+
+
+def test_multiple_future_spans_can_jointly_cover_all_claim_topics() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 4 - C#",
+                        content=(
+                            "In our next session, we will explore type modifiers. "
+                            "In our next session, we will also examine testing strategies."
+                        ),
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our next session, we will explore type modifiers and testing strategies.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.reviewable_claim_ids == ["C001"]
+    assert len(selection.diagnostics["selected_by_claim"]["C001"]) == 2
+
+
+def test_future_candidate_with_structural_overlap_but_wrong_topic_is_rejected() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 4 - Course Progress",
+                        content=(
+                            "In our next session, we will explore generic types or testing "
+                            "strategies."
+                        ),
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our next session, we will explore advanced delegates and lambdas.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.selected_spans == []
+    assert selection.reviewable_claim_ids == []
+    assert selection.diagnostics["rejected_structural_only_candidates"] > 0
+
+
+def test_mismatched_future_topic_cannot_be_reviewed_as_continuity() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 4",
+                        content=(
+                            "In our next session, we will explore generic types or testing "
+                            "strategies."
+                        ),
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="In our next session, we will explore advanced delegates and lambdas.",
+    )
+    selection = select_workspace_continuity_support(request, [claim])
+    all_spans = build_workspace_continuity_ledger(request)
+    response = GroundingReviewerResponse.model_validate(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "continuity_supported",
+                    "continuity_ids": [all_spans[-1].continuity_id],
+                }
+            ]
+        }
+    )
+
+    review = merge_grounding_review(
+        [claim],
+        [],
+        response,
+        [],
+        selection.selected_spans,
+        set(selection.reviewable_claim_ids),
+        selection.diagnostics,
+    )
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.selected_spans == []
+    assert selection.reviewable_claim_ids == []
+    assert review.decision is GroundingDecision.REVISION_REQUIRED
+    assert review.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    assert review.continuity_validation_failures == 1
+
+
+def test_meaningful_continuity_terms_exclude_structure_and_normalize_plural() -> None:
+    assert meaningful_continuity_terms(
+        "In our next session, we will explore advanced delegates and lambda expressions."
+    ) == {"delegate", "lambda", "expression"}
+    assert meaningful_continuity_terms(
+        "Today, we apply concepts from previous sessions to Sealed Classes."
+    ) == {"sealed"}
+    assert meaningful_continuity_terms(
+        "Let's combine concepts from Lecture 1 (Interfaces) and Lecture 4 (Sealed Classes)."
+    ) == {"interface", "sealed"}
+    assert meaningful_continuity_terms("Next session may cover testing strategies.") == {"testing"}
+    assert meaningful_continuity_terms("Larger system architectures and testing strategies.") == {
+        "architecture",
+        "system",
+        "testing",
+    }
+    assert meaningful_continuity_terms(
+        "Today, we build upon our understanding of class inheritance from previous sessions "
+        "to explore a specific architectural decision: Sealed Classes."
+    ) == {"inheritance", "sealed"}
+
+
+@pytest.mark.parametrize(
+    ("title", "content", "claim", "expected_overlap"),
+    [
+        (
+            "Lecture 5 - Delegates and Lambdas",
+            "Upcoming lecture: delegates, lambdas, and event handlers.",
+            "In our next session, we will explore advanced delegates and lambda expressions.",
+            {"delegate", "lambda"},
+        ),
+        (
+            "Lecture 3 - Generic Methods",
+            "We covered generic methods.",
+            "Lecture 3 covered Generic Methods.",
+            {"method"},
+        ),
+        (
+            "Lecture 2 - Structs and Classes",
+            "We previously worked with structs and classes.",
+            "This distinction aligns with our previous work on structs.",
+            {"struct"},
+        ),
+    ],
+)
+def test_matching_continuity_topics_are_selected_with_diagnostics(
+    title: str,
+    content: str,
+    claim: str,
+    expected_overlap: set[str],
+) -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="context-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title=title,
+                        content=content,
+                    )
+                ],
+            )
+        }
+    )
+    selection = select_workspace_continuity_support(
+        request,
+        [GroundingClaimInput(claim_id="C001", text=claim)],
+    )
+
+    assert selection.reviewable_claim_ids == ["C001"]
+    assert selection.selected_spans
+    details = selection.diagnostics["selected_candidate_details"]
+    assert isinstance(details, list)
+    assert any(expected_overlap.issubset(set(detail["topic_overlap_terms"])) for detail in details)
+    assert all(detail["selected"] is True for detail in details)
+
+
+def test_same_lecture_number_does_not_support_wrong_topic() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We covered generic methods.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(claim_id="C001", text="Lecture 3 covered delegates.")
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.selected_spans == []
+    assert selection.reviewable_claim_ids == []
+
+
+def test_generic_word_overlap_alone_does_not_establish_topic_match() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We covered generic methods.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(claim_id="C001", text="Lecture 3 covered generic types.")
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert selection.selected_spans == []
+    assert selection.reviewable_claim_ids == []
+
+
+def test_topic_empty_continuity_claim_stays_unreviewable() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We covered generic methods.",
+                    )
+                ],
+            )
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="This builds on our previous work.",
+    )
+
+    selection = select_workspace_continuity_support(request, [claim])
+
+    assert meaningful_continuity_terms(claim.text) == set()
+    assert selection.reviewable_claim_ids == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("In our previous session, we explored Generic Methods.", True),
+        ("Lecture 3 covered generic methods.", True),
+        ("Students have already worked with interfaces.", True),
+        ("The next topic in the course roadmap is LINQ.", True),
+        ("This lecture builds on the previous lesson about structs.", True),
+        ("This distinction aligns with our previous work on value types.", True),
+        ("Our previous work on structs provides the context for this example.", True),
+        ("We previously covered interfaces.", True),
+        ("This builds on earlier work on generic methods.", True),
+        ("As seen in Lecture 3, we used generic methods.", True),
+        ("From Lecture 2, students have already worked with structs.", True),
+        ("Generic methods provide reusable type-safe behavior.", False),
+        (
+            "Last lecture covered generic methods, which are essential to professional C#.",
+            False,
+        ),
+        ("In Lecture 2 we covered structs, which are always faster than classes.", False),
+        (
+            "Earlier lectures explored how interfaces define contracts that allow code "
+            "to depend on capabilities.",
+            False,
+        ),
+        ("Interfaces enable polymorphism.", False),
+        ("LINQ uses deferred execution.", False),
+        ("Exception handling is critical in C#.", False),
+    ],
+)
+def test_workspace_continuity_claim_gate(text: str, expected: bool) -> None:
+    assert is_workspace_continuity_claim(text) is expected
+
+
+def test_source_scope_normalization_drops_irrelevant_requested_topics() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content="We explored reusable type-safe abstractions.",
+                    )
+                ],
+            )
+        }
+    )
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["generic methods"],
+        unsupported_requested_topics=[
+            "a source-derived topic copied from retrieved notes",
+            "generic methods",
+        ],
+    )
+    assessment = normalize_source_scope(
+        request,
+        scope,
+    )
+    assert assessment is not None
+    assert assessment.unsupported_requested_topics == ["generic methods"]
+    assert assessment.supported_topics == ["generic methods"]
+
+
+def test_source_scope_normalization_removes_short_irrelevant_topics() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "instruction": "Create the next C# lecture on LINQ and async exception handling.",
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="C# Roadmap",
+                items=[
+                    WorkspaceContextItem(
+                        id="ctx-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title="Roadmap",
+                        content="Next topics: LINQ, async/await, exception handling.",
+                    )
+                ],
+            ),
+        }
+    )
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["linq"],
+        unsupported_requested_topics=[
+            "Kubernetes Storage Class",
+            "Server Thread-Pool behavior (Kestrel/IIS)",
+        ],
+    )
+
+    assessment = normalize_source_scope(request, scope)
+    assert assessment is not None
+    assert assessment.unsupported_requested_topics == []
+    _, diagnostics = normalize_source_scope_with_diagnostics(request, scope)
+    assert diagnostics["raw_unsupported_requested_topics"] == [
+        "Kubernetes Storage Class",
+        "Server Thread-Pool behavior (Kestrel/IIS)",
+    ]
+    assert diagnostics["normalized_unsupported_requested_topics"] == []
+    removed = diagnostics["removed_unsupported_topics"]
+    assert isinstance(removed, list)
+    assert len(removed) == 2
+
+
+def test_source_scope_normalization_preserves_long_legitimate_topics() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "instruction": (
+                "Create a lecture on asynchronous programming with cancellation "
+                "and exception propagation."
+            ),
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="C# Roadmap",
+                items=[
+                    WorkspaceContextItem(
+                        id="ctx-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title="Lecture 4 - Async",
+                        content=(
+                            "asynchronous programming with cancellation and exception propagation"
+                        ),
+                    )
+                ],
+            ),
+        }
+    )
+    topic = "asynchronous programming with cancellation and exception propagation"
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["asynchronous programming"],
+        unsupported_requested_topics=[topic],
+    )
+
+    assessment = normalize_source_scope(request, scope)
+    assert assessment is not None
+    assert assessment.unsupported_requested_topics == [topic]
+
+
+def test_source_scope_normalization_preserves_semantic_token_variant() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "instruction": "Create a lecture on async/await and task flow.",
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="C# Roadmap",
+                items=[
+                    WorkspaceContextItem(
+                        id="ctx-1",
+                        role=WorkspaceItemRole.CONTEXT,
+                        title="Async and Task patterns",
+                        content="async await Task asynchronous patterns",
+                    )
+                ],
+            ),
+        }
+    )
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["async await basics"],
+        unsupported_requested_topics=["Task-Based Asynchronous Pattern"],
+    )
+
+    assessment = normalize_source_scope(request, scope)
+    assert assessment is not None
+    assert assessment.unsupported_requested_topics == ["Task-Based Asynchronous Pattern"]
+
+
+def test_zero_continuity_claims_select_no_workspace_spans() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 1 - Structs",
+                        content="Large history body. " * 400,
+                    )
+                ],
+            )
+        }
+    )
+    unresolved_claims = [
+        GroundingClaimInput(
+            claim_id="C001",
+            text="Generic methods provide reusable type-safe behavior.",
+        )
+    ]
+
+    selection = select_workspace_continuity_support(request, unresolved_claims)
+
+    assert selection.eligible_claim_ids == []
+    assert selection.selected_spans == []
+    assert selection.diagnostics["selected_span_count"] == 0
+
+
+def test_zero_continuity_claims_do_not_inflate_grounding_prompt() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 1 - Massive History",
+                        content=("Extensive history content. " * 600),
+                    )
+                ],
+            )
+        }
+    )
+    unresolved_claims = [
+        GroundingClaimInput(
+            claim_id="C001",
+            text="IQueryable<T> uses expression trees.",
+        )
+    ]
+    prompt = build_grounding_review_prompt(request, unresolved_claims)
+
+    assert "Massive History" not in prompt.user_message
+    assert '"items": []' in prompt.user_message
+    assert '"spans": []' in prompt.user_message
+
+
+def test_continuity_selection_prioritizes_title_and_caps_per_claim() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 1 - Introduction",
+                        content="Overview and orientation.",
+                    ),
+                    WorkspaceContextItem(
+                        id="history-2",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 2 - Structs",
+                        content="Value types and memory layout.",
+                    ),
+                    WorkspaceContextItem(
+                        id="history-3",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content=(
+                            "Generic methods add type parameters to methods. "
+                            "They support reusable algorithms with static typing."
+                        ),
+                    ),
+                ],
+            )
+        }
+    )
+    unresolved_claims = [
+        GroundingClaimInput(
+            claim_id="C001",
+            text="In our previous session, we explored Generic Methods.",
+        )
+    ]
+
+    selection = select_workspace_continuity_support(request, unresolved_claims)
+
+    assert selection.eligible_claim_ids == ["C001"]
+    assert len(selection.selected_spans) <= MAX_CONTINUITY_SPANS_PER_CLAIM
+    assert selection.selected_spans[0].continuity_id == "W03-C001"
+    assert "Generic Methods" in selection.selected_spans[0].text
+
+
+def test_continuity_selection_deduplicates_and_caps_total_spans() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content=("Generic methods and type safety. " * 40),
+                    ),
+                    WorkspaceContextItem(
+                        id="history-2",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Course roadmap: LINQ and Async",
+                        content=("LINQ query patterns and async/await sequencing. " * 40),
+                    ),
+                ],
+            )
+        }
+    )
+    unresolved_claims = [
+        GroundingClaimInput(
+            claim_id="C001",
+            text="In our previous session, we explored Generic Methods.",
+        ),
+        GroundingClaimInput(
+            claim_id="C002",
+            text="The next topic in the course roadmap is LINQ.",
+        ),
+    ]
+
+    selection = select_workspace_continuity_support(request, unresolved_claims)
+    continuity_ids = [span.continuity_id for span in selection.selected_spans]
+
+    assert len(selection.selected_spans) <= MAX_CONTINUITY_SPANS_TOTAL
+    assert len(continuity_ids) == len(set(continuity_ids))
+
+
+def test_compact_continuity_prompt_payload_stays_bounded_for_large_history() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "workspace_context": WorkspaceContext(
+                workspace_id="workspace-1",
+                workspace_name="Workspace One",
+                items=[
+                    WorkspaceContextItem(
+                        id="history-1",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 1 - Introduction",
+                        content=("Foundations and terms. " * 350),
+                    ),
+                    WorkspaceContextItem(
+                        id="history-2",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 2 - Structs",
+                        content=("Structs, stack allocation, and value semantics. " * 350),
+                    ),
+                    WorkspaceContextItem(
+                        id="history-3",
+                        role=WorkspaceItemRole.HISTORY,
+                        title="Lecture 3 - Generic Methods",
+                        content=("Generic methods, constraints, and inference. " * 350),
+                    ),
+                ],
+            )
+        }
+    )
+    unresolved_claims = [
+        GroundingClaimInput(
+            claim_id="C001",
+            text="In our previous session, we explored Generic Methods.",
+        ),
+        GroundingClaimInput(
+            claim_id="C002",
+            text="The next topic in the course roadmap is LINQ.",
+        ),
+    ]
+
+    prompt = build_grounding_review_prompt(request, unresolved_claims)
+
+    assert len(prompt.user_message) < 20_000
+
+
 def test_reviewer_response_models_require_classification_specific_evidence_ids() -> None:
     valid_claims = [
         {
@@ -1687,18 +3124,23 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
         },
         {
             "claim_id": "C002",
+            "classification": "continuity_supported",
+            "continuity_ids": ["W01-C001"],
+        },
+        {
+            "claim_id": "C003",
             "classification": "unsupported",
             "evidence_ids": [],
             "reason": "No supplied evidence establishes the claim.",
         },
         {
-            "claim_id": "C003",
+            "claim_id": "C004",
             "classification": "pedagogical",
             "evidence_ids": [],
         },
     ]
     response = GroundingReviewerResponse.model_validate({"claims": valid_claims})
-    assert len(response.claim_assessments) == 3
+    assert len(response.claim_assessments) == 4
 
     invalid_claims = [
         {
@@ -1730,6 +3172,16 @@ def test_reviewer_response_models_require_classification_specific_evidence_ids()
         },
         {
             "claim_id": "C001",
+            "classification": "continuity_supported",
+            "evidence_ids": ["S01-E001"],
+        },
+        {
+            "claim_id": "C001",
+            "classification": "continuity_supported",
+            "continuity_ids": [],
+        },
+        {
+            "claim_id": "C001",
             "classification": "direct_supported",
             "evidence_ids": ["S01-E001"],
             "reason": "Directly supported.",
@@ -1758,13 +3210,18 @@ def test_reviewer_response_json_schema_requires_evidence_ids_by_classification()
     definitions = schema["$defs"]
     claim_items = schema["properties"]["claims"]["items"]
     assert claim_items["discriminator"]["propertyName"] == "classification"
-    assert len(claim_items["oneOf"]) == 3
+    assert len(claim_items["oneOf"]) == 4
 
     supported = definitions["SupportedReviewerClaim"]
     assert "evidence_ids" in supported["required"]
     assert supported["properties"]["evidence_ids"]["minItems"] == 1
     assert "reason" not in supported["properties"]
     assert "category" not in supported["properties"]
+    continuity = definitions["ContinuitySupportedReviewerClaim"]
+    assert "continuity_ids" in continuity["required"]
+    assert continuity["properties"]["continuity_ids"]["minItems"] == 1
+    assert "evidence_ids" not in continuity["properties"]
+    assert "reason" not in continuity["properties"]
     pedagogical = definitions["PedagogicalReviewerClaim"]
     assert "evidence_ids" in pedagogical["required"]
     assert pedagogical["properties"]["evidence_ids"]["minItems"] == 0
@@ -2149,7 +3606,7 @@ def test_grounding_review_revises_once_and_validates_revised_output(
     assert result.writer_result is not None and result.writer_result.raw_response == candidate
     assert result.revision_result is not None
     assert result.revision_result.raw_response == revised
-    assert result.revision_result.prompt_version == "grounding-revision-v2"
+    assert result.revision_result.prompt_version == "grounding-revision-v5"
     assert result.initial_grounding_review is not None
     assert result.initial_grounding_review.review is not None
     assert result.initial_grounding_review.review.decision is GroundingDecision.REVISION_REQUIRED
@@ -2579,8 +4036,8 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     saved_review_prompt = json.loads(
         (run_dir / "grounding_review_initial_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_review_prompt["prompt_version"] == "grounding-review-v7"
-    assert "Unresolved factual claims to adjudicate" in saved_review_prompt["user_message"]
+    assert saved_review_prompt["prompt_version"] == "grounding-review-v12"
+    assert "Unresolved claims to adjudicate" in saved_review_prompt["user_message"]
     assert saved_review_prompt["claims_extracted"] == 1
     assert saved_review_prompt["direct_supported_claim_count"] == 0
     assert saved_review_prompt["unresolved_claim_count"] == 1
@@ -2620,6 +4077,8 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert "- Stop reason: stop" in diagnostics
     assert "- Reviewer-supported claims: 1" in diagnostics
     assert "- Evidence validation failures / unknown evidence IDs: 0" in diagnostics
+    assert "- Continuity selected candidate details: []" in diagnostics
+    assert "- Continuity rejected structural-only candidates: 0" in diagnostics
     assert "- Coverage complete: yes" in diagnostics
 
 

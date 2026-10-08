@@ -12,10 +12,15 @@ from lecture_slm.generation.models import (
     GenerationStatus,
     StageRecord,
     StageTiming,
+    TaskTeachingPlan,
 )
 from lecture_slm.generation.plan_schemas import plan_schema_for_task, validate_plan_for_task
 from lecture_slm.generation.profiles import GenerationProfiles, StageProfile
-from lecture_slm.generation.prompts.planner import build_planner_prompt
+from lecture_slm.generation.prompts.base import PromptPackage
+from lecture_slm.generation.prompts.planner import (
+    build_planner_prompt,
+    build_planner_reassessment_prompt,
+)
 from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
@@ -95,6 +100,36 @@ class Planner:
 
     def plan(self, request: GenerationRequest, settings: StageProfile) -> StageRecord:
         prompt = build_planner_prompt(request, concise=not settings.think)
+        return self._execute_plan_prompt(
+            request,
+            settings,
+            prompt,
+            stage_name="Planner",
+        )
+
+    def reassess(
+        self,
+        request: GenerationRequest,
+        initial_plan: TaskTeachingPlan,
+        settings: StageProfile,
+    ) -> StageRecord:
+        reassessment_settings = settings.for_reassessment()
+        prompt = build_planner_reassessment_prompt(request, initial_plan)
+        return self._execute_plan_prompt(
+            request,
+            reassessment_settings,
+            prompt,
+            stage_name="Planner reassessment",
+        )
+
+    def _execute_plan_prompt(
+        self,
+        request: GenerationRequest,
+        settings: StageProfile,
+        prompt: PromptPackage,
+        *,
+        stage_name: str,
+    ) -> StageRecord:
         assembled = f"{prompt.system_message}\n\n{prompt.user_message}"
         structured_output_budget = settings.output_budget(request.task)
         thinking_reserve_tokens = settings.thinking_reserve_tokens if settings.think else 0
@@ -187,8 +222,10 @@ class Planner:
                         )
                     elif last_response.content.strip():
                         last_error = PlannerOutputTruncatedError(
-                            "Planner output was truncated after reaching its generation "
-                            "budget; the incomplete structured plan could not be validated. "
+                            f"{stage_name} output was truncated after reaching its "
+                            f"{generation_budget:,}-token generation budget; the incomplete "
+                            f"{'updated ' if stage_name == 'Planner reassessment' else ''}"
+                            "structured plan could not be validated. "
                             f"{budget_details} Validation error: {error}"
                         )
                 if attempt_timing is None:

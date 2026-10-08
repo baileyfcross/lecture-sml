@@ -47,6 +47,18 @@ class StageProfile(BaseModel):
 
         return self.output_budget(task) + (self.thinking_reserve_tokens if self.think else 0)
 
+    def for_reassessment(self) -> Self:
+        """Return deterministic, non-thinking settings for one plan reassessment."""
+
+        return self.model_copy(
+            update={
+                "think": False,
+                "temperature": 0,
+                "thinking_reserve_tokens": 0,
+                "retry_count": 0,
+            }
+        )
+
 
 class GenerationProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")

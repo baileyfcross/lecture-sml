@@ -1,12 +1,13 @@
 """Planner-only instructional reasoning prompt construction."""
 
-from lecture_slm.generation.models import GenerationRequest
+import json
+
+from lecture_slm.generation.models import GenerationRequest, TaskTeachingPlan
 from lecture_slm.generation.prompts.base import PromptPackage, request_blocks
 
 PLANNER_PROMPT_VERSION = "planner-v3"
 STANDARD_PLANNER_PROMPT_VERSION = "planner-standard-v4"
-EXPANDED_PLANNER_PROMPT_VERSION = "planner-expansion-v1"
-STANDARD_EXPANDED_PLANNER_PROMPT_VERSION = "planner-standard-expansion-v1"
+PLANNER_REASSESSMENT_PROMPT_VERSION = "planner-reassessment-v1"
 
 PLANNER_SYSTEM_PROMPT = (
     "You are the instructional planner for Lecture SLM. Reason about pedagogy, prerequisites, "
@@ -44,11 +45,7 @@ SOURCE_GROUNDING_INSTRUCTIONS = (
 )
 
 
-def build_planner_prompt(
-    request: GenerationRequest,
-    *,
-    concise: bool = False,
-) -> PromptPackage:
+def build_planner_prompt(request: GenerationRequest, *, concise: bool = False) -> PromptPackage:
     blocks = request_blocks(request)
     blocks.append(
         "## Planner task\nCreate the structured instructional plan required by the schema. "
@@ -57,32 +54,59 @@ def build_planner_prompt(
     system_message = STANDARD_PLANNER_SYSTEM_PROMPT if concise else PLANNER_SYSTEM_PROMPT
     if request.source_material:
         system_message = f"{system_message}\n\n{SOURCE_GROUNDING_INSTRUCTIONS}"
-    retrieval = request.metadata.get("knowledge_retrieval")
-    diagnostics = retrieval.get("diagnostics") if isinstance(retrieval, dict) else None
-    is_scope_reassessment = (
-        isinstance(diagnostics, dict) and diagnostics.get("scope_reassessment") is True
-    )
-    if is_scope_reassessment:
-        blocks.append(
-            "## Scope reassessment\nThis is the single source-scope reassessment after bounded "
-            "retrieval expansion. Keep every plan field compact: use short phrases, avoid "
-            "explanatory paragraphs, and use the minimum required number of list items. Leave "
-            "optional lists and notes empty where allowed. List all supported and unsupported "
-            "factual topics as short labels without examples or repeated wording. For an "
-            "explanation, use exactly one concise artifact_structure item, explanation_sequence "
-            "item, and check_for_understanding item; keep assumed_knowledge and misconceptions "
-            "empty and make example one short sentence."
-        )
     return PromptPackage(
-        version=(
-            STANDARD_EXPANDED_PLANNER_PROMPT_VERSION
-            if concise and is_scope_reassessment
-            else EXPANDED_PLANNER_PROMPT_VERSION
-            if is_scope_reassessment
-            else STANDARD_PLANNER_PROMPT_VERSION
-            if concise
-            else PLANNER_PROMPT_VERSION
-        ),
+        version=STANDARD_PLANNER_PROMPT_VERSION if concise else PLANNER_PROMPT_VERSION,
         system_message=system_message,
+        user_message="\n\n".join(blocks),
+    )
+
+
+PLANNER_REASSESSMENT_SYSTEM_PROMPT = (
+    "You are reassessing an already-valid instructional plan after one bounded retrieval "
+    "expansion. Do not re-plan from scratch. Preserve its pedagogy, sequence, structure, "
+    "examples, prerequisites, and constraints unless newly supplied factual sources require a "
+    "change. Reassess source coverage using the expanded sources, update factual portions only "
+    "as needed, and add a previously unsupported requested topic only when these authoritative "
+    "sources support it. Do not invent factual support. Ignore irrelevant retrieved topics. "
+    "Return the complete updated task-specific TeachingPlan JSON only. Do not explain your "
+    "reasoning."
+)
+
+
+def build_planner_reassessment_prompt(
+    request: GenerationRequest,
+    initial_plan: TaskTeachingPlan,
+) -> PromptPackage:
+    scope = initial_plan.source_scope
+    initial_status = "not available" if scope is None else scope.status.value
+    unsupported_topics = [] if scope is None else scope.unsupported_requested_topics
+    compact_plan = json.dumps(
+        initial_plan.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    blocks = request_blocks(request)
+    blocks.extend(
+        [
+            (f"## Existing validated teaching plan\n```json\n{compact_plan}\n```"),
+            (
+                "## Initial source-scope assessment\n"
+                f"- Status: {initial_status}\n"
+                f"- Previously unsupported requested topics: "
+                f"{json.dumps(unsupported_topics, ensure_ascii=False)}\n"
+                "Additional retrieval has now occurred. Reassess whether the expanded factual "
+                "sources change coverage."
+            ),
+            (
+                "## Reassessment task\nPreserve the existing plan and update only what the "
+                "expanded evidence justifies. Retrieved documents do not redefine the requested "
+                "scope. Return the complete updated TeachingPlan required by the task schema, "
+                "not a patch or source-scope object."
+            ),
+        ]
+    )
+    return PromptPackage(
+        version=PLANNER_REASSESSMENT_PROMPT_VERSION,
+        system_message=PLANNER_REASSESSMENT_SYSTEM_PROMPT,
         user_message="\n\n".join(blocks),
     )

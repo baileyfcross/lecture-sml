@@ -16,15 +16,17 @@ from lecture_slm.generation.models import (
     GroundingReviewRecord,
     StageRecord,
 )
+from lecture_slm.generation.prompts.base import PromptPackage
 from lecture_slm.generation.prompts.grounding import (
     build_grounding_review_prompt,
     build_grounding_revision_prompt,
     grounding_source_ref_map,
 )
 from lecture_slm.generation.prompts.planner import (
-    STANDARD_EXPANDED_PLANNER_PROMPT_VERSION,
+    PLANNER_REASSESSMENT_PROMPT_VERSION,
     STANDARD_PLANNER_PROMPT_VERSION,
     build_planner_prompt,
+    build_planner_reassessment_prompt,
 )
 from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import prepare_grounding_claims
@@ -46,6 +48,31 @@ def _write_json(path: Path, value: Any) -> None:
         json.dumps(serialized, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _planner_prompt_snapshot(
+    prompt: PromptPackage,
+    record: StageRecord,
+    *,
+    temperature: float | None,
+) -> dict[str, Any]:
+    timing = record.timing
+    return {
+        "prompt_version": prompt.version,
+        "temperature": temperature,
+        "system_message": prompt.system_message,
+        "user_message": prompt.user_message,
+        "selected_context": None if timing is None else timing.selected_context,
+        "estimated_input_tokens": (None if timing is None else timing.estimated_input_tokens),
+        "output_budget": None if timing is None else timing.output_budget,
+        "thinking_reserve_tokens": (None if timing is None else timing.thinking_reserve_tokens),
+        "generation_budget": None if timing is None else timing.generation_budget,
+        "thinking_enabled": None if timing is None else timing.thinking_enabled,
+        "duration_seconds": None if timing is None else timing.duration_seconds,
+        "generated_tokens": None if timing is None else timing.generated_tokens,
+        "stop_reason": None if timing is None else timing.stop_reason,
+        "output_limit_reached": None if timing is None else timing.output_limit_reached,
+    }
 
 
 def _source_markdown(request: GenerationRequest) -> str:
@@ -87,32 +114,25 @@ def _stage_diagnostic(name: str, record: StageRecord | None, *, used: bool) -> l
     lines = [f"## {name}", f"- Used: {'yes' if used else 'no'}"]
     timing = None if record is None else record.timing
     values: list[tuple[str, object | None]] = [
+        ("Prompt version", None if record is None else record.prompt_version),
+        ("Status", None if record is None else record.status.value),
         ("Context", None if timing is None else timing.selected_context),
         ("Estimated input tokens", None if timing is None else timing.estimated_input_tokens),
+        ("Thinking enabled", None if timing is None else timing.thinking_enabled),
+        ("Structured output budget", None if timing is None else timing.output_budget),
+        ("Thinking reserve", None if timing is None else timing.thinking_reserve_tokens),
+        ("Total generation budget", None if timing is None else timing.generation_budget),
+        ("Generated tokens", None if timing is None else timing.generated_tokens),
+        ("Thinking characters", None if timing is None else timing.thinking_characters),
     ]
-    if timing is not None and timing.thinking_enabled is True:
-        values.extend(
-            [
-                ("Structured output budget", timing.output_budget),
-                ("Thinking reserve", timing.thinking_reserve_tokens),
-                ("Total generation budget", timing.generation_budget),
-                ("Generated tokens", timing.generated_tokens),
-                ("Thinking characters", timing.thinking_characters),
-            ]
-        )
-    else:
-        values.extend(
-            [
-                ("Output budget", None if timing is None else timing.output_budget),
-                ("Generated tokens", None if timing is None else timing.generated_tokens),
-            ]
-        )
     values.extend(
         [
             ("Duration", None if timing is None else timing.duration_seconds),
             ("Tokens/sec", None if timing is None else timing.tokens_per_second),
             ("Stop reason", None if timing is None else timing.stop_reason),
             ("Output limit reached", None if timing is None else timing.output_limit_reached),
+            ("Error type", None if record is None else record.error_type),
+            ("Error", None if record is None else record.error_message),
         ]
     )
     lines.extend(f"- {label}: {value if value is not None else 'n/a'}" for label, value in values)
@@ -163,13 +183,59 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
             [
                 f"- Evidence ledger spans: {len(record.review.evidence_ledger)}",
                 f"- Reviewer-supported claims: {counts[GroundingClaimClassification.SUPPORTED]}",
+                (
+                    "- Continuity-supported claims: "
+                    f"{counts[GroundingClaimClassification.CONTINUITY_SUPPORTED]}"
+                ),
                 f"- Pedagogical claims: {counts[GroundingClaimClassification.PEDAGOGICAL]}",
                 f"- Unsupported claims: {counts[GroundingClaimClassification.UNSUPPORTED]}",
                 (f"- Evidence validation failures / unknown evidence IDs: {evidence_failures}"),
+                (
+                    "- Continuity validation failures / not-reviewable-or-invalid IDs: "
+                    f"{record.review.continuity_validation_failures}"
+                ),
                 f"- Coverage complete: {'yes' if record.review.coverage_complete else 'no'}",
                 f"- Decision: {record.review.decision.value}",
             ]
         )
+        continuity_selection = record.review.continuity_selection
+        if isinstance(continuity_selection, dict):
+            lines.extend(
+                [
+                    "- Continuity eligible claims: "
+                    f"{continuity_selection.get('eligible_claim_count', 'n/a')}",
+                    "- Continuity gate-eligible claim IDs: "
+                    + ", ".join(
+                        str(item)
+                        for item in continuity_selection.get("gate_eligible_claim_ids", [])
+                    ),
+                    "- Continuity reviewable claim IDs: "
+                    + ", ".join(
+                        str(item) for item in continuity_selection.get("reviewable_claim_ids", [])
+                    ),
+                    "- Continuity available items: "
+                    f"{continuity_selection.get('available_item_count', 'n/a')}",
+                    "- Continuity available spans: "
+                    f"{continuity_selection.get('available_span_count', 'n/a')}",
+                    "- Continuity selected spans: "
+                    f"{continuity_selection.get('selected_span_count', 'n/a')}",
+                    "- Continuity selected spans by claim: "
+                    + json.dumps(
+                        continuity_selection.get("selected_by_claim", {}),
+                        ensure_ascii=False,
+                    ),
+                    "- Continuity selected candidate details: "
+                    + json.dumps(
+                        continuity_selection.get("selected_candidate_details", []),
+                        ensure_ascii=False,
+                    ),
+                    "- Continuity rejected structural-only candidates: "
+                    f"{continuity_selection.get('rejected_structural_only_candidates', 0)}",
+                    "- Continuity cap per claim: "
+                    f"{continuity_selection.get('max_spans_per_claim', 'n/a')}",
+                    f"- Continuity cap total: {continuity_selection.get('max_total_spans', 'n/a')}",
+                ]
+            )
         lines.append(f"- Flagged claims: {len(record.review.issues)}")
         lines.extend(
             f"  - [{issue.category.value}] {issue.excerpt}: {issue.reason}"
@@ -310,6 +376,34 @@ def _write_diagnostics(
             source_scope_lines.append("  - none identified")
         if source_scope.scope_note:
             source_scope_lines.append(f"- Scope note: {source_scope.scope_note}")
+    if isinstance(retrieval_diagnostics, dict):
+        diagnostics = retrieval_diagnostics.get("diagnostics")
+        normalization = (
+            diagnostics.get("source_scope_normalization") if isinstance(diagnostics, dict) else None
+        )
+        if isinstance(normalization, dict):
+            raw = normalization.get("raw_unsupported_requested_topics", [])
+            normalized = normalization.get("normalized_unsupported_requested_topics", [])
+            removed = normalization.get("removed_unsupported_topics", [])
+            source_scope_lines.append("- Raw unsupported requested topics:")
+            if isinstance(raw, list) and raw:
+                source_scope_lines.extend(f"  - {topic}" for topic in raw)
+            else:
+                source_scope_lines.append("  - none identified")
+            source_scope_lines.append("- Normalized unsupported requested topics:")
+            if isinstance(normalized, list) and normalized:
+                source_scope_lines.extend(f"  - {topic}" for topic in normalized)
+            else:
+                source_scope_lines.append("  - none identified")
+            source_scope_lines.append("- Removed unsupported topics:")
+            if isinstance(removed, list) and removed:
+                source_scope_lines.extend(
+                    f"  - {entry.get('topic', 'n/a')}: {entry.get('reason', 'n/a')}"
+                    for entry in removed
+                    if isinstance(entry, dict)
+                )
+            else:
+                source_scope_lines.append("  - none identified")
     lines = [
         "# Generation Diagnostics",
         "",
@@ -334,6 +428,18 @@ def _write_diagnostics(
         ),
         "",
         *_stage_diagnostic("Planner", planner_record, used=planner_used),
+        "",
+        *_stage_diagnostic(
+            "Planner initial",
+            result.planner_initial_result,
+            used=result.planner_initial_result is not None,
+        ),
+        "",
+        *_stage_diagnostic(
+            "Planner reassessment",
+            result.planner_reassessment_result,
+            used=result.planner_reassessment_result is not None,
+        ),
         "",
         *source_scope_lines,
         "",
@@ -402,31 +508,108 @@ def save_generation_run(
             encoding="utf-8",
         )
     if planner_record is not None and planner_record.prompt_version is not None:
-        planner_prompt = build_planner_prompt(
-            request,
-            concise=planner_record.prompt_version
-            in {
-                STANDARD_PLANNER_PROMPT_VERSION,
-                STANDARD_EXPANDED_PLANNER_PROMPT_VERSION,
-            },
-        )
-        timing = planner_record.timing
+        initial_record = result.planner_initial_result
+        reassessment_record = result.planner_reassessment_result
+        initial_request = result.planner_initial_request or request
+        if initial_record is not None and initial_record.prompt_version is not None:
+            initial_prompt = build_planner_prompt(
+                initial_request,
+                concise=initial_record.prompt_version == STANDARD_PLANNER_PROMPT_VERSION,
+            )
+            if reassessment_record is not None:
+                configured_planner = result.profile_configuration.get("planner", {})
+                _write_json(
+                    directory / "planner_initial_prompt.json",
+                    _planner_prompt_snapshot(
+                        initial_prompt,
+                        initial_record,
+                        temperature=(
+                            configured_planner.get("temperature")
+                            if isinstance(configured_planner, dict)
+                            else None
+                        ),
+                    ),
+                )
+                if initial_record.plan is not None:
+                    (directory / "planner_initial_plan.json").write_text(
+                        initial_record.plan.model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+                if initial_record.raw_response is not None:
+                    (directory / "planner_initial_raw_response.txt").write_text(
+                        initial_record.raw_response,
+                        encoding="utf-8",
+                    )
+
+        if (
+            reassessment_record is not None
+            and initial_record is not None
+            and initial_record.plan is not None
+        ):
+            reassessment_prompt = build_planner_reassessment_prompt(
+                request,
+                initial_record.plan,
+            )
+            _write_json(
+                directory / "planner_reassessment_prompt.json",
+                _planner_prompt_snapshot(
+                    reassessment_prompt,
+                    reassessment_record,
+                    temperature=0,
+                ),
+            )
+            if reassessment_record.plan is not None:
+                (directory / "planner_reassessment_plan.json").write_text(
+                    reassessment_record.plan.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+            if reassessment_record.raw_response is not None:
+                (directory / "planner_reassessment_raw_response.txt").write_text(
+                    reassessment_record.raw_response,
+                    encoding="utf-8",
+                )
+            _write_json(
+                directory / "planner_reassessment_error.json",
+                {
+                    "status": reassessment_record.status.value,
+                    "prompt_version": reassessment_record.prompt_version,
+                    "error_type": reassessment_record.error_type,
+                    "error_message": reassessment_record.error_message,
+                    "timing": (
+                        None
+                        if reassessment_record.timing is None
+                        else reassessment_record.timing.model_dump(mode="json")
+                    ),
+                },
+            )
+
+            effective_prompt = reassessment_prompt
+            effective_record = reassessment_record
+        else:
+            effective_prompt = (
+                initial_prompt
+                if initial_record is not None
+                else build_planner_prompt(
+                    request,
+                    concise=planner_record.prompt_version == STANDARD_PLANNER_PROMPT_VERSION,
+                )
+            )
+            effective_record = planner_record
         _write_json(
             directory / "planner_prompt.json",
-            {
-                "prompt_version": planner_prompt.version,
-                "system_message": planner_prompt.system_message,
-                "user_message": planner_prompt.user_message,
-                "selected_context": None if timing is None else timing.selected_context,
-                "estimated_input_tokens": (
-                    None if timing is None else timing.estimated_input_tokens
+            _planner_prompt_snapshot(
+                effective_prompt,
+                effective_record,
+                temperature=(
+                    0
+                    if effective_prompt.version == PLANNER_REASSESSMENT_PROMPT_VERSION
+                    else (
+                        result.profile_configuration.get("planner", {}).get("temperature")
+                        if isinstance(result.profile_configuration.get("planner"), dict)
+                        else None
+                    )
                 ),
-                "output_budget": None if timing is None else timing.output_budget,
-                "thinking_reserve_tokens": (
-                    None if timing is None else timing.thinking_reserve_tokens
-                ),
-                "generation_budget": None if timing is None else timing.generation_budget,
-            },
+            ),
         )
 
     writer_record = result.writer_result
@@ -467,7 +650,7 @@ def save_generation_run(
         _, _, unresolved_claims = prepare_grounding_claims(request, initial_candidate)
         review_prompt = build_grounding_review_prompt(request, unresolved_claims)
         _write_json(directory / "grounding_review.json", initial_review)
-        timing = initial_review.timing
+        review_timing = initial_review.timing
         _write_json(
             directory / "grounding_review_initial_prompt.json",
             {
@@ -475,9 +658,11 @@ def save_generation_run(
                 "system_message": review_prompt.system_message,
                 "user_message": review_prompt.user_message,
                 "source_ref_map": grounding_source_ref_map(request),
-                "selected_context": None if timing is None else timing.selected_context,
+                "selected_context": (
+                    None if review_timing is None else review_timing.selected_context
+                ),
                 "estimated_input_tokens": (
-                    None if timing is None else timing.estimated_input_tokens
+                    None if review_timing is None else review_timing.estimated_input_tokens
                 ),
                 "output_budget": initial_review.review_output_budget,
                 "claims_extracted": initial_review.claims_extracted,
@@ -500,7 +685,7 @@ def save_generation_run(
                 (writer_record.raw_response if writer_record is not None else None) or "",
                 initial_review.review,
             )
-            timing = revision_record.timing
+            revision_timing = revision_record.timing
             _write_json(
                 directory / "grounding_revision_prompt.json",
                 {
@@ -508,11 +693,15 @@ def save_generation_run(
                     "system_message": revision_prompt.system_message,
                     "user_message": revision_prompt.user_message,
                     "source_ref_map": grounding_source_ref_map(request),
-                    "selected_context": None if timing is None else timing.selected_context,
-                    "estimated_input_tokens": (
-                        None if timing is None else timing.estimated_input_tokens
+                    "selected_context": (
+                        None if revision_timing is None else revision_timing.selected_context
                     ),
-                    "output_budget": None if timing is None else timing.output_budget,
+                    "estimated_input_tokens": (
+                        None if revision_timing is None else revision_timing.estimated_input_tokens
+                    ),
+                    "output_budget": (
+                        None if revision_timing is None else revision_timing.output_budget
+                    ),
                 },
             )
 
@@ -528,7 +717,7 @@ def save_generation_run(
         )
         _, _, unresolved_claims = prepare_grounding_claims(request, final_candidate or "")
         review_prompt = build_grounding_review_prompt(request, unresolved_claims)
-        timing = final_review.timing
+        final_timing = final_review.timing
         _write_json(
             directory / "grounding_review_final_prompt.json",
             {
@@ -536,9 +725,11 @@ def save_generation_run(
                 "system_message": review_prompt.system_message,
                 "user_message": review_prompt.user_message,
                 "source_ref_map": grounding_source_ref_map(request),
-                "selected_context": None if timing is None else timing.selected_context,
+                "selected_context": (
+                    None if final_timing is None else final_timing.selected_context
+                ),
                 "estimated_input_tokens": (
-                    None if timing is None else timing.estimated_input_tokens
+                    None if final_timing is None else final_timing.estimated_input_tokens
                 ),
                 "output_budget": final_review.review_output_budget,
                 "claims_extracted": final_review.claims_extracted,

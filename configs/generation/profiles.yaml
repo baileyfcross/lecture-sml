@@ -80,7 +80,7 @@ profiles:
       think: true
       thinking_reserve_tokens: 3072
       temperature: 0.5
-      context_tiers: [8192, 16384]
+      context_tiers: [8192, 16384, 32768]
       max_output_tokens: 3072
       task_output_tokens:
         explanation: 3072

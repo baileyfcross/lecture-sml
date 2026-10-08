@@ -88,6 +88,7 @@ class GroundingPhaseSummary(BaseModel):
     claims_extracted: int
     direct_supported: int
     reviewer_supported: int
+    continuity_supported: int
     pedagogical: int
     unsupported: int
     evidence_validation_failures: int
@@ -134,6 +135,16 @@ class GenerateResponse(BaseModel):
         initial = result.initial_grounding_review
         final = result.final_grounding_review
         planner_result = result.planner_result
+        planner_records = (
+            result.planner_initial_result,
+            result.planner_reassessment_result,
+        )
+        planner_durations = [
+            record.timing.duration_seconds
+            for record in planner_records
+            if record is not None and record.timing is not None
+        ]
+        planner_seconds = sum(planner_durations) if planner_durations else _duration(planner_result)
         return cls(
             request_id=result.request_id,
             status=result.status,
@@ -166,7 +177,7 @@ class GenerateResponse(BaseModel):
             ),
             timing=TimingSummary(
                 total_seconds=result.timing.duration_seconds,
-                planner_seconds=_duration(result.planner_result),
+                planner_seconds=planner_seconds,
                 writer_seconds=_duration(result.writer_result),
                 initial_review_seconds=_duration(initial),
                 revision_seconds=_duration(result.revision_result),
@@ -311,6 +322,7 @@ def _grounding_phase_summary(record: GroundingReviewRecord | None) -> GroundingP
         claims_extracted=len(assessments),
         direct_supported=counts[GroundingClaimClassification.DIRECT_SUPPORTED],
         reviewer_supported=counts[GroundingClaimClassification.SUPPORTED],
+        continuity_supported=counts[GroundingClaimClassification.CONTINUITY_SUPPORTED],
         pedagogical=counts[GroundingClaimClassification.PEDAGOGICAL],
         unsupported=counts[GroundingClaimClassification.UNSUPPORTED],
         evidence_validation_failures=record.review.evidence_validation_failures,

@@ -11,7 +11,7 @@ from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
 from lecture_slm.schemas.dataset import TaskType
 from lecture_slm.schemas.pedagogy import PedagogyProfile
-from lecture_slm.workspaces.models import WorkspaceContext
+from lecture_slm.workspaces.models import WorkspaceContext, WorkspaceItemRole
 
 
 class GenerationProfileName(StrEnum):
@@ -53,6 +53,17 @@ class EvidenceSpan(BaseModel):
     evidence_id: str = Field(pattern=r"^S\d{2}-E\d{3}$")
     source_id: str = Field(min_length=1)
     source_title: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    order: int = Field(ge=1)
+
+
+class WorkspaceContinuitySpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    continuity_id: str = Field(pattern=r"^W\d{2}-C\d{3}$")
+    workspace_item_id: str = Field(min_length=1)
+    workspace_item_title: str = Field(min_length=1)
+    role: WorkspaceItemRole
     text: str = Field(min_length=1)
     order: int = Field(ge=1)
 
@@ -307,6 +318,8 @@ class GroundingIssue(BaseModel):
     category: GroundingIssueCategory = Field(alias="kind")
     reason: str = Field(min_length=1, alias="why")
     relevant_source_ids: list[str] = Field(default_factory=list, alias="sources")
+    continuity_failure_reason: str | None = None
+    revision_guidance: str | None = None
 
 
 class GroundingClaimStatus(StrEnum):
@@ -317,6 +330,7 @@ class GroundingClaimStatus(StrEnum):
 class GroundingClaimClassification(StrEnum):
     DIRECT_SUPPORTED = "direct_supported"
     SUPPORTED = "supported"
+    CONTINUITY_SUPPORTED = "continuity_supported"
     PEDAGOGICAL = "pedagogical"
     UNSUPPORTED = "unsupported"
 
@@ -324,6 +338,7 @@ class GroundingClaimClassification(StrEnum):
 class GroundingSupportMethod(StrEnum):
     NORMALIZED_DIRECT_MATCH = "normalized_direct_match"
     REVIEWER_ENTAILMENT = "reviewer_entailment"
+    WORKSPACE_CONTINUITY = "workspace_continuity"
     PEDAGOGICAL = "pedagogical"
     UNSUPPORTED = "unsupported"
 
@@ -341,6 +356,14 @@ class SupportedReviewerClaim(BaseModel):
     claim_id: str = Field(pattern=r"^C\d{3,}$")
     classification: Literal[GroundingClaimClassification.SUPPORTED]
     evidence_ids: list[str] = Field(min_length=1)
+
+
+class ContinuitySupportedReviewerClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    claim_id: str = Field(pattern=r"^C\d{3,}$")
+    classification: Literal[GroundingClaimClassification.CONTINUITY_SUPPORTED]
+    continuity_ids: list[str] = Field(min_length=1)
 
 
 class PedagogicalReviewerClaim(BaseModel):
@@ -362,7 +385,10 @@ class UnsupportedReviewerClaim(BaseModel):
 
 
 ReviewerClaimAssessment = Annotated[
-    SupportedReviewerClaim | PedagogicalReviewerClaim | UnsupportedReviewerClaim,
+    SupportedReviewerClaim
+    | ContinuitySupportedReviewerClaim
+    | PedagogicalReviewerClaim
+    | UnsupportedReviewerClaim,
     Field(discriminator="classification"),
 ]
 
@@ -381,8 +407,11 @@ class GroundingClaimAssessment(BaseModel):
     classification: GroundingClaimClassification
     support_method: GroundingSupportMethod
     evidence_ids: list[str] = Field(default_factory=list)
+    continuity_ids: list[str] = Field(default_factory=list)
     reason: str = Field(min_length=1)
     category: GroundingIssueCategory | None = None
+    continuity_failure_reason: str | None = None
+    revision_guidance: str | None = None
 
     @model_validator(mode="after")
     def validate_provenance(self) -> Self:
@@ -391,6 +420,9 @@ class GroundingClaimAssessment(BaseModel):
                 GroundingSupportMethod.NORMALIZED_DIRECT_MATCH
             ),
             GroundingClaimClassification.SUPPORTED: GroundingSupportMethod.REVIEWER_ENTAILMENT,
+            GroundingClaimClassification.CONTINUITY_SUPPORTED: (
+                GroundingSupportMethod.WORKSPACE_CONTINUITY
+            ),
             GroundingClaimClassification.PEDAGOGICAL: GroundingSupportMethod.PEDAGOGICAL,
             GroundingClaimClassification.UNSUPPORTED: GroundingSupportMethod.UNSUPPORTED,
         }[self.classification]
@@ -405,6 +437,25 @@ class GroundingClaimAssessment(BaseModel):
             and not self.evidence_ids
         ):
             raise ValueError("supported claims must retain evidence IDs")
+        if self.classification is GroundingClaimClassification.CONTINUITY_SUPPORTED:
+            if not self.continuity_ids:
+                raise ValueError("continuity-supported claims must retain continuity IDs")
+            if self.evidence_ids:
+                raise ValueError("continuity-supported claims must not retain evidence IDs")
+        if (
+            self.classification
+            in {
+                GroundingClaimClassification.DIRECT_SUPPORTED,
+                GroundingClaimClassification.SUPPORTED,
+            }
+            and self.continuity_ids
+        ):
+            raise ValueError("factual claims must not retain continuity IDs")
+        if self.classification in {
+            GroundingClaimClassification.PEDAGOGICAL,
+            GroundingClaimClassification.UNSUPPORTED,
+        } and (self.evidence_ids or self.continuity_ids):
+            raise ValueError("non-supported claims must not retain provenance IDs")
         return self
 
     @property
@@ -430,6 +481,8 @@ class GroundingReview(BaseModel):
     revision_instructions: list[str] = Field(default_factory=list, alias="fixes")
     source_consistency_notes: list[str] = Field(default_factory=list, alias="notes")
     evidence_validation_failures: int = Field(default=0, ge=0)
+    continuity_validation_failures: int = Field(default=0, ge=0)
+    continuity_selection: dict[str, Any] = Field(default_factory=dict)
     coverage_complete: bool = True
 
     @model_validator(mode="after")
@@ -489,6 +542,9 @@ class GenerationResult(BaseModel):
     model: str
     status: GenerationStatus
     planner_result: StageRecord | None = None
+    planner_initial_result: StageRecord | None = None
+    planner_reassessment_result: StageRecord | None = None
+    planner_initial_request: GenerationRequest | None = Field(default=None, exclude=True)
     writer_result: StageRecord | None = None
     initial_grounding_review: GroundingReviewRecord | None = None
     revision_result: StageRecord | None = None

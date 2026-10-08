@@ -3,7 +3,7 @@
 from lecture_slm.generation.models import GenerationRequest, TeachingPlanBase
 from lecture_slm.generation.prompts.base import PromptPackage, json_block, request_blocks
 
-WRITER_PROMPT_VERSION = "writer-v8"
+WRITER_PROMPT_VERSION = "writer-v11"
 
 WRITER_SYSTEM_PROMPT = (
     "You are the artifact writer for Lecture SLM. Follow the user's authoritative request and "
@@ -79,9 +79,41 @@ def build_writer_prompt(
     return PromptPackage(
         version=WRITER_PROMPT_VERSION,
         system_message=(
-            f"{WRITER_SYSTEM_PROMPT}\n\n{SOURCE_GROUNDING_INSTRUCTIONS}"
-            if request.source_material
-            else WRITER_SYSTEM_PROMPT
+            "\n\n".join(
+                [
+                    WRITER_SYSTEM_PROMPT,
+                    *([SOURCE_GROUNDING_INSTRUCTIONS] if request.source_material else []),
+                    *(
+                        [
+                            "When Workspace Context or History states a specific future "
+                            "lecture/session/lab/assignment topic, you may repeat or closely "
+                            "paraphrase only that same topic. The existence of any future-course "
+                            "statement does not authorize a different topic: do not infer, invent, "
+                            "broaden, substitute, chain, or predict future course topics. Use a "
+                            "current Workspace Context roadmap as the primary authority. Use a "
+                            "History future statement only when no conflicting or newer Context "
+                            "roadmap exists, and only for the topic it explicitly states. Do not "
+                            "append related but unstated applications, examples, subtopics, or "
+                            "additional topics to a future-course sentence. Do not infer later "
+                            "topics from it. For example, if History says "
+                            "'Next lecture may "
+                            "cover generic classes or testing,' 'Next lecture may continue with "
+                            "generic classes or testing' is allowed, but 'Next lecture will cover "
+                            "delegates and lambdas' or 'Next lecture will cover testing strategies "
+                            "and async programming' is not. A History item supports a future "
+                            "claim only when the specific supporting statement itself establishes "
+                            "that sequence and topic; an unrelated future marker elsewhere in the "
+                            "item does not carry over. A specific future topic may be stated from "
+                            "Context only when that item explicitly establishes it; a past History "
+                            "item without an explicit future topic does not establish one. "
+                            "Generic pedagogical transitions such as 'Later we will build on this "
+                            "idea' remain allowed when they do not assert a specific future topic."
+                        ]
+                        if request.workspace_context is not None and request.workspace_context.items
+                        else []
+                    ),
+                ]
+            )
         ),
         user_message="\n\n".join(blocks),
     )

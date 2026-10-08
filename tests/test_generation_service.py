@@ -442,6 +442,7 @@ def test_partial_retrieval_expands_once_and_deduplicates_chunk_matches(
     request = GenerationRequest(
         task=TaskType.EXPLANATION,
         instruction="Can you explain quantum computing?",
+        previous_topics=["algorithms", "error correction"],
     )
     execution = service.generate(request, retrieval=options)
 

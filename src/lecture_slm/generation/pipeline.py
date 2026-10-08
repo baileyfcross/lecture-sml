@@ -21,10 +21,14 @@ from lecture_slm.generation.models import (
     SourceScopeStatus,
     StageRecord,
     StageTiming,
+    TaskTeachingPlan,
 )
 from lecture_slm.generation.planner import Planner
 from lecture_slm.generation.profiles import GenerationProfile, GenerationProfiles
-from lecture_slm.generation.prompts.planner import build_planner_prompt
+from lecture_slm.generation.prompts.planner import (
+    build_planner_prompt,
+    build_planner_reassessment_prompt,
+)
 from lecture_slm.generation.prompts.writer import (
     WRITER_PROMPT_VERSION,
     build_writer_prompt,
@@ -32,6 +36,9 @@ from lecture_slm.generation.prompts.writer import (
 from lecture_slm.generation.reviewer import (
     GenerationReviewer,
     GroundingStageRunner,
+)
+from lecture_slm.generation.source_scope import (
+    normalize_source_scope_with_diagnostics,
 )
 from lecture_slm.generation.writer import Writer
 from lecture_slm.inference.ollama_client import OllamaClient, OllamaError
@@ -81,6 +88,9 @@ class GenerationPipeline:
         initial_grounding_review: GroundingReviewRecord | None = None
         revision_record: StageRecord | None = None
         final_grounding_review: GroundingReviewRecord | None = None
+        planner_initial_record: StageRecord | None = None
+        planner_reassessment_record: StageRecord | None = None
+        planner_initial_request = request
         plan = None
         selected_contexts: dict[str, int] = {}
         estimated_inputs: dict[str, int] = {}
@@ -113,6 +123,9 @@ class GenerationPipeline:
                 reviewer_feedback=None,
                 reviewer_error=None,
                 final_output=None,
+                planner_initial_record=planner_initial_record,
+                planner_reassessment_record=planner_reassessment_record,
+                planner_initial_request=planner_initial_request,
             )
 
         def run_planner(target_request: GenerationRequest) -> StageRecord:
@@ -125,8 +138,8 @@ class GenerationPipeline:
                     safety_margin=self.profiles.context_safety_margin,
                     output_reserve_tokens=profile.planner.generation_budget(target_request.task),
                 )
-                selected_contexts["planner"] = planner_selection.selected_context
-                estimated_inputs["planner"] = planner_selection.estimated_input_tokens
+                selected_contexts["planner_initial"] = planner_selection.selected_context
+                estimated_inputs["planner_initial"] = planner_selection.estimated_input_tokens
             except ValueError as error:
                 return StageRecord(
                     status=GenerationStatus.FAILED,
@@ -157,14 +170,111 @@ class GenerationPipeline:
             record = planner.plan(target_request, profile.planner)
             selected = None if record.timing is None else record.timing.selected_context
             if selected is not None:
-                selected_contexts["planner"] = selected
+                selected_contexts["planner_initial"] = selected
             if record.timing and record.timing.estimated_input_tokens is not None:
-                estimated_inputs["planner"] = record.timing.estimated_input_tokens
+                estimated_inputs["planner_initial"] = record.timing.estimated_input_tokens
+            self._record_stage_selection(
+                "planner",
+                record.timing,
+                selected_contexts,
+                estimated_inputs,
+            )
             self._emit_stage_complete(progress, GenerationStage.PLANNING, record)
             return record
 
+        def run_planner_reassessment(
+            target_request: GenerationRequest,
+            initial_plan: TaskTeachingPlan,
+        ) -> StageRecord:
+            settings = profile.planner.for_reassessment()
+            prompt = build_planner_reassessment_prompt(target_request, initial_plan)
+            planner_input = f"{prompt.system_message}\n\n{prompt.user_message}"
+            try:
+                selection = select_context_tier(
+                    planner_input,
+                    settings.context_tiers,
+                    safety_margin=self.profiles.context_safety_margin,
+                    output_reserve_tokens=settings.generation_budget(target_request.task),
+                )
+                selected_contexts["planner_reassessment"] = selection.selected_context
+                estimated_inputs["planner_reassessment"] = selection.estimated_input_tokens
+            except ValueError as error:
+                return StageRecord(
+                    status=GenerationStatus.FAILED,
+                    error_type=type(error).__name__,
+                    error_message=str(error),
+                    prompt_version=prompt.version,
+                )
+
+            budget = settings.generation_budget(target_request.task)
+            self._emit_stage_start(
+                progress,
+                GenerationStage.PLANNING,
+                "Reassessing the teaching plan after retrieval expansion",
+                budget,
+            )
+            planner = Planner(
+                client=self.client_factory(
+                    self.model_config.inference.host,
+                    settings.timeout_seconds,
+                ),
+                model=self.model_config.ollama_name,
+                model_config=self.model_config,
+                profiles=self.profiles,
+            )
+            record = planner.reassess(target_request, initial_plan, profile.planner)
+            self._record_stage_selection(
+                "planner_reassessment",
+                record.timing,
+                selected_contexts,
+                estimated_inputs,
+            )
+            self._record_stage_selection(
+                "planner",
+                record.timing,
+                selected_contexts,
+                estimated_inputs,
+            )
+            self._emit_stage_complete(progress, GenerationStage.PLANNING, record)
+            return record
+
+        def stage_diagnostics(record: StageRecord | None) -> dict[str, object] | None:
+            if record is None:
+                return None
+            return {
+                "status": record.status.value,
+                "prompt_version": record.prompt_version,
+                "timing": None if record.timing is None else record.timing.model_dump(mode="json"),
+                "error_type": record.error_type,
+                "error_message": record.error_message,
+            }
+
         if profile.planner.enabled:
             planner_record = run_planner(request)
+            planner_initial_record = planner_record
+            scope_normalization: dict[str, object] | None = None
+            if planner_record.plan is not None and planner_record.plan.source_scope is not None:
+                normalized_scope, scope_normalization = normalize_source_scope_with_diagnostics(
+                    request,
+                    planner_record.plan.source_scope,
+                )
+                planner_record = planner_record.model_copy(
+                    update={
+                        "plan": planner_record.plan.model_copy(
+                            update={"source_scope": normalized_scope}
+                        )
+                    }
+                )
+            planner_initial_record = planner_record
+            if scope_normalization is not None and isinstance(
+                request.metadata.get("knowledge_retrieval"),
+                dict,
+            ):
+                retrieval_diagnostics = request.metadata["knowledge_retrieval"]
+                diagnostics = retrieval_diagnostics.setdefault("diagnostics", {})
+                if isinstance(diagnostics, dict):
+                    diagnostics["source_scope_normalization"] = scope_normalization
+                    diagnostics["planner_initial_source_scope_normalization"] = scope_normalization
             plan = planner_record.plan
 
             if planner_record.status is GenerationStatus.FAILED or plan is None:
@@ -185,6 +295,8 @@ class GenerationPipeline:
                     reviewer_feedback=None,
                     reviewer_error=None,
                     final_output=None,
+                    planner_initial_record=planner_initial_record,
+                    planner_initial_request=planner_initial_request,
                 )
 
             initial_scope = plan.source_scope
@@ -200,7 +312,37 @@ class GenerationPipeline:
                 expanded_request = expand_retrieval(request, initial_scope)
                 if expanded_request is not None:
                     request = expanded_request
-                    planner_record = run_planner(request)
+                    planner_reassessment_record = run_planner_reassessment(request, plan)
+                    planner_record = planner_reassessment_record
+                    scope_normalization = None
+                    if (
+                        planner_record.plan is not None
+                        and planner_record.plan.source_scope is not None
+                    ):
+                        normalized_scope, scope_normalization = (
+                            normalize_source_scope_with_diagnostics(
+                                request,
+                                planner_record.plan.source_scope,
+                            )
+                        )
+                        planner_record = planner_record.model_copy(
+                            update={
+                                "plan": planner_record.plan.model_copy(
+                                    update={"source_scope": normalized_scope}
+                                )
+                            }
+                        )
+                    if scope_normalization is not None and isinstance(
+                        request.metadata.get("knowledge_retrieval"),
+                        dict,
+                    ):
+                        retrieval_diagnostics = request.metadata["knowledge_retrieval"]
+                        diagnostics = retrieval_diagnostics.setdefault("diagnostics", {})
+                        if isinstance(diagnostics, dict):
+                            diagnostics["source_scope_normalization"] = scope_normalization
+                            diagnostics["planner_reassessment_source_scope_normalization"] = (
+                                scope_normalization
+                            )
                     plan = planner_record.plan
                     retrieval_diagnostics = request.metadata.get("knowledge_retrieval")
                 if isinstance(retrieval_diagnostics, dict):
@@ -224,6 +366,16 @@ class GenerationPipeline:
                                 else planner_record.timing.duration_seconds
                             )
                         )
+                        round_diagnostics["planner_stages"] = {
+                            "planner_initial": stage_diagnostics(planner_initial_record),
+                            "planner_reassessment": stage_diagnostics(planner_reassessment_record),
+                        }
+                        round_diagnostics["planner_initial_seconds"] = initial_planner_seconds
+                        round_diagnostics["planner_reassessment_seconds"] = (
+                            0.0
+                            if planner_record.timing is None
+                            else planner_record.timing.duration_seconds
+                        )
 
                 if expanded_request is not None and (
                     planner_record.status is GenerationStatus.FAILED or plan is None
@@ -246,6 +398,9 @@ class GenerationPipeline:
                         reviewer_feedback=None,
                         reviewer_error=None,
                         final_output=None,
+                        planner_initial_record=planner_initial_record,
+                        planner_reassessment_record=planner_reassessment_record,
+                        planner_initial_request=planner_initial_request,
                     )
             elif (
                 expand_retrieval is not None
@@ -267,6 +422,14 @@ class GenerationPipeline:
                     round_diagnostics["final_planning_seconds"] = round_diagnostics[
                         "initial_planning_seconds"
                     ]
+                    round_diagnostics["planner_stages"] = {
+                        "planner_initial": stage_diagnostics(planner_initial_record),
+                        "planner_reassessment": None,
+                    }
+                    round_diagnostics["planner_initial_seconds"] = round_diagnostics[
+                        "initial_planning_seconds"
+                    ]
+                    round_diagnostics["planner_reassessment_seconds"] = None
 
         if (
             request.source_material
@@ -293,6 +456,9 @@ class GenerationPipeline:
                 reviewer_feedback=None,
                 reviewer_error=None,
                 final_output=None,
+                planner_initial_record=planner_initial_record,
+                planner_reassessment_record=planner_reassessment_record,
+                planner_initial_request=planner_initial_request,
             )
 
         writer_prompt = build_writer_prompt(request, plan)
@@ -541,6 +707,9 @@ class GenerationPipeline:
             initial_grounding_review=initial_grounding_review,
             revision_record=revision_record,
             final_grounding_review=final_grounding_review,
+            planner_initial_record=planner_initial_record,
+            planner_reassessment_record=planner_reassessment_record,
+            planner_initial_request=planner_initial_request,
         )
 
     def _progress_emitter(
@@ -660,16 +829,33 @@ class GenerationPipeline:
         initial_grounding_review: GroundingReviewRecord | None = None,
         revision_record: StageRecord | None = None,
         final_grounding_review: GroundingReviewRecord | None = None,
+        planner_initial_record: StageRecord | None = None,
+        planner_reassessment_record: StageRecord | None = None,
+        planner_initial_request: GenerationRequest | None = None,
     ) -> GenerationResult:
-        planner_seconds = (
-            0.0
-            if planner_record is None or planner_record.timing is None
-            else planner_record.timing.duration_seconds
-        )
         writer_seconds = (
             0.0
             if writer_record is None or writer_record.timing is None
             else writer_record.timing.duration_seconds
+        )
+        planner_initial_seconds = (
+            0.0
+            if planner_initial_record is None or planner_initial_record.timing is None
+            else planner_initial_record.timing.duration_seconds
+        )
+        planner_reassessment_seconds = (
+            0.0
+            if planner_reassessment_record is None or planner_reassessment_record.timing is None
+            else planner_reassessment_record.timing.duration_seconds
+        )
+        planner_seconds = (
+            planner_initial_seconds + planner_reassessment_seconds
+            if planner_initial_record is not None
+            else (
+                0.0
+                if planner_record is None or planner_record.timing is None
+                else planner_record.timing.duration_seconds
+            )
         )
         model_defaults = self.model_config.model_dump(mode="json")
         model_defaults["inference"]["host"] = "[redacted]"
@@ -680,6 +866,9 @@ class GenerationPipeline:
             model=self.model_config.ollama_name,
             status=status,
             planner_result=planner_record,
+            planner_initial_result=planner_initial_record,
+            planner_reassessment_result=planner_reassessment_record,
+            planner_initial_request=planner_initial_request,
             writer_result=writer_record,
             initial_grounding_review=initial_grounding_review,
             revision_result=revision_record,
@@ -699,6 +888,34 @@ class GenerationPipeline:
                 "planner_prompt_version": (
                     None if planner_record is None else planner_record.prompt_version
                 ),
+                "planner_initial_prompt_version": (
+                    None
+                    if planner_initial_record is None
+                    else planner_initial_record.prompt_version
+                ),
+                "planner_reassessment_prompt_version": (
+                    None
+                    if planner_reassessment_record is None
+                    else planner_reassessment_record.prompt_version
+                ),
+                "planner_stages": {
+                    "planner_initial": (
+                        None
+                        if planner_initial_record is None
+                        else planner_initial_record.model_dump(
+                            mode="json",
+                            exclude={"plan", "raw_response"},
+                        )
+                    ),
+                    "planner_reassessment": (
+                        None
+                        if planner_reassessment_record is None
+                        else planner_reassessment_record.model_dump(
+                            mode="json",
+                            exclude={"plan", "raw_response"},
+                        )
+                    ),
+                },
                 "writer_prompt_version": WRITER_PROMPT_VERSION,
                 "grounding_review_enabled": (
                     bool(request.source_material) and request.profile.value in {"standard", "deep"}
@@ -717,6 +934,8 @@ class GenerationPipeline:
                     else final_grounding_review.prompt_version
                 ),
                 "planner_duration_seconds": planner_seconds,
+                "planner_initial_duration_seconds": planner_initial_seconds,
+                "planner_reassessment_duration_seconds": planner_reassessment_seconds,
                 "writer_duration_seconds": writer_seconds,
                 "profile_sha256": hashlib.sha256(
                     self.profiles.model_dump_json().encode("utf-8")

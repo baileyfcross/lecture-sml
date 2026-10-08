@@ -18,6 +18,7 @@ from lecture_slm.generation.persistence import create_generation_run_directory, 
 from lecture_slm.generation.pipeline import RetrievalExpansionCallback
 from lecture_slm.generation.profiles import GenerationProfiles
 from lecture_slm.generation.router import GenerationRouter
+from lecture_slm.generation.source_scope import normalize_source_scope
 from lecture_slm.knowledge.assembler import KnowledgeContextAssembler
 from lecture_slm.knowledge.chunking import CHUNKING_VERSION
 from lecture_slm.knowledge.config import KnowledgeConfig, load_knowledge_config
@@ -332,9 +333,12 @@ class GenerationService:
                     source_scope: SourceScopeAssessment,
                 ) -> GenerationRequest | None:
                     nonlocal expanded_request, retrieval_result
+                    normalized_scope = normalize_source_scope(sourced_request, source_scope)
                     plan = build_retrieval_expansion_plan(
                         retrieval_query.canonical,
-                        source_scope.unsupported_requested_topics,
+                        []
+                        if normalized_scope is None
+                        else normalized_scope.unsupported_requested_topics,
                     )
                     initial_diagnostics = dict(initial_retrieval_result.diagnostics)
                     initial_diagnostics["expansion_plan"] = plan.model_dump(mode="json")
