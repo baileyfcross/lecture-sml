@@ -9,19 +9,27 @@ from pathlib import Path
 from threading import Lock
 from typing import NoReturn
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from lecture_slm.api.models import (
     GenerateRequest,
     GenerateResponse,
+    GenerationHistoryDetail,
+    GenerationHistoryWorkspaceSave,
     HealthResponse,
     ProfileSummary,
     StageProgress,
     WorkspaceFolderUpdate,
     WorkspaceHistorySave,
     WorkspaceItemUpdate,
+)
+from lecture_slm.generation.history import (
+    ArchiveNotFoundError,
+    GenerationHistoryStore,
+    GenerationHistorySummary,
+    InvalidArchiveError,
 )
 from lecture_slm.generation.models import ProgressEvent
 from lecture_slm.generation.service import GenerationService
@@ -79,8 +87,10 @@ def create_app(
         version="0.1.0",
     )
     registry = RunRegistry(max_retained_runs)
+    history = GenerationHistoryStore(service.artifact_root)
     app.state.generation_service = service
     app.state.run_registry = registry
+    app.state.generation_history = history
     static_root = frontend_dist or Path(__file__).parents[3] / "web" / "dist"
     index_file = static_root / "index.html"
     assets_dir = static_root / "assets"
@@ -173,6 +183,93 @@ def create_app(
                 workspace_id,
                 **payload.model_dump(exclude_unset=True),
                 description_is_set="description" in payload.model_fields_set,
+            )
+        except (WorkspaceNotFoundError, WorkspaceConflictError) as error:
+            raise_workspace_http_error(error)
+
+    @app.get("/api/history", response_model=list[GenerationHistorySummary])
+    async def list_generation_history(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[GenerationHistorySummary]:
+        try:
+            return await asyncio.to_thread(history.list_archives, limit)
+        except OSError as error:
+            logger.exception("Could not read generation History")
+            raise HTTPException(
+                status_code=503,
+                detail="Generation History is temporarily unavailable",
+            ) from error
+
+    @app.get("/api/history/{archive_id}", response_model=GenerationHistoryDetail)
+    async def get_generation_history(archive_id: str) -> GenerationHistoryDetail:
+        try:
+            archive = await asyncio.to_thread(history.load_archive, archive_id)
+        except ArchiveNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Generation archive not found") from error
+        except InvalidArchiveError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="The generation archive is incomplete or malformed",
+            ) from error
+        result = GenerateResponse.from_archive(
+            archive.result,
+            retrieved_count=archive.retrieved_count,
+            assembled_count=archive.assembled_count,
+            saved_run=str(history.artifact_root / archive.summary.archive_id),
+        )
+        return GenerationHistoryDetail(
+            **result.model_dump(),
+            archive_id=archive.summary.archive_id,
+            instruction=archive.summary.instruction,
+            created_at=archive.summary.created_at,
+        )
+
+    @app.delete("/api/history/{archive_id}", status_code=204)
+    async def delete_generation_history(archive_id: str) -> Response:
+        try:
+            await asyncio.to_thread(history.delete_archive, archive_id)
+        except ArchiveNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Generation archive not found") from error
+        except OSError as error:
+            logger.exception("Could not delete generation archive %s", archive_id)
+            raise HTTPException(
+                status_code=503,
+                detail="The generation archive could not be deleted",
+            ) from error
+        return Response(status_code=204)
+
+    @app.post(
+        "/api/history/{archive_id}/workspace",
+        response_model=WorkspaceItem,
+        status_code=201,
+    )
+    async def save_generation_history_to_workspace(
+        archive_id: str,
+        payload: GenerationHistoryWorkspaceSave,
+    ) -> WorkspaceItem:
+        try:
+            request_id, output = await asyncio.to_thread(
+                history.load_approved_output,
+                archive_id,
+            )
+        except ArchiveNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Generation archive not found") from error
+        except InvalidArchiveError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Only completed archives with approved output can be saved to Workspace",
+            ) from error
+        try:
+            return await asyncio.to_thread(
+                workspace_store().create_item,
+                payload.workspace_id,
+                WorkspaceItemInput(
+                    title=payload.title,
+                    folder_id=payload.folder_id,
+                    role=WorkspaceItemRole.HISTORY,
+                    content=output,
+                    source_request_id=request_id,
+                ),
             )
         except (WorkspaceNotFoundError, WorkspaceConflictError) as error:
             raise_workspace_http_error(error)

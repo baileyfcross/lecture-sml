@@ -44,6 +44,7 @@ class FakeService:
     ) -> None:
         self.model_config = load_model_config(ROOT / "configs/models/qwen35-9b.yaml")
         self.profiles = load_generation_profiles(ROOT / "configs/generation/profiles.yaml")
+        self.artifact_root = Path("artifacts/generations")
         self.status = status
         self.retrieved_count = retrieved_count
         self.calls: list[tuple[GenerationRequest, RetrievalOptions | None, bool]] = []

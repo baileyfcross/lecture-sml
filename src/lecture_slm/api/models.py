@@ -1,5 +1,6 @@
 """Stable request and response models for the local API."""
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -7,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from lecture_slm.generation.models import (
     GenerationProfileName,
     GenerationRequest,
+    GenerationResult,
     GenerationStatus,
     GroundingClaimClassification,
     GroundingReviewRecord,
@@ -130,8 +132,42 @@ class GenerateResponse(BaseModel):
 
     @classmethod
     def from_execution(cls, execution: GenerationExecution) -> "GenerateResponse":
-        request = execution.request
-        result = execution.result
+        return cls._from_result(
+            execution.result,
+            retrieved_count=execution.retrieved_count,
+            assembled_count=len(execution.request.source_material),
+            saved_run=(
+                None
+                if execution.saved_run_directory is None
+                else str(execution.saved_run_directory)
+            ),
+        )
+
+    @classmethod
+    def from_archive(
+        cls,
+        result: GenerationResult,
+        *,
+        retrieved_count: int,
+        assembled_count: int,
+        saved_run: str,
+    ) -> "GenerateResponse":
+        return cls._from_result(
+            result,
+            retrieved_count=retrieved_count,
+            assembled_count=assembled_count,
+            saved_run=saved_run,
+        )
+
+    @classmethod
+    def _from_result(
+        cls,
+        result: GenerationResult,
+        *,
+        retrieved_count: int,
+        assembled_count: int,
+        saved_run: str | None,
+    ) -> "GenerateResponse":
         initial = result.initial_grounding_review
         final = result.final_grounding_review
         planner_result = result.planner_result
@@ -172,8 +208,8 @@ class GenerateResponse(BaseModel):
                 ),
             ),
             sources=SourceSummary(
-                retrieved=execution.retrieved_count,
-                assembled=len(request.source_material),
+                retrieved=retrieved_count,
+                assembled=assembled_count,
             ),
             timing=TimingSummary(
                 total_seconds=result.timing.duration_seconds,
@@ -185,12 +221,30 @@ class GenerateResponse(BaseModel):
                 selected_contexts=result.selected_contexts,
                 estimated_input_tokens=result.estimated_input_tokens,
             ),
-            saved_run=(
-                None
-                if execution.saved_run_directory is None
-                else str(execution.saved_run_directory)
-            ),
+            saved_run=saved_run,
         )
+
+
+class GenerationHistoryDetail(GenerateResponse):
+    archive_id: str
+    instruction: str
+    created_at: datetime
+
+
+class GenerationHistoryWorkspaceSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=300)
+    folder_id: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_is_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must contain non-whitespace characters")
+        return value
 
 
 class ProfileSummary(BaseModel):

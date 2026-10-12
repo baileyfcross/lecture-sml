@@ -150,6 +150,30 @@ export interface GenerationResult {
   saved_run: string | null;
 }
 
+export interface GenerationHistorySummary {
+  archive_id: string;
+  request_id: string;
+  instruction: string;
+  task: TaskType;
+  profile: ProfileName;
+  status: GenerationStatus;
+  created_at: string;
+  has_output: boolean;
+  workspace_id: string | null;
+}
+
+export interface GenerationHistoryDetail extends GenerationResult {
+  archive_id: string;
+  instruction: string;
+  created_at: string;
+}
+
+export interface GenerationHistoryWorkspaceSave {
+  workspace_id: string;
+  title: string;
+  folder_id: string | null;
+}
+
 export interface SseMessage {
   event: string;
   data: string;

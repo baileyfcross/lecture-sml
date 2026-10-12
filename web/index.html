@@ -18,6 +18,9 @@
           <p class="subtitle">Create grounded teaching materials with your local model.</p>
         </div>
         <div class="health">
+          <button id="history-button" class="button button-quiet" type="button">
+            History
+          </button>
           <span id="health-indicator" class="status-dot" aria-hidden="true"></span>
           <span id="health-label" role="status">Checking local services…</span>
           <button id="refresh-health" class="button button-quiet" type="button">
@@ -45,10 +48,6 @@
             <label class="check-label" for="retrieve">
               <input id="retrieve" name="retrieve" type="checkbox" />
               Use Vault Sources
-            </label>
-            <label class="check-label" for="save-run">
-              <input id="save-run" name="save-run" type="checkbox" checked />
-              Save Diagnostic Run
             </label>
             <label for="top-k">
               Retrieval Top-K
@@ -211,6 +210,26 @@
       </section>
       <footer class="page-footer">Runs locally. The browser communicates only with the Lecture SLM API.</footer>
     </main>
+    <dialog
+      id="history-dialog"
+      class="history-dialog"
+      aria-labelledby="history-heading"
+      aria-modal="true"
+    >
+      <div class="history-modal">
+        <div class="section-heading">
+          <h2 id="history-heading">Generation History</h2>
+          <button id="history-close" class="button button-quiet" type="button" aria-label="Close Generation History">
+            Close
+          </button>
+        </div>
+        <div class="history-toolbar">
+          <p id="history-message" class="field-help" role="status" aria-live="polite"></p>
+          <button id="history-refresh" class="button button-quiet" type="button">Refresh</button>
+        </div>
+        <ul id="history-list" class="history-list"></ul>
+      </div>
+    </dialog>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

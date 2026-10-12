@@ -96,6 +96,10 @@ textarea:focus-visible {
   margin-bottom: 1.5rem;
 }
 
+.page-header .health {
+  align-items: center;
+}
+
 h1,
 h2,
 h3,
@@ -288,6 +292,15 @@ details > summary {
   .inline-controls {
     flex-wrap: wrap;
   }
+
+  .history-entry {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+  }
+
+  .history-actions {
+    justify-content: flex-start;
+  }
 }
 
 .check-label {
@@ -333,6 +346,93 @@ details > summary {
 
 .button-quiet {
   color: var(--accent);
+}
+
+.history-dialog {
+  width: min(900px, calc(100vw - 2rem));
+  max-width: none;
+  max-height: min(85vh, 900px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.history-dialog::backdrop {
+  background: rgb(8 15 25 / 58%);
+}
+
+.history-modal {
+  display: flex;
+  max-height: min(85vh, 900px);
+  flex-direction: column;
+  padding: clamp(1rem, 3vw, 1.5rem);
+}
+
+.history-modal > .section-heading {
+  flex: 0 0 auto;
+}
+
+.history-modal h2 {
+  margin-bottom: 0;
+}
+
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex: 0 0 auto;
+}
+
+.history-toolbar p {
+  margin-bottom: 0.5rem;
+}
+
+.history-list {
+  display: grid;
+  gap: 0.65rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+}
+
+.history-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+}
+
+.history-entry-info {
+  min-width: 0;
+}
+
+.history-entry-info strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.history-entry-info p {
+  margin: 0.2rem 0 0;
+}
+
+.history-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.history-workspace-editor {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 0.6rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--border);
 }
 
 .state-label {

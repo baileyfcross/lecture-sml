@@ -1,5 +1,8 @@
 import type {
   GenerationRequest,
+  GenerationHistoryDetail,
+  GenerationHistorySummary,
+  GenerationHistoryWorkspaceSave,
   GenerationResult,
   HealthResponse,
   ProfileSummary,
@@ -152,6 +155,32 @@ export function getRun(requestId: string): Promise<GenerationResult> {
   return getJson<GenerationResult>(`/api/runs/${encodeURIComponent(requestId)}`);
 }
 
+export function getGenerationHistory(limit = 100): Promise<GenerationHistorySummary[]> {
+  const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+  return getJson<GenerationHistorySummary[]>(`/api/history?limit=${boundedLimit}`);
+}
+
+export function getGenerationHistoryItem(archiveId: string): Promise<GenerationHistoryDetail> {
+  return getJson<GenerationHistoryDetail>(
+    `/api/history/${encodeURIComponent(archiveId)}`,
+  );
+}
+
+export function deleteGenerationHistoryItem(archiveId: string): Promise<void> {
+  return sendNoContent(`/api/history/${encodeURIComponent(archiveId)}`, "DELETE");
+}
+
+export function addGenerationHistoryToWorkspace(
+  archiveId: string,
+  request: GenerationHistoryWorkspaceSave,
+): Promise<WorkspaceItem> {
+  return sendJson<WorkspaceItem>(
+    `/api/history/${encodeURIComponent(archiveId)}/workspace`,
+    "POST",
+    request,
+  );
+}
+
 function parseData<T>(message: SseMessage): T {
   try {
     return JSON.parse(message.data) as T;
@@ -174,7 +203,7 @@ export async function generateStream(
       Accept: "text/event-stream",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(request),
+    body: JSON.stringify({ ...request, save_run: true }),
   });
   if (!response.ok) throw new ApiError(await errorMessage(response), response.status);
   if (!response.body) throw new ApiError("The streaming response did not include a body.");

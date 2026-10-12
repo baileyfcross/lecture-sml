@@ -14,6 +14,7 @@ import {
   saveOutputToWorkspace,
   updateWorkspaceItem,
 } from "./api";
+import { connectGenerationHistory } from "./history";
 import {
   applyProgress,
   applyResult,
@@ -45,7 +46,6 @@ const storageKeys = {
   profile: "lecture-slm.profile",
   retrieve: "lecture-slm.retrieve",
   topK: "lecture-slm.top-k",
-  saveRun: "lecture-slm.save-run",
   workspaceId: "lecture-slm.workspace-id",
 };
 
@@ -66,7 +66,6 @@ const form = byId<HTMLFormElement>("generation-form");
 const taskSelect = byId<HTMLSelectElement>("task");
 const profileSelect = byId<HTMLSelectElement>("profile");
 const retrieveCheckbox = byId<HTMLInputElement>("retrieve");
-const saveRunCheckbox = byId<HTMLInputElement>("save-run");
 const topKInput = byId<HTMLInputElement>("top-k");
 const instructionInput = byId<HTMLTextAreaElement>("instruction");
 const generateButton = byId<HTMLButtonElement>("generate");
@@ -181,7 +180,6 @@ function updateFormState(): void {
   taskSelect.disabled = isGenerating;
   profileSelect.disabled = isGenerating;
   retrieveCheckbox.disabled = isGenerating;
-  saveRunCheckbox.disabled = isGenerating;
   topKInput.disabled = isGenerating || !retrieveCheckbox.checked;
   instructionInput.disabled = isGenerating;
   workspaceSelect.disabled = isGenerating;
@@ -636,7 +634,7 @@ async function submitGeneration(event: SubmitEvent): Promise<void> {
     profile: profileSelect.value as GenerationRequest["profile"],
     instruction: instructionInput.value.trim(),
     retrieve: retrieveCheckbox.checked,
-    save_run: saveRunCheckbox.checked,
+    save_run: true,
   };
   if (workspaceSelect.value) request.workspace_id = workspaceSelect.value;
   if (retrieveCheckbox.checked) request.retrieval_top_k = Number(topKInput.value);
@@ -755,13 +753,10 @@ function savePreferences(): void {
   if (profileSelect.value) setPreference(storageKeys.profile, profileSelect.value);
   setPreference(storageKeys.retrieve, String(retrieveCheckbox.checked));
   setPreference(storageKeys.topK, topKInput.value);
-  setPreference(storageKeys.saveRun, String(saveRunCheckbox.checked));
 }
 
 function initializePreferences(): void {
   retrieveCheckbox.checked = localStorage.getItem(storageKeys.retrieve) === "true";
-  const savedRunPreference = localStorage.getItem(storageKeys.saveRun);
-  saveRunCheckbox.checked = savedRunPreference === null ? true : savedRunPreference === "true";
   const topK = Number(localStorage.getItem(storageKeys.topK));
   if (Number.isInteger(topK) && topK >= 1 && topK <= 10) topKInput.value = String(topK);
 }
@@ -802,7 +797,6 @@ retrieveCheckbox.addEventListener("change", () => {
   savePreferences();
   updateFormState();
 });
-saveRunCheckbox.addEventListener("change", savePreferences);
 topKInput.addEventListener("change", savePreferences);
 refreshHealthButton.addEventListener("click", () => void refreshHealth());
 document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
@@ -834,6 +828,33 @@ copyRunPathButton.addEventListener("click", async () => {
     copyMessage.textContent = `Could not copy path: ${apiErrorMessage(error)}`;
   }
 });
+
+connectGenerationHistory(
+  {
+    trigger: byId<HTMLButtonElement>("history-button"),
+    dialog: byId<HTMLDialogElement>("history-dialog"),
+    close: byId<HTMLButtonElement>("history-close"),
+    refresh: byId<HTMLButtonElement>("history-refresh"),
+    message: byId<HTMLParagraphElement>("history-message"),
+    list: byId<HTMLUListElement>("history-list"),
+  },
+  {
+    selectedWorkspaceId: () => workspaceSelect.value,
+    onOpen: (detail) => {
+      instructionInput.value = detail.instruction;
+      taskSelect.value = detail.task;
+      profileSelect.value = detail.profile;
+      updateProfilePurpose();
+      workspaceSaveTitle.value = "";
+      requestError.hidden = true;
+      generation = applyResult(initialGenerationState(), detail);
+      render();
+    },
+    onWorkspaceSaved: async (workspaceId) => {
+      if (workspaceSelect.value === workspaceId) await refreshWorkspaceDetail();
+    },
+  },
+);
 
 initializePreferences();
 render();

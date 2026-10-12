@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  addGenerationHistoryToWorkspace,
+  deleteGenerationHistoryItem,
   generateStream,
+  getGenerationHistory,
+  getGenerationHistoryItem,
   getWorkspaces,
   saveOutputToWorkspace,
 } from "../src/api";
@@ -61,13 +65,17 @@ describe("generateStream", () => {
       },
     });
 
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
     const onProgress = vi.fn();
 
     const actual = await generateStream(request, onProgress);
 
     expect(actual).toEqual(completedResult);
     expect(onProgress).toHaveBeenCalledWith({ stage: "writing" });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toMatchObject({
+      save_run: true,
+    });
   });
 
   it("turns an HTTP error into a transport failure", async () => {
@@ -114,6 +122,7 @@ describe("Workspace API", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/workspaces", {
       headers: { Accept: "application/json" },
     });
+
   });
 
   it("saves a generated result through the explicit History endpoint", async () => {
@@ -136,6 +145,64 @@ describe("Workspace API", () => {
         body: JSON.stringify({
           request_id: "request-1",
           title: "Approved output",
+        }),
+      }),
+    );
+  });
+});
+
+describe("Generation History API", () => {
+  it("loads only the requested bounded history summaries and lazily fetches details", async () => {
+    const summary = [{ archive_id: "archive-1", instruction: "Full instruction" }];
+    const detail = { ...completedResult, archive_id: "archive-1", instruction: "Full instruction" };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(summary), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(detail), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getGenerationHistory(999)).resolves.toEqual(summary);
+    await expect(getGenerationHistoryItem("archive/1")).resolves.toEqual(detail);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/history?limit=500", {
+      headers: { Accept: "application/json" },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/history/archive%2F1", {
+      headers: { Accept: "application/json" },
+    });
+  });
+
+  it("deletes an archive and copies it to Workspace History", async () => {
+    const saved = { id: "item-1", role: "history" };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(saved), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(deleteGenerationHistoryItem("archive-1")).resolves.toBeUndefined();
+    await expect(
+      addGenerationHistoryToWorkspace("archive-1", {
+        workspace_id: "workspace-1",
+        title: "Lecture 4",
+        folder_id: "folder-1",
+      }),
+    ).resolves.toEqual(saved);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/history/archive-1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/history/archive-1/workspace",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          workspace_id: "workspace-1",
+          title: "Lecture 4",
+          folder_id: "folder-1",
         }),
       }),
     );
