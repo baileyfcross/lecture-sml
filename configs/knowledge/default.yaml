@@ -10,6 +10,7 @@ knowledge:
       #- .txt
       #- .docx
       # - .pptx
+      # - .epub
     ignore_directories:
       - .obsidian
       - .git

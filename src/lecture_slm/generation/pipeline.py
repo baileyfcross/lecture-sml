@@ -39,6 +39,7 @@ from lecture_slm.generation.reviewer import (
 )
 from lecture_slm.generation.source_scope import (
     normalize_source_scope_with_diagnostics,
+    validate_plan_against_source_scope,
 )
 from lecture_slm.generation.writer import Writer
 from lecture_slm.inference.ollama_client import OllamaClient, OllamaError
@@ -91,6 +92,7 @@ class GenerationPipeline:
         planner_initial_record: StageRecord | None = None
         planner_reassessment_record: StageRecord | None = None
         planner_initial_request = request
+        planner_source_scope_raw: SourceScopeAssessment | None = None
         plan = None
         selected_contexts: dict[str, int] = {}
         estimated_inputs: dict[str, int] = {}
@@ -254,6 +256,7 @@ class GenerationPipeline:
             planner_initial_record = planner_record
             scope_normalization: dict[str, object] | None = None
             if planner_record.plan is not None and planner_record.plan.source_scope is not None:
+                planner_source_scope_raw = planner_record.plan.source_scope
                 normalized_scope, scope_normalization = normalize_source_scope_with_diagnostics(
                     request,
                     planner_record.plan.source_scope,
@@ -319,6 +322,7 @@ class GenerationPipeline:
                         planner_record.plan is not None
                         and planner_record.plan.source_scope is not None
                     ):
+                        planner_source_scope_raw = planner_record.plan.source_scope
                         normalized_scope, scope_normalization = (
                             normalize_source_scope_with_diagnostics(
                                 request,
@@ -430,6 +434,79 @@ class GenerationPipeline:
                         "initial_planning_seconds"
                     ]
                     round_diagnostics["planner_reassessment_seconds"] = None
+
+            if request.source_material and plan is not None and plan.source_scope is not None:
+                source_scope_validation = validate_plan_against_source_scope(
+                    request,
+                    plan,
+                    raw_scope=planner_source_scope_raw,
+                )
+                if source_scope_validation.effective_status is not None and (
+                    source_scope_validation.effective_status is not plan.source_scope.status
+                ):
+                    effective_scope_note = (
+                        "Core requested topic remains unsupported by the available sources."
+                    )
+                    existing_scope_note = plan.source_scope.scope_note
+                    scope_note = (
+                        f"{existing_scope_note} {effective_scope_note}".strip()
+                        if existing_scope_note
+                        else effective_scope_note
+                    )
+                    plan = plan.model_copy(
+                        update={
+                            "source_scope": plan.source_scope.model_copy(
+                                update={
+                                    "status": source_scope_validation.effective_status,
+                                    "scope_note": scope_note,
+                                }
+                            )
+                        }
+                    )
+                    planner_record = planner_record.model_copy(update={"plan": plan})
+                    if planner_reassessment_record is not None:
+                        planner_reassessment_record = planner_reassessment_record.model_copy(
+                            update={"plan": plan}
+                        )
+                scope_validation_diagnostics = source_scope_validation.diagnostics()
+                unsupported_topics: list[str] = []
+                if plan.source_scope is not None:
+                    unsupported_topics = plan.source_scope.unsupported_requested_topics
+                scope_validation_diagnostics["unsupported_requested_topics"] = unsupported_topics
+                scope_validation_diagnostics["writer_blocked"] = (
+                    not source_scope_validation.valid
+                    or source_scope_validation.effective_status is SourceScopeStatus.INSUFFICIENT
+                )
+                request.metadata["source_scope_validation"] = scope_validation_diagnostics
+                if isinstance(request.metadata.get("knowledge_retrieval"), dict):
+                    retrieval_diagnostics = request.metadata["knowledge_retrieval"]
+                    diagnostics = retrieval_diagnostics.setdefault("diagnostics", {})
+                    if isinstance(diagnostics, dict):
+                        diagnostics["source_scope_validation"] = scope_validation_diagnostics
+                if not source_scope_validation.valid:
+                    message = (
+                        "The final teaching plan still depends on requested factual topics that "
+                        "the available sources do not support. The writer was not started."
+                    )
+                    errors.append(message)
+                    progress(GenerationStage.FAILED, message)
+                    return self._result(
+                        request,
+                        profile,
+                        GenerationStatus.FAILED,
+                        started,
+                        errors=errors,
+                        selected_contexts=selected_contexts,
+                        estimated_inputs=estimated_inputs,
+                        planner_record=planner_record,
+                        writer_record=None,
+                        reviewer_feedback=None,
+                        reviewer_error=None,
+                        final_output=None,
+                        planner_initial_record=planner_initial_record,
+                        planner_reassessment_record=planner_reassessment_record,
+                        planner_initial_request=planner_initial_request,
+                    )
 
         if (
             request.source_material

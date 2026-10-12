@@ -158,7 +158,7 @@ def test_generation_materializes_reference_sources_and_continuity_only_workspace
     assert context.id in snapshot and history.id in snapshot and reference.id in snapshot
 
 
-def test_workspace_name_anchors_global_retrieval_without_replacing_canonical_query(
+def test_self_contained_query_excludes_unrelated_workspace_anchor(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -197,13 +197,74 @@ def test_workspace_name_anchors_global_retrieval_without_replacing_canonical_que
     )
 
     assert len(seen_queries) == 1
-    assert seen_queries[0].canonical == "CSC 220 Logic predicate logic"
+    assert seen_queries[0].canonical == "predicate logic"
     retrieval_diagnostics = execution.request.metadata["knowledge_retrieval"]
     assert retrieval_diagnostics["canonical_query"] == "predicate logic"
+    assert retrieval_diagnostics["diagnostics"]["workspace_anchored_query"] is None
     assert (
-        retrieval_diagnostics["diagnostics"]["workspace_anchored_query"]
-        == seen_queries[0].canonical
+        retrieval_diagnostics["diagnostics"]["query_intent"]["workspace_anchor"]["reason"]
+        == "Request contains a self-contained factual topic."
     )
+
+
+def test_course_relative_query_uses_workspace_domain_and_history(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    router = FakeRouter()
+    service = _service(router)
+    service._workspace_service = WorkspaceService(database_path=tmp_path / "workspaces.sqlite")
+    workspace = service.workspaces.store.create_workspace("C# Class")
+    service.workspaces.store.create_item(
+        workspace.id,
+        WorkspaceItemInput(
+            title="Lecture 3",
+            role=WorkspaceItemRole.HISTORY,
+            content=(
+                "# C#.NET Fundamentals: Lecture 3 – Generic Methods\n"
+                "The prior lecture covered generic methods."
+            ),
+        ),
+    )
+    seen_queries: list[Any] = []
+    monkeypatch.setattr(
+        "lecture_slm.generation.service.load_knowledge_config",
+        lambda _: KnowledgeConfig(),
+    )
+
+    def retrieve(
+        request: GenerationRequest,
+        retrieval_options: RetrievalOptions,
+        _: KnowledgeConfig,
+        *,
+        query: Any,
+        top_k: int | None = None,
+    ) -> RetrievalResult:
+        del request, retrieval_options, top_k
+        seen_queries.append(query)
+        return RetrievalResult(query=query.canonical)
+
+    monkeypatch.setattr(service, "_retrieve", retrieve)
+    original = "Can you generate lecture 4 for the C# class?"
+    execution = service.generate(
+        GenerationRequest(
+            task=TaskType.LECTURE,
+            instruction=original,
+            workspace_id=workspace.id,
+        ),
+        retrieval=RetrievalOptions(enabled=True),
+    )
+
+    assert seen_queries[0].canonical == "C# Generic Methods"
+    assert execution.request.instruction == original
+    intent = execution.request.metadata["knowledge_retrieval"]["diagnostics"]["query_intent"]
+    assert intent["raw_instruction"] == original
+    assert intent["workspace_anchor"] == {
+        "considered": True,
+        "applied": True,
+        "value": "C#",
+        "reason": "Request depends on the active course sequence.",
+    }
 
 
 def test_explicit_sources_take_budget_before_workspace_references_and_global_retrieval(
@@ -379,7 +440,11 @@ def test_partial_retrieval_expands_once_and_deduplicates_chunk_matches(
         expand_scope=SourceScopeAssessment(
             status=SourceScopeStatus.PARTIAL,
             supported_topics=["quantum annealing"],
-            unsupported_requested_topics=["algorithms", "error correction"],
+            unsupported_requested_topics=[
+                "algorithms",
+                "error correction",
+                "Kubernetes Storage Class",
+            ],
         )
     )
     service = _service(router)
@@ -466,6 +531,19 @@ def test_partial_retrieval_expands_once_and_deduplicates_chunk_matches(
     assert diagnostics["retrieval_rounds"][1]["retrieved_count"] == 4
     assert diagnostics["retrieval_rounds"][1]["unique_added_count"] == 2
     assert diagnostics["retrieval_rounds"][1]["merged_match_count"] == 4
+    assert diagnostics["expansion_scope"]["normalized_unsupported_topics"] == [
+        "algorithms",
+        "error correction",
+    ]
+    assert diagnostics["expansion_plan"]["missing_topics"] == ["algorithms", "error correction"]
+    assert diagnostics["expansion_plan"]["expansion_queries"] == [
+        "quantum computing algorithms",
+        "quantum computing error correction",
+    ]
+    assert all(
+        "Kubernetes" not in query for query in diagnostics["expansion_plan"]["expansion_queries"]
+    )
+    assert diagnostics["query_intent"]["raw_instruction"] == request.instruction
     assert diagnostics["context_assembly"]["candidate_chunks"] == 4
     assert diagnostics["context_assembly"]["source_material_count"] == 4
     assert execution.result.final_output == "Generated output."

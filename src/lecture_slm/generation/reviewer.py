@@ -72,6 +72,7 @@ class GroundingReviewPreparation:
     continuity_eligible_claim_ids: list[str]
     continuity_reviewable_claim_ids: list[str]
     continuity_diagnostics: dict[str, object]
+    current_artifact_framing_claim_ids: list[str]
     output_budget: int | None
 
     @property
@@ -80,7 +81,14 @@ class GroundingReviewPreparation:
 
     @property
     def direct_supported_claim_count(self) -> int:
-        return len(self.direct_claims)
+        return sum(
+            claim.classification is GroundingClaimClassification.DIRECT_SUPPORTED
+            for claim in self.direct_claims
+        )
+
+    @property
+    def current_artifact_pedagogical_count(self) -> int:
+        return len(self.current_artifact_framing_claim_ids)
 
     @property
     def unresolved_claim_count(self) -> int:
@@ -210,6 +218,54 @@ def _factual_sentence_excerpts(artifact: str) -> list[str]:
             if any(character.isalpha() for character in excerpt):
                 sentences.append(excerpt)
     return sentences
+
+
+_CURRENT_ARTIFACT_PREFIX_PATTERNS = (
+    r"^today,\s+we\s+(?:shift|focus|begin|start|examine|compare|review|practice|look|explore)\b",
+    r"^in this (?:lecture|section|lesson),\s+we\s+will\b",
+    r"^this section (?:focuses|will focus|covers)\b",
+    r"^next,\s+we\s+(?:will\s+)?(?:compare|look|examine|review|move)\b",
+    r"^now(?:,)?\s+let'?s\s+(?:look|review|compare|examine|connect)\b",
+    r"^first,\s+we\s+will\b",
+    r"^at the end of this section,\s+we\s+will\b",
+)
+
+_COURSE_SEQUENCE_DISQUALIFIERS = (
+    r"\bin our previous (?:lecture|session|class|lesson|lab)\b",
+    r"\b(?:last|previous|earlier)\s+(?:lecture|session|class|lesson|lab)\b",
+    r"\bnext\s+(?:lecture|session|class|lesson|lab|week)\b",
+    r"\bin lecture\s+\d+\b",
+)
+
+_MIXED_FACTUAL_DISQUALIFIERS = (
+    r",\s*(?:which|that)\b",
+    r"\b(?:which|that)\s+(?:declares?|defines?|means?|uses?|implements?|provides?)\b",
+    r"\b(?:is|are|means?|declares?|defines?|uses?|implements?|always|never|outperforms)\b",
+    r"`[^`]+`",
+)
+
+
+def is_current_artifact_framing_claim(text: str) -> bool:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return False
+    lowered = normalized.casefold()
+    if any(
+        re.search(pattern, lowered, flags=re.IGNORECASE)
+        for pattern in _COURSE_SEQUENCE_DISQUALIFIERS
+    ):
+        return False
+    if not any(
+        re.search(pattern, lowered, flags=re.IGNORECASE)
+        for pattern in _CURRENT_ARTIFACT_PREFIX_PATTERNS
+    ):
+        return False
+    if any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in _MIXED_FACTUAL_DISQUALIFIERS
+    ):
+        return False
+    return True
 
 
 def _split_grounding_sentences(line: str) -> list[str]:
@@ -342,24 +398,50 @@ def _evidence_ids_for_direct_claim(
 def prepare_grounding_claims(
     request: GenerationRequest,
     artifact: str,
-) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
+) -> tuple[
+    list[GroundingClaimInput],
+    list[GroundingClaimAssessment],
+    list[GroundingClaimInput],
+]:
     """Assign stable IDs and deterministically resolve obvious source-text matches."""
     evidence_ledger = build_evidence_ledger(request)
-    return _prepare_grounding_claims(request, artifact, evidence_ledger)
+    claims, direct, unresolved, _ = _prepare_grounding_claims(request, artifact, evidence_ledger)
+    return claims, direct, unresolved
 
 
 def _prepare_grounding_claims(
     request: GenerationRequest,
     artifact: str,
     evidence_ledger: list[EvidenceSpan],
-) -> tuple[list[GroundingClaimInput], list[GroundingClaimAssessment], list[GroundingClaimInput]]:
+) -> tuple[
+    list[GroundingClaimInput],
+    list[GroundingClaimAssessment],
+    list[GroundingClaimInput],
+    list[str],
+]:
     inputs = [
         GroundingClaimInput(claim_id=f"C{index:03d}", text=text)
         for index, text in enumerate(_factual_sentence_excerpts(artifact), start=1)
     ]
     direct: list[GroundingClaimAssessment] = []
+    current_artifact_framing_claim_ids: list[str] = []
     unresolved: list[GroundingClaimInput] = []
     for claim in inputs:
+        if is_current_artifact_framing_claim(claim.text):
+            current_artifact_framing_claim_ids.append(claim.claim_id)
+            direct.append(
+                GroundingClaimAssessment(
+                    claim_id=claim.claim_id,
+                    text=claim.text,
+                    classification=GroundingClaimClassification.PEDAGOGICAL,
+                    support_method=GroundingSupportMethod.PEDAGOGICAL,
+                    reason=(
+                        "Deterministic current-artifact framing: this claim describes the "
+                        "organization or agenda of the current artifact."
+                    ),
+                )
+            )
+            continue
         matched_evidence_ids = _evidence_ids_for_direct_claim(claim.text, request, evidence_ledger)
         if not matched_evidence_ids:
             unresolved.append(claim)
@@ -374,7 +456,7 @@ def _prepare_grounding_claims(
                 reason="Normalized claim text occurs directly in the supplied source.",
             )
         )
-    return inputs, direct, unresolved
+    return inputs, direct, unresolved, current_artifact_framing_claim_ids
 
 
 def merge_grounding_review(
@@ -651,10 +733,12 @@ class GroundingStageRunner:
         artifact: str,
     ) -> GroundingReviewPreparation:
         evidence_ledger = build_evidence_ledger(request)
-        all_claims, direct_claims, unresolved_claims = _prepare_grounding_claims(
-            request,
-            artifact,
-            evidence_ledger,
+        all_claims, direct_claims, unresolved_claims, current_artifact_framing_claim_ids = (
+            _prepare_grounding_claims(
+                request,
+                artifact,
+                evidence_ledger,
+            )
         )
         continuity_selection = select_workspace_continuity_support(request, unresolved_claims)
         return GroundingReviewPreparation(
@@ -666,6 +750,7 @@ class GroundingStageRunner:
             continuity_eligible_claim_ids=continuity_selection.eligible_claim_ids,
             continuity_reviewable_claim_ids=continuity_selection.reviewable_claim_ids,
             continuity_diagnostics=continuity_selection.diagnostics,
+            current_artifact_framing_claim_ids=current_artifact_framing_claim_ids,
             output_budget=(
                 grounding_review_output_budget(len(unresolved_claims))
                 if unresolved_claims
@@ -704,6 +789,10 @@ class GroundingStageRunner:
                     error_type=type(error).__name__,
                     error_message=self._safe_error(str(error)),
                     claims_extracted=prepared.claims_extracted,
+                    current_artifact_pedagogical_count=(
+                        prepared.current_artifact_pedagogical_count
+                    ),
+                    current_artifact_framing_claim_ids=prepared.current_artifact_framing_claim_ids,
                     direct_supported_claim_count=prepared.direct_supported_claim_count,
                     unresolved_claim_count=prepared.unresolved_claim_count,
                     review_output_budget=prepared.output_budget,
@@ -713,6 +802,8 @@ class GroundingStageRunner:
                 review=direct_review,
                 prompt_version=GROUNDING_REVIEW_PROMPT_VERSION,
                 claims_extracted=prepared.claims_extracted,
+                current_artifact_pedagogical_count=prepared.current_artifact_pedagogical_count,
+                current_artifact_framing_claim_ids=prepared.current_artifact_framing_claim_ids,
                 direct_supported_claim_count=prepared.direct_supported_claim_count,
                 unresolved_claim_count=prepared.unresolved_claim_count,
                 review_output_budget=prepared.output_budget,
@@ -741,6 +832,8 @@ class GroundingStageRunner:
                 error_type=type(error).__name__,
                 error_message=str(error),
                 claims_extracted=prepared.claims_extracted,
+                current_artifact_pedagogical_count=prepared.current_artifact_pedagogical_count,
+                current_artifact_framing_claim_ids=prepared.current_artifact_framing_claim_ids,
                 direct_supported_claim_count=prepared.direct_supported_claim_count,
                 unresolved_claim_count=prepared.unresolved_claim_count,
                 review_output_budget=prepared.output_budget,
@@ -807,6 +900,8 @@ class GroundingStageRunner:
                     else self._safe_error(str(error))
                 ),
                 claims_extracted=prepared.claims_extracted,
+                current_artifact_pedagogical_count=prepared.current_artifact_pedagogical_count,
+                current_artifact_framing_claim_ids=prepared.current_artifact_framing_claim_ids,
                 direct_supported_claim_count=prepared.direct_supported_claim_count,
                 unresolved_claim_count=prepared.unresolved_claim_count,
                 review_output_budget=prepared.output_budget,
@@ -824,6 +919,8 @@ class GroundingStageRunner:
             raw_response=response.content,
             prompt_version=prompt.version,
             claims_extracted=prepared.claims_extracted,
+            current_artifact_pedagogical_count=prepared.current_artifact_pedagogical_count,
+            current_artifact_framing_claim_ids=prepared.current_artifact_framing_claim_ids,
             direct_supported_claim_count=prepared.direct_supported_claim_count,
             unresolved_claim_count=prepared.unresolved_claim_count,
             review_output_budget=prepared.output_budget,

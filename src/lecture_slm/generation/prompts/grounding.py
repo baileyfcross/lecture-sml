@@ -24,8 +24,8 @@ GROUNDING_REVIEW_SYSTEM_PROMPT = (
     "sequence claim and selected spans with meaningful topic overlap; matching words such as "
     "'next session', 'Lecture 3', 'covered', or 'explored' are structural only and do not "
     "establish topic relevance. Even when allowed, classify continuity_supported only if the "
-    "selected span itself establishes the claim's same topic and sequence. If the claim "
-    "Whenever a continuity claim contains multiple specific topics, selected continuity evidence "
+    "selected span itself establishes the claim's same topic and sequence. Whenever a "
+    "continuity claim contains multiple specific topics, selected continuity evidence "
     "must establish each one; one overlapping topic does not support the other topics. For future "
     "claims, each topic must be stated as part of the future sequence, not merely mentioned "
     "elsewhere in the item's history. For example, evidence that says the next session covers "
@@ -45,7 +45,11 @@ GROUNDING_REVIEW_SYSTEM_PROMPT = (
     "classification, and evidence_ids: []. Do not include a reason. For unsupported claims "
     "return claim_id, classification, evidence_ids: [], a concise reason, and category when "
     "applicable. Never invent evidence IDs or continuity IDs. Reasonable paraphrase does not "
-    "need to match source wording exactly. Do not require exact lexical identity. Do not inflate "
+    "need to match source wording exactly. Do not require exact lexical identity. For a claim to "
+    "be supported, cited evidence must establish every material factual assertion in the claim. "
+    "Evidence discussing the same broad topic is not sufficient when it does not establish the "
+    "specific mechanism, syntax, behavior, relationship, limitation, or example being asserted. "
+    "Do not inflate "
     "a technical statement into importance, significance, historical cause, foundational status, "
     "broader application, general necessity, or course continuity unless the appropriate ledger "
     "establishes that stronger claim. Multiple factual evidence spans, including spans from "
@@ -59,7 +63,13 @@ GROUNDING_REVIEW_SYSTEM_PROMPT = (
     "then 'Tests can check whether an implementation continues to satisfy expected interface "
     "behavior as it changes' is supported by [E001, E002]. By contrast, 'Interface testing is "
     "essential to professional C# development' is unsupported unless evidence establishes "
-    "essential status and professional significance. Pedagogical claims may remain "
+    "essential status and professional significance. If [E101] states 'A generic class can "
+    "declare a type parameter on the class declaration, such as class Box<T>.', then "
+    "'A generic class declares its type parameter on the class declaration.' is supported by "
+    "[E101]. If [E201] only states 'Generics preserve static type information while reusing "
+    "algorithms and containers.', then 'A generic class declares type parameters using syntax "
+    "such as class Stack<T>.' is unsupported unless another cited span explicitly establishes "
+    "that syntax. Pedagogical claims may remain "
     "pedagogical when they are "
     "stipulated examples or illustrative setups. General model knowledge is not evidence. "
     "Only claims listed as allowed to use Workspace continuity evidence may be classified as "
@@ -213,8 +223,30 @@ def build_grounding_review_prompt(
         json_block(
             "Deterministic evidence ledger (cite evidence_id values)", _evidence_ledger(request)
         ),
-        json_block("Unresolved claims to adjudicate", claims),
     ]
+    source_scope_validation = request.metadata.get("source_scope_validation", {})
+    unsupported_topics = (
+        source_scope_validation.get("unsupported_requested_topics", [])
+        if isinstance(source_scope_validation, dict)
+        else []
+    )
+    if isinstance(unsupported_topics, list) and unsupported_topics:
+        sections.append(
+            json_block(
+                "Known unsupported requested topics from planning",
+                unsupported_topics,
+            )
+        )
+        sections.append(
+            "Treat these as known evidence gaps. Do not infer missing technical details from "
+            "related source material. A claim about one of these topics may still be supported "
+            "only when the evidence ledger explicitly establishes that specific claim."
+        )
+    sections.extend(
+        [
+            json_block("Unresolved claims to adjudicate", claims),
+        ]
+    )
     return PromptPackage(
         version=GROUNDING_REVIEW_PROMPT_VERSION,
         system_message=system_message,

@@ -145,6 +145,7 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
         return lines
     timing = record.timing
     claims_extracted = record.claims_extracted
+    current_artifact_count = record.current_artifact_pedagogical_count
     direct_count = record.direct_supported_claim_count
     unresolved_count = record.unresolved_claim_count
     output_budget = record.review_output_budget
@@ -159,6 +160,10 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
             f"- Prompt version: {record.prompt_version or 'n/a'}",
             f"- Duration: {timing.duration_seconds if timing is not None else 'n/a'}",
             f"- Claims extracted: {claims_extracted if claims_extracted is not None else 'n/a'}",
+            (
+                "- Current-artifact pedagogical claims: "
+                f"{current_artifact_count if current_artifact_count is not None else 'n/a'}"
+            ),
             f"- Direct-supported claims: {direct_count if direct_count is not None else 'n/a'}",
             f"- Unresolved reviewer claims: "
             f"{unresolved_count if unresolved_count is not None else 'n/a'}",
@@ -198,6 +203,12 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
                 f"- Decision: {record.review.decision.value}",
             ]
         )
+    if record.current_artifact_framing_claim_ids:
+        lines.append(
+            "- Current-artifact framing claim IDs: "
+            + ", ".join(record.current_artifact_framing_claim_ids)
+        )
+    if record.review is not None:
         continuity_selection = record.review.continuity_selection
         if isinstance(continuity_selection, dict):
             lines.extend(
@@ -246,6 +257,33 @@ def _grounding_diagnostic(name: str, record: GroundingReviewRecord | None) -> li
     return lines
 
 
+def _fusion_trace_lines(label: str, trace: Any) -> list[str]:
+    if not isinstance(trace, list):
+        return []
+    lines: list[str] = [f"- {label} fusion trace ({len(trace)} max):"]
+    for candidate in trace:
+        if not isinstance(candidate, dict):
+            continue
+        title = candidate.get("source_title", "unknown source")
+        chunk_id = candidate.get("chunk_id", "unknown chunk")
+        lexical = candidate.get("lexical_rank")
+        dense = candidate.get("dense_rank")
+        lexical_contribution = candidate.get("lexical_rrf_contribution", 0)
+        dense_contribution = candidate.get("dense_rrf_contribution", 0)
+        reason = candidate.get("rejection_reason")
+        outcome = candidate.get("selection_outcome", "n/a")
+        lines.append(
+            f"  - {title} ({chunk_id}): lexical rank={lexical or 'n/a'} "
+            f"score={candidate.get('lexical_score') or 'n/a'}; "
+            f"dense rank={dense or 'n/a'} score={candidate.get('dense_score') or 'n/a'}; "
+            f"RRF lexical={lexical_contribution} + dense={dense_contribution}; "
+            f"fused rank={candidate.get('fused_rank', 'n/a')} "
+            f"score={candidate.get('fused_score', 'n/a')}; outcome={outcome}; "
+            f"rejection={reason or 'none'}"
+        )
+    return lines
+
+
 def _write_diagnostics(
     directory: Path,
     request: GenerationRequest,
@@ -275,6 +313,27 @@ def _write_diagnostics(
             f"- Canonical query: {canonical_query}",
         ]
     retrieval_diagnostics = retrieval_mapping.get("diagnostics", {})
+    query_intent = (
+        retrieval_diagnostics.get("query_intent")
+        if isinstance(retrieval_diagnostics, dict)
+        else None
+    )
+    if isinstance(query_intent, dict):
+        terms = query_intent.get("query_terms", [])
+        if isinstance(terms, list):
+            retrieval_query_lines.append(
+                "- Factual query terms: " + (", ".join(str(term) for term in terms) or "none")
+            )
+        anchor = query_intent.get("workspace_anchor")
+        if isinstance(anchor, dict):
+            retrieval_query_lines.extend(
+                [
+                    f"- Workspace anchor considered: {'yes' if anchor.get('considered') else 'no'}",
+                    f"- Workspace anchor applied: {'yes' if anchor.get('applied') else 'no'}",
+                    f"- Workspace anchor value: {anchor.get('value') or 'n/a'}",
+                    f"- Workspace anchor reason: {anchor.get('reason') or 'n/a'}",
+                ]
+            )
     retrieval_rounds = (
         retrieval_diagnostics.get("retrieval_rounds", [])
         if isinstance(retrieval_diagnostics, dict)
@@ -321,6 +380,12 @@ def _write_diagnostics(
                             )
         expansion_plan = retrieval_diagnostics.get("expansion_plan")
         if isinstance(expansion_plan, dict):
+            normalized_topics = expansion_plan.get("missing_topics")
+            if isinstance(normalized_topics, list):
+                retrieval_round_lines.append(
+                    "- Normalized unsupported topics used for expansion: "
+                    + (", ".join(str(topic) for topic in normalized_topics) or "none")
+                )
             queries = expansion_plan.get("expansion_queries")
             if isinstance(queries, list):
                 retrieval_round_lines.append(
@@ -354,6 +419,24 @@ def _write_diagnostics(
                     f"{round_diagnostic.get('retrieved_count', 0)} matches in "
                     f"{round_diagnostic.get('duration_seconds', 0)} seconds"
                 )
+                trace = round_diagnostic.get("fusion_trace")
+                if isinstance(trace, list):
+                    retrieval_round_lines.extend(
+                        _fusion_trace_lines(
+                            f"Round {round_diagnostic.get('round', 'n/a')} candidate",
+                            trace,
+                        )
+                    )
+                query_diagnostics = round_diagnostic.get("queries")
+                if isinstance(query_diagnostics, list):
+                    for query_diagnostic in query_diagnostics:
+                        if isinstance(query_diagnostic, dict):
+                            retrieval_round_lines.extend(
+                                _fusion_trace_lines(
+                                    f"Expansion query {query_diagnostic.get('query', 'n/a')}",
+                                    query_diagnostic.get("fusion_trace", []),
+                                )
+                            )
     source_scope_lines = ["## Source scope"]
     source_scope = (
         None
@@ -390,6 +473,45 @@ def _write_diagnostics(
                 source_scope_lines.extend(f"  - {topic}" for topic in raw)
             else:
                 source_scope_lines.append("  - none identified")
+        validation = (
+            diagnostics.get("source_scope_validation") if isinstance(diagnostics, dict) else None
+        )
+        if isinstance(validation, dict):
+            source_scope_lines.append("- Source-scope application validation:")
+            source_scope_lines.append(f"  - Raw status: {validation.get('raw_status', 'n/a')}")
+            source_scope_lines.append(
+                f"  - Normalized status: {validation.get('normalized_status', 'n/a')}"
+            )
+            source_scope_lines.append(
+                f"  - Effective status: {validation.get('effective_status', 'n/a')}"
+            )
+            source_scope_lines.append(
+                f"  - Core scope unavailable: {validation.get('core_scope_unavailable', 'n/a')}"
+            )
+            source_scope_lines.append(
+                f"  - Writer blocked: {validation.get('writer_blocked', 'n/a')}"
+            )
+            unsupported = validation.get("unsupported_requested_topics", [])
+            source_scope_lines.append("  - Effective unsupported requested topics:")
+            if isinstance(unsupported, list) and unsupported:
+                source_scope_lines.extend(f"    - {topic}" for topic in unsupported)
+            else:
+                source_scope_lines.append("    - none identified")
+            conflicts = validation.get("conflicts", [])
+            source_scope_lines.append("  - Plan/source-scope conflicts:")
+            if isinstance(conflicts, list) and conflicts:
+                for conflict in conflicts:
+                    if not isinstance(conflict, dict):
+                        continue
+                    source_scope_lines.append(
+                        "    - "
+                        f"{conflict.get('unsupported_topic', 'n/a')} | "
+                        f"{conflict.get('plan_location', 'n/a')} | "
+                        f"overlap={conflict.get('overlap_terms', [])} | "
+                        f"text={conflict.get('plan_text', 'n/a')}"
+                    )
+            else:
+                source_scope_lines.append("    - none identified")
             source_scope_lines.append("- Normalized unsupported requested topics:")
             if isinstance(normalized, list) and normalized:
                 source_scope_lines.extend(f"  - {topic}" for topic in normalized)

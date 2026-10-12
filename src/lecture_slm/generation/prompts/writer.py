@@ -1,6 +1,6 @@
 """Final-artifact writer prompt construction."""
 
-from lecture_slm.generation.models import GenerationRequest, TeachingPlanBase
+from lecture_slm.generation.models import GenerationRequest, SourceScopeStatus, TeachingPlanBase
 from lecture_slm.generation.prompts.base import PromptPackage, json_block, request_blocks
 
 WRITER_PROMPT_VERSION = "writer-v11"
@@ -60,7 +60,10 @@ SOURCE_GROUNDING_INSTRUCTIONS = (
     "when partial, stay within "
     "supported_topics "
     "and do not fill unsupported_requested_topics, adding at most one concise scope note when "
-    "useful; when insufficient, do not create a substantive factual artifact."
+    "useful; when insufficient, do not create a substantive factual artifact. "
+    "If a requested topic is listed as unsupported by the effective source scope, "
+    "do not fill the gap using general knowledge, pretrained knowledge, or "
+    "plausible syntax."
 )
 
 
@@ -75,6 +78,21 @@ def build_writer_prompt(
         blocks.append(
             "## Writer task\nCreate the requested artifact directly. "
             "Do not provide a planning discussion."
+        )
+    if (
+        plan is not None
+        and plan.source_scope is not None
+        and plan.source_scope.status is SourceScopeStatus.PARTIAL
+        and plan.source_scope.unsupported_requested_topics
+    ):
+        unsupported_topics = "\n".join(
+            f"- {topic}" for topic in plan.source_scope.unsupported_requested_topics
+        )
+        blocks.append(
+            "## Unsupported requested topics - do not teach as facts\n"
+            f"{unsupported_topics}\n\n"
+            "Do not supply technical details, syntax, examples, definitions, or behavior for "
+            "these topics from pretrained/model knowledge. Omit or explicitly defer them."
         )
     return PromptPackage(
         version=WRITER_PROMPT_VERSION,

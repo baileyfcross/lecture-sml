@@ -22,6 +22,7 @@ from lecture_slm.generation.models import (
     GroundingReview,
     GroundingReviewerResponse,
     GroundingSupportMethod,
+    LecturePlan,
     PreviousCourseContext,
     SourceMaterial,
     SourceScopeAssessment,
@@ -42,6 +43,7 @@ from lecture_slm.generation.reviewer import (
     _factual_sentence_excerpts,
     _validate_claim_coverage,
     grounding_review_output_budget,
+    is_current_artifact_framing_claim,
     merge_grounding_review,
     prepare_grounding_claims,
 )
@@ -49,6 +51,7 @@ from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.generation.source_scope import (
     normalize_source_scope,
     normalize_source_scope_with_diagnostics,
+    validate_plan_against_source_scope,
 )
 from lecture_slm.generation.workspace_continuity import (
     MAX_CONTINUITY_SPANS_PER_CLAIM,
@@ -413,6 +416,43 @@ def sample_request(
             recently_taught_topics=["URLs"],
             not_yet_taught=["recursive DNS lookup details"],
         ),
+    )
+
+
+def sample_lecture_plan(
+    *,
+    source_scope: SourceScopeAssessment | None,
+    artifact_structure: list[str] | None = None,
+    notes_for_writer: list[str] | None = None,
+) -> LecturePlan:
+    return LecturePlan.model_validate(
+        {
+            "task": "lecture",
+            "artifact_structure": artifact_structure or ["objectives", "example", "practice"],
+            "source_scope": (
+                None if source_scope is None else source_scope.model_dump(mode="json")
+            ),
+            "objectives": ["Explain DNS name resolution."],
+            "prerequisites": ["domain names and IP addresses"],
+            "prior_knowledge_connections": ["URLs contain domain names"],
+            "concept_sequence": [
+                {
+                    "title": "Concrete lookup",
+                    "purpose": "Introduce DNS through an example.",
+                    "concepts": ["resolver", "IP address"],
+                    "learner_action": "Trace a lookup.",
+                }
+            ],
+            "worked_examples": [],
+            "misconceptions": ["DNS is the website itself."],
+            "guided_practice": [],
+            "independent_practice": [],
+            "formative_checks": ["What does DNS return?"],
+            "synthesis": ["Connect names to network addresses."],
+            "timing": [],
+            "source_coverage": ["Use supplied source only."],
+            "notes_for_writer": notes_for_writer or ["Keep this freshman-friendly."],
+        }
     )
 
 
@@ -1084,6 +1124,46 @@ def test_insufficient_source_scope_fails_before_writer_without_fallback(
     assert any("sources are insufficient" in error for error in result.errors)
 
 
+def test_plan_scope_conflict_blocks_writer_before_start(configs: tuple[Any, Any]) -> None:
+    model, profiles = configs
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["Interface implementation details", "Class libraries concept"],
+            unsupported_requested_topics=["Generic classes syntax and usage"],
+        ),
+        artifact_structure=[
+            "Declaring Type Parameters on Classes",
+            "Generic Constraints and Inheritance",
+        ],
+    )
+    planner_response = ChatResponse(
+        model="test-model",
+        content=plan.model_dump_json(),
+        prompt_tokens=1000,
+        completion_tokens=120,
+        total_duration_ns=1_000_000_000,
+        eval_duration_ns=500_000_000,
+        completion_reason="stop",
+    )
+    fake = FakeOllamaClient(planner_response=planner_response)
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE).model_copy(
+        update={"instruction": "Create a lecture on Generic Classes."}
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.writer_result is None
+    assert len(fake.requests) == 1
+    assert any("writer was not started" in error.casefold() for error in result.errors)
+    validation = request.metadata.get("source_scope_validation", {})
+    assert validation.get("effective_status") == "insufficient"
+    assert validation.get("core_scope_unavailable") is True
+    assert validation.get("writer_blocked") is True
+    assert validation.get("conflicts")
+
+
 @pytest.mark.parametrize(
     ("final_status", "expected_status", "writer_runs"),
     [
@@ -1165,7 +1245,7 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
     assert result.planner_initial_result.timing is not None
     assert result.planner_reassessment_result.timing is not None
     assert result.planner_initial_result.prompt_version == "planner-standard-v4"
-    assert result.planner_reassessment_result.prompt_version == "planner-reassessment-v1"
+    assert result.planner_reassessment_result.prompt_version == "planner-reassessment-v2"
     assert planner_requests[0]["think"] is False
     assert planner_requests[1]["think"] is False
     assert planner_requests[1]["options"]["temperature"] == 0
@@ -1198,7 +1278,7 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
         "planner-standard-v4"
     )
     assert diagnostics["planner_stages"]["planner_reassessment"]["prompt_version"] == (
-        "planner-reassessment-v1"
+        "planner-reassessment-v2"
     )
     assert "planner_initial_source_scope_normalization" in diagnostics
     assert "planner_reassessment_source_scope_normalization" in diagnostics
@@ -1424,7 +1504,7 @@ def test_reassessment_truncation_fails_closed_and_persists_initial_plan(
     saved_prompt = json.loads(
         (run_dir / "planner_reassessment_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_prompt["prompt_version"] == "planner-reassessment-v1"
+    assert saved_prompt["prompt_version"] == "planner-reassessment-v2"
     assert saved_prompt["thinking_enabled"] is False
     assert saved_prompt["generation_budget"] == 3072
     diagnostic_text = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
@@ -1868,6 +1948,54 @@ def test_presentation_label_does_not_strip_factual_qualifiers() -> None:
     assert unresolved[0].text == (
         "**Important Fact**: Predicate logic is essential to computer science."
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Today, we shift focus to Generic Classes.", True),
+        ("In this lecture, we will examine generic constraints.", True),
+        ("This section focuses on interfaces.", True),
+        ("Next, we will compare these two approaches.", True),
+        ("Last lecture covered Generic Methods.", False),
+        ("Next lecture will cover delegates.", False),
+        (
+            "Today, we study Generic Classes, which declare type parameters on the class itself.",
+            False,
+        ),
+    ],
+)
+def test_current_artifact_framing_gate(text: str, expected: bool) -> None:
+    assert is_current_artifact_framing_claim(text) is expected
+
+
+def test_current_artifact_framing_claims_are_deterministically_pedagogical() -> None:
+    request = sample_request(GenerationProfileName.STANDARD)
+    artifact = "Today, we shift focus to Generic Classes."
+
+    claims, direct, unresolved = prepare_grounding_claims(request, artifact)
+
+    assert [claim.claim_id for claim in claims] == ["C001"]
+    assert unresolved == []
+    assert len(direct) == 1
+    assert direct[0].classification is GroundingClaimClassification.PEDAGOGICAL
+    assert direct[0].support_method is GroundingSupportMethod.PEDAGOGICAL
+    assert direct[0].evidence_ids == []
+    assert direct[0].continuity_ids == []
+
+
+def test_mixed_current_artifact_and_factual_claim_does_not_bypass_grounding() -> None:
+    request = sample_request(GenerationProfileName.STANDARD)
+    artifact = (
+        "Today, we shift focus to Generic Classes, which declare type parameters on the class "
+        "definition."
+    )
+
+    _, direct, unresolved = prepare_grounding_claims(request, artifact)
+
+    assert direct == []
+    assert len(unresolved) == 1
+    assert unresolved[0].text == artifact
 
 
 def test_evidence_ledger_is_deterministic_and_ordered() -> None:
@@ -2919,6 +3047,83 @@ def test_source_scope_normalization_preserves_semantic_token_variant() -> None:
     assessment = normalize_source_scope(request, scope)
     assert assessment is not None
     assert assessment.unsupported_requested_topics == ["Task-Based Asynchronous Pattern"]
+
+
+def test_plan_scope_validation_rejects_generic_class_teaching_conflict() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE).model_copy(
+        update={"instruction": "Create a lecture on Generic Classes."}
+    )
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["Interface implementation details", "Class libraries concept"],
+            unsupported_requested_topics=["Generic classes syntax and usage"],
+        ),
+        artifact_structure=[
+            "Declaring Type Parameters on Classes",
+            "Generic Constraints and Inheritance",
+            "Comparing Generic Methods vs Generic Classes",
+        ],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is False
+    assert validation.core_scope_unavailable is True
+    assert validation.effective_status is SourceScopeStatus.INSUFFICIENT
+    assert validation.conflicts
+    assert any(
+        "Declaring Type Parameters on Classes" in conflict.plan_text
+        for conflict in validation.conflicts
+    )
+
+
+def test_plan_scope_validation_allows_narrowed_partial_scope() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE).model_copy(
+        update={
+            "instruction": (
+                "Create a lecture covering LINQ, async/await, and advanced cancellation patterns."
+            )
+        }
+    )
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["LINQ", "async/await"],
+            unsupported_requested_topics=["advanced cancellation patterns"],
+        ),
+        artifact_structure=["LINQ Query Basics", "Async Await Fundamentals"],
+        notes_for_writer=[
+            (
+                "Advanced cancellation patterns are outside the available source scope and will "
+                "not be covered."
+            )
+        ],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is True
+    assert validation.core_scope_unavailable is False
+    assert validation.effective_status is SourceScopeStatus.PARTIAL
+    assert validation.conflicts == []
+
+
+def test_plan_scope_validation_avoids_generic_term_false_positive() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE)
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["Class libraries"],
+            unsupported_requested_topics=["generic classes syntax"],
+        ),
+        artifact_structure=["Class libraries and namespaces"],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is True
+    assert validation.conflicts == []
 
 
 def test_zero_continuity_claims_select_no_workspace_spans() -> None:
@@ -4076,9 +4281,9 @@ def test_generation_run_persistence_is_opt_in_and_stage_separated(
     assert "- Generated tokens: 24" in diagnostics
     assert "- Stop reason: stop" in diagnostics
     assert "- Reviewer-supported claims: 1" in diagnostics
+    assert "- Current-artifact pedagogical claims: 0" in diagnostics
+    assert "- Continuity-supported claims: 0" in diagnostics
     assert "- Evidence validation failures / unknown evidence IDs: 0" in diagnostics
-    assert "- Continuity selected candidate details: []" in diagnostics
-    assert "- Continuity rejected structural-only candidates: 0" in diagnostics
     assert "- Coverage complete: yes" in diagnostics
 
 

@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -55,6 +56,8 @@ from lecture_slm.knowledge.resolution import SourceResolver
 from lecture_slm.knowledge.retrieval import (
     KnowledgeRetriever,
     _candidate_term_coverage,
+    _fusion_trace_entry,
+    _fusion_trace_ids,
     _query_term_coverage_boost,
     _query_terms,
     _term_coverage,
@@ -368,10 +371,77 @@ def test_metadata_section_retrieval_uses_title_then_heading(tmp_path: Path) -> N
     assert result.diagnostics["lexical_candidates"]
     assert result.diagnostics["semantic_candidates"]
     assert result.diagnostics["fused_candidates"]
+    fusion_trace = result.diagnostics["fusion_trace"]
+    assert 1 <= len(fusion_trace) <= 20
+    assert any(candidate["dense_rank"] is not None for candidate in fusion_trace)
+    assert all(
+        {
+            "lexical_rank",
+            "lexical_score",
+            "dense_rank",
+            "dense_score",
+            "lexical_rrf_contribution",
+            "dense_rrf_contribution",
+            "fused_rank",
+            "fused_score",
+            "selected",
+            "rejection_reason",
+        }.issubset(candidate)
+        for candidate in fusion_trace
+    )
+    assert any(candidate["selected"] for candidate in fusion_trace)
     assert any(
         details["exact_title"] and details["section"]
         for details in result.diagnostics["metadata_boosts"].values()
     )
+
+
+def test_fusion_trace_retains_dense_rank_two_and_explains_fusion_cutoff() -> None:
+    candidates: dict[str, dict[str, Any]] = {
+        "lexical-1": {"fused_rank": 1},
+        "dense-1": {"fused_rank": 2},
+        "dense-2": {"fused_rank": 21},
+    }
+    trace_ids = _fusion_trace_ids(
+        {"lexical-1": 1},
+        {"dense-1": 1, "dense-2": 2},
+        candidates,
+    )
+    assert "dense-2" in trace_ids
+
+    candidate = {
+        "row": {
+            "source_id": "source-dense-2",
+            "title": "C Sharp Interfaces Generics and Inheritance",
+            "active_path": "csharp-generics.md",
+            "section_title": "Generic interfaces",
+            "role": "content",
+        },
+        "lexical_rank": None,
+        "lexical_score": None,
+        "semantic_rank": 2,
+        "semantic_score": 0.708,
+        "lexical_rrf_contribution": 0.0,
+        "dense_rrf_contribution": 1 / 62,
+        "rrf_score": 1 / 62,
+        "fused_rank": 21,
+        "fused_score": 1 / 62,
+    }
+    trace = _fusion_trace_entry(
+        "dense-2",
+        candidate,
+        fused_candidate_limit=20,
+        selected=False,
+        neighbor_only=False,
+        rerank_rank=None,
+    )
+
+    assert trace["dense_rank"] == 2
+    assert trace["dense_score"] == pytest.approx(0.708)
+    assert trace["dense_rrf_contribution"] == pytest.approx(1 / 62)
+    assert trace["fused_rank"] == 21
+    assert trace["selected"] is False
+    assert trace["rejection_reason"] == "below_fused_cutoff"
 
 
 def test_unmatched_explicit_source_title_fails_closed(tmp_path: Path) -> None:

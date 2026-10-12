@@ -7,7 +7,7 @@ from lecture_slm.generation.prompts.base import PromptPackage, request_blocks
 
 PLANNER_PROMPT_VERSION = "planner-v3"
 STANDARD_PLANNER_PROMPT_VERSION = "planner-standard-v4"
-PLANNER_REASSESSMENT_PROMPT_VERSION = "planner-reassessment-v1"
+PLANNER_REASSESSMENT_PROMPT_VERSION = "planner-reassessment-v2"
 
 PLANNER_SYSTEM_PROMPT = (
     "You are the instructional planner for Lecture SLM. Reason about pedagogy, prerequisites, "
@@ -68,6 +68,16 @@ PLANNER_REASSESSMENT_SYSTEM_PROMPT = (
     "change. Reassess source coverage using the expanded sources, update factual portions only "
     "as needed, and add a previously unsupported requested topic only when these authoritative "
     "sources support it. Do not invent factual support. Ignore irrelevant retrieved topics. "
+    "Only SourceMaterial may establish domain facts, including explicit caller-provided factual "
+    "sources, Workspace Reference material, and retrieved global knowledge. Workspace Context "
+    "and History may establish course sequence, prior topics, student progress, and instructional "
+    "continuity, but they are not factual evidence for technical claims and must not fill factual "
+    "gaps identified by source_scope. Context and History must not establish syntax, API behavior, "
+    "algorithm behavior, technical definitions, historical facts, performance characteristics, "
+    "mechanisms, or implementation details unless explicitly promoted to Reference and supplied "
+    "as SourceMaterial. Keep unsupported requested topics unsupported when expanded "
+    "SourceMaterial does not establish them. Do not claim that course continuity supplies "
+    "missing factual details. "
     "Return the complete updated task-specific TeachingPlan JSON only. Do not explain your "
     "reasoning."
 )

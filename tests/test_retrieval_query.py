@@ -2,6 +2,7 @@ import pytest
 
 from lecture_slm.knowledge.query import (
     MAX_RETRIEVAL_EXPANSION_QUERIES,
+    build_factual_retrieval_query,
     build_retrieval_expansion_plan,
     canonicalize_retrieval_query,
 )
@@ -116,3 +117,92 @@ def test_empty_canonical_query_cannot_be_expanded() -> None:
 def test_punctuation_only_canonical_query_cannot_be_expanded() -> None:
     with pytest.raises(ValueError, match="empty canonical retrieval query"):
         build_retrieval_expansion_plan("!!!", ["topic"])
+
+
+def test_course_relative_generation_request_uses_concise_workspace_anchor() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Can you generate lecture 4 for the C# class?",
+        workspace_name="C# Class",
+        history_titles=["Lecture 3\n# C#.NET Fundamentals: Lecture 3 – Generic Methods"],
+    )
+
+    assert query.original == "Can you generate lecture 4 for the C# class?"
+    assert query.canonical == "C# Generic Methods"
+    assert diagnostics["query_terms"] == ["c#", "generic", "methods"]
+    assert diagnostics["workspace_anchor"] == {
+        "considered": True,
+        "applied": True,
+        "value": "C#",
+        "reason": "Request depends on the active course sequence.",
+    }
+
+
+def test_self_contained_factual_request_does_not_use_unrelated_workspace_anchor() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Can you explain quantum computing for me?",
+        workspace_name="Java 112",
+    )
+
+    assert query.canonical == "quantum computing"
+    assert diagnostics["workspace_anchor"] == {
+        "considered": True,
+        "applied": False,
+        "value": None,
+        "reason": "Request contains a self-contained factual topic.",
+    }
+
+
+def test_referential_request_uses_course_domain_and_recent_history_title() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Create the next lecture.",
+        workspace_name="C# Class",
+        history_titles=["Lecture 3\n# C#.NET Fundamentals: Lecture 3 – Generic Methods"],
+    )
+
+    assert query.canonical == "C# Generic Methods"
+    assert diagnostics["workspace_anchor"]["applied"] is True
+
+
+def test_expansion_queries_use_normalized_topics_and_domain_anchor() -> None:
+    plan = build_retrieval_expansion_plan(
+        "C# Generic Methods",
+        ["Generic classes syntax and usage"],
+        domain_anchor="C#",
+    )
+
+    assert plan.missing_topics == ["generic classes syntax usage"]
+    assert plan.domain_anchor == "C#"
+    assert plan.expansion_queries == [
+        "C# generic classes",
+        "C# generic classes syntax",
+        "C# generic classes usage",
+    ]
+    assert all("lecture" not in query.casefold() for query in plan.expansion_queries)
+
+
+def test_simple_gap_does_not_force_three_expansion_queries() -> None:
+    plan = build_retrieval_expansion_plan(
+        "C# Generic Methods",
+        ["generic classes"],
+        domain_anchor="C#",
+    )
+
+    assert plan.expansion_queries == ["C# generic classes"]
+
+
+def test_multiple_gaps_share_the_global_expansion_query_cap() -> None:
+    plan = build_retrieval_expansion_plan(
+        "C# Generic Methods",
+        [
+            "generic classes syntax and usage",
+            "generic constraints and inheritance",
+            "type parameters",
+        ],
+        domain_anchor="C#",
+    )
+
+    assert 1 <= len(plan.expansion_queries) <= MAX_RETRIEVAL_EXPANSION_QUERIES == 3
+    assert len(set(query.casefold() for query in plan.expansion_queries)) == len(
+        plan.expansion_queries
+    )
+    assert all(query.startswith("C# ") for query in plan.expansion_queries)

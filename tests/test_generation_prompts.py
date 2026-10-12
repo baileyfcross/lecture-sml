@@ -237,7 +237,12 @@ def test_planner_reassessment_prompt_preserves_plan_and_updates_scope_conservati
 
     prompt = build_planner_reassessment_prompt(request, initial_plan)
 
-    assert prompt.version == PLANNER_REASSESSMENT_PROMPT_VERSION == "planner-reassessment-v1"
+    assert prompt.version == PLANNER_REASSESSMENT_PROMPT_VERSION == "planner-reassessment-v2"
+    assert "Workspace Context and History" in prompt.system_message
+    assert "must not fill factual gaps identified by source_scope" in prompt.system_message
+    assert "Only SourceMaterial may establish domain facts" in prompt.system_message
+    assert "Workspace Reference material" in prompt.system_message
+    assert "retrieved global knowledge" in prompt.system_message
     assert "## Existing validated teaching plan" in prompt.user_message
     assert '"concept":"DNS maps names to network addresses."' in prompt.user_message
     assert "Supplied source material" in prompt.user_message
@@ -626,6 +631,62 @@ def test_writer_future_policy_limits_history_and_prioritizes_context() -> None:
     assert "delegates and lambdas' or" in prompt.system_message
 
 
+def test_writer_prompt_includes_explicit_partial_scope_unsupported_topics_block() -> None:
+    request = _request(with_source=True)
+    plan = ExplanationPlan(
+        task=TaskType.EXPLANATION,
+        artifact_structure=["concept", "example", "check"],
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["interface implementation"],
+            unsupported_requested_topics=["generic classes syntax and usage"],
+        ),
+        notes_for_writer=[],
+        concept="Interfaces define promised capabilities.",
+        assumed_knowledge=[],
+        explanation_sequence=["definition", "example"],
+        example="A comparer interface example.",
+        misconceptions=[],
+        check_for_understanding=["What does an interface promise?"],
+    )
+
+    prompt = build_writer_prompt(request, plan)
+
+    assert "Unsupported requested topics - do not teach as facts" in prompt.user_message
+    assert "- generic classes syntax and usage" in prompt.user_message
+    lowered = prompt.user_message.lower()
+    assert "do not supply technical details, syntax, examples, definitions, or behavior" in lowered
+    assert "omit or explicitly defer them" in lowered
+    assert "do not fill the gap using general knowledge, pretrained knowledge" in (
+        prompt.system_message
+    )
+
+
+def test_grounding_prompt_includes_source_scope_warning_topics() -> None:
+    request = _request(with_source=True).model_copy(
+        update={
+            "metadata": {
+                "source_scope_validation": {
+                    "unsupported_requested_topics": ["generic classes syntax and usage"]
+                }
+            }
+        }
+    )
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="A generic class declares type parameters using class Stack<T> syntax.",
+    )
+
+    prompt = build_grounding_review_prompt(request, [claim])
+
+    assert "Known unsupported requested topics from planning" in prompt.user_message
+    assert "generic classes syntax and usage" in prompt.user_message
+    assert "known evidence gaps" in prompt.user_message
+    assert "only when the evidence ledger explicitly establishes that specific claim" in (
+        prompt.user_message
+    )
+
+
 def test_grounding_reviewer_prompt_allows_direct_multi_span_entailment_safely() -> None:
     request = _request()
     prompt = build_grounding_review_prompt(
@@ -648,6 +709,10 @@ def test_grounding_reviewer_prompt_allows_direct_multi_span_entailment_safely() 
     assert "one overlapping topic does not support the other topics" in text
     assert "each one" in text
     assert "type modifiers and testing strategies" in text
+    assert "must establish every material factual assertion" in text
+    assert "same broad topic is not sufficient" in text
+    assert "class box<t>" in text
+    assert "class stack<t>" in text
     assert "[e001, e002]" in text
     assert "interface testing is essential to professional c# development" in text
     assert "unsupported unless evidence establishes" in text

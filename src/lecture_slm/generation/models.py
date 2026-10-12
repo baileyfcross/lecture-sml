@@ -513,6 +513,8 @@ class GroundingReviewRecord(BaseModel):
     review: GroundingReview | None = None
     timing: StageTiming | None = None
     claims_extracted: int | None = Field(default=None, ge=0)
+    current_artifact_pedagogical_count: int | None = Field(default=None, ge=0)
+    current_artifact_framing_claim_ids: list[str] = Field(default_factory=list)
     direct_supported_claim_count: int | None = Field(default=None, ge=0)
     unresolved_claim_count: int | None = Field(default=None, ge=0)
     review_output_budget: int | None = Field(default=None, ge=0)

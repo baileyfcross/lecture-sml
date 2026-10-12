@@ -25,8 +25,9 @@ class RetrievalExpansionPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     original_query: str = Field(min_length=1)
+    domain_anchor: str | None = None
     expansion_queries: list[str] = Field(default_factory=list, max_length=3)
-    missing_topics: list[str] = Field(default_factory=list, max_length=3)
+    missing_topics: list[str] = Field(default_factory=list)
 
 
 class KnowledgeChunk(BaseModel):

@@ -30,9 +30,30 @@ class KnowledgeContextAssembler:
         used_tokens = 0
         selected_chunk_ids: list[str] = []
         excluded_budget: list[str] = []
+        selection_trace: list[dict[str, str | bool]] = [
+            {
+                "source_id": match.source_id,
+                "chunk_id": match.chunk_id,
+                "source_title": match.source_title,
+                "selected": False,
+                "rejection_reason": "content_role_filtered",
+            }
+            for match in result.matches
+            if match.role.value not in eligible_roles
+        ]
         for group in groups:
             text = _merge_overlap([match.text for match in group])
             if not text.strip():
+                selection_trace.extend(
+                    {
+                        "source_id": match.source_id,
+                        "chunk_id": match.chunk_id,
+                        "source_title": match.source_title,
+                        "selected": False,
+                        "rejection_reason": "empty_content",
+                    }
+                    for match in group
+                )
                 continue
             section = group[0].section or (
                 f"Page {group[0].page_number}" if group[0].page_number else None
@@ -43,10 +64,30 @@ class KnowledgeContextAssembler:
             token_count = estimate_tokens_from_characters(rendered)
             if used_tokens + token_count > source_context_budget:
                 excluded_budget.extend(match.chunk_id for match in group)
+                selection_trace.extend(
+                    {
+                        "source_id": match.source_id,
+                        "chunk_id": match.chunk_id,
+                        "source_title": match.source_title,
+                        "selected": False,
+                        "rejection_reason": "assembly_limit",
+                    }
+                    for match in group
+                )
                 continue
             used_tokens += token_count
             first = group[0]
             selected_chunk_ids.extend(match.chunk_id for match in group)
+            selection_trace.extend(
+                {
+                    "source_id": match.source_id,
+                    "chunk_id": match.chunk_id,
+                    "source_title": match.source_title,
+                    "selected": True,
+                    "rejection_reason": "",
+                }
+                for match in group
+            )
             output.append(
                 SourceMaterial(
                     source_id=first.source_id,
@@ -101,6 +142,7 @@ class KnowledgeContextAssembler:
             "configured_budget": source_context_budget,
             "unused_budget": max(0, source_context_budget - used_tokens),
             "excluded_by_budget": excluded_budget,
+            "selection_trace": selection_trace,
         }
         return output
 

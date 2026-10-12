@@ -31,8 +31,8 @@ from lecture_slm.knowledge.models import (
     RetrievalTimings,
 )
 from lecture_slm.knowledge.query import (
+    build_factual_retrieval_query,
     build_retrieval_expansion_plan,
-    canonicalize_retrieval_query,
 )
 from lecture_slm.knowledge.retrieval import KnowledgeRetriever
 from lecture_slm.knowledge.storage import KnowledgeStore
@@ -64,8 +64,13 @@ def _match_diagnostic(match: RetrievalMatch) -> dict[str, object]:
         "source_title": match.source_title,
         "source_path": match.source_path,
         "section": match.section,
+        "lexical_rank": match.lexical_rank,
+        "lexical_score": match.lexical_score,
+        "dense_rank": match.semantic_rank,
+        "dense_score": match.semantic_score,
         "fused_rank": match.fused_rank,
         "fused_score": match.fused_score,
+        "role": match.role.value,
         "neighbor_of": match.neighbor_of,
     }
 
@@ -102,6 +107,11 @@ def _combined_assembly_diagnostics(
     excluded_by_budget = _diagnostic_strings(initial.get("excluded_by_budget", [])) + (
         _diagnostic_strings(expansion.get("excluded_by_budget", []))
     )
+    initial_selection = initial.get("selection_trace", [])
+    expansion_selection = expansion.get("selection_trace", [])
+    selection_trace = (initial_selection if isinstance(initial_selection, list) else []) + (
+        expansion_selection if isinstance(expansion_selection, list) else []
+    )
     estimated_tokens = initial_tokens + expansion_tokens
     return {
         "candidate_chunks": match_count,
@@ -115,6 +125,7 @@ def _combined_assembly_diagnostics(
         "configured_budget": configured_budget,
         "unused_budget": max(0, configured_budget - estimated_tokens),
         "excluded_by_budget": excluded_by_budget,
+        "selection_trace": selection_trace,
     }
 
 
@@ -127,19 +138,36 @@ def _merge_retrieval_results(
     matches = list(initial.matches)
     seen = {_match_identity(match) for match in matches}
     found_by_queries: dict[str, list[str]] = {}
+    merge_selection_by_query: dict[str, list[dict[str, object]]] = {}
     retrieved_count = 0
     unique_added_count = 0
     for query, result in expansions:
         retrieved_count += len(result.matches)
+        query_selection: list[dict[str, object]] = []
         for match in result.matches:
             identity = _match_identity(match)
             identity_key = f"{identity[0]}:{identity[1]}"
             found_by_queries.setdefault(identity_key, []).append(query)
             if identity in seen:
+                query_selection.append(
+                    {
+                        **_match_diagnostic(match),
+                        "selected": False,
+                        "rejection_reason": "deduplicated",
+                    }
+                )
                 continue
             seen.add(identity)
             matches.append(match)
             unique_added_count += 1
+            query_selection.append(
+                {
+                    **_match_diagnostic(match),
+                    "selected": True,
+                    "rejection_reason": "",
+                }
+            )
+        merge_selection_by_query[query] = query_selection
 
     all_results = [initial, *(result for _, result in expansions)]
     timing_values = {
@@ -156,11 +184,13 @@ def _merge_retrieval_results(
         deep=True,
     )
     merged.diagnostics["found_by_queries"] = found_by_queries
+    merged.diagnostics["expansion_merge_selection"] = merge_selection_by_query
     return merged, {
         "retrieved_count": retrieved_count,
         "unique_added_count": unique_added_count,
         "merged_match_count": len(matches),
         "found_by_queries": found_by_queries,
+        "merge_selection_by_query": merge_selection_by_query,
     }
 
 
@@ -251,17 +281,31 @@ class GenerationService:
             )
 
         if retrieval is not None and retrieval.enabled and knowledge_config is not None:
-            retrieval_query = canonicalize_retrieval_query(request.instruction)
-            effective_query = retrieval_query.canonical
-            if request.workspace_id is not None and active_request.workspace_context is not None:
-                effective_query = self.workspaces.anchor_retrieval_query(
-                    retrieval_query.canonical,
-                    active_request.workspace_context.workspace_name,
-                )
-            actual_retrieval_query = RetrievalQuery(
-                original=retrieval_query.original,
-                canonical=effective_query,
+            workspace_context = active_request.workspace_context
+            history_titles: list[str] = []
+            if workspace_context is not None:
+                for item in workspace_context.items:
+                    if item.role.value != "history":
+                        continue
+                    first_heading = next(
+                        (
+                            line.lstrip("# ").strip()
+                            for line in item.content.splitlines()
+                            if line.lstrip().startswith("#")
+                        ),
+                        "",
+                    )
+                    history_titles.append(
+                        "\n".join(part for part in (item.title, first_heading) if part)
+                    )
+            retrieval_query, query_intent = build_factual_retrieval_query(
+                request.instruction,
+                workspace_name=(
+                    None if workspace_context is None else workspace_context.workspace_name
+                ),
+                history_titles=history_titles,
             )
+            effective_query = retrieval_query.canonical
             remaining_source_budget = retrieval_budget - _source_material_tokens(
                 active_request.source_material
             )
@@ -271,7 +315,7 @@ class GenerationService:
                     request,
                     retrieval,
                     knowledge_config,
-                    query=actual_retrieval_query,
+                    query=retrieval_query,
                 )
             else:
                 retrieval_result = RetrievalResult(
@@ -288,11 +332,15 @@ class GenerationService:
             retrieval_result = retrieval_result.model_copy(
                 update={
                     "original_query": retrieval_query.original,
-                    "canonical_query": retrieval_query.canonical,
+                    "canonical_query": effective_query,
                 }
             )
-            if request.workspace_id is not None:
-                retrieval_result.diagnostics["workspace_anchored_query"] = effective_query
+            retrieval_result.diagnostics["query_intent"] = query_intent
+            anchor_info = query_intent.get("workspace_anchor")
+            anchor_applied = isinstance(anchor_info, dict) and bool(anchor_info.get("applied"))
+            retrieval_result.diagnostics["workspace_anchored_query"] = (
+                effective_query if anchor_applied else None
+            )
             retrieval_result.diagnostics["retrieval_rounds"] = [
                 {
                     "round": 1,
@@ -301,6 +349,7 @@ class GenerationService:
                     "retrieved_count": len(retrieval_result.matches),
                     "duration_seconds": initial_retrieval_seconds,
                     "results": [_match_diagnostic(match) for match in retrieval_result.matches],
+                    "fusion_trace": retrieval_result.diagnostics.get("fusion_trace", []),
                 }
             ]
             budget = retrieval_budget
@@ -313,6 +362,18 @@ class GenerationService:
                     retrieval_result,
                     source_context_budget=remaining_budget,
                 )
+                round_diagnostics = retrieval_result.diagnostics.get("retrieval_rounds", [])
+                if isinstance(round_diagnostics, list) and round_diagnostics:
+                    first_round = round_diagnostics[0]
+                    if isinstance(first_round, dict):
+                        first_round["context_assembly"] = retrieval_result.diagnostics.get(
+                            "context_assembly", {}
+                        )
+                        assembly = retrieval_result.diagnostics.get("context_assembly", {})
+                        if isinstance(assembly, dict):
+                            first_round["assembly_selection_trace"] = assembly.get(
+                                "selection_trace", []
+                            )
                 source_material.extend(retrieved_material)
             elif retrieval_result.matches:
                 retrieval_result.warnings.append(
@@ -334,14 +395,24 @@ class GenerationService:
                 ) -> GenerationRequest | None:
                     nonlocal expanded_request, retrieval_result
                     normalized_scope = normalize_source_scope(sourced_request, source_scope)
+                    anchor_info = query_intent.get("workspace_anchor", {})
+                    domain_anchor = (
+                        anchor_info.get("value")
+                        if isinstance(anchor_info, dict) and anchor_info.get("applied")
+                        else None
+                    )
                     plan = build_retrieval_expansion_plan(
                         retrieval_query.canonical,
                         []
                         if normalized_scope is None
                         else normalized_scope.unsupported_requested_topics,
+                        domain_anchor=domain_anchor if isinstance(domain_anchor, str) else None,
                     )
                     initial_diagnostics = dict(initial_retrieval_result.diagnostics)
                     initial_diagnostics["expansion_plan"] = plan.model_dump(mode="json")
+                    initial_diagnostics["expansion_scope"] = {
+                        "normalized_unsupported_topics": plan.missing_topics,
+                    }
                     if not plan.expansion_queries:
                         initial_retrieval_result.diagnostics.update(initial_diagnostics)
                         initial_retrieval_result.diagnostics["retrieval_expanded"] = False
@@ -357,20 +428,12 @@ class GenerationService:
                         _match_identity(match) for match in initial_retrieval_result.matches
                     }
                     for expansion_query in plan.expansion_queries:
-                        if (
-                            request.workspace_id is not None
-                            and active_request.workspace_context is not None
-                        ):
-                            expansion_query = self.workspaces.anchor_retrieval_query(
-                                expansion_query,
-                                active_request.workspace_context.workspace_name,
-                            )
                         result = self._retrieve(
                             request,
                             retrieval,
                             knowledge_config,
                             query=RetrievalQuery(
-                                original=retrieval_query.canonical,
+                                original=retrieval_query.original,
                                 canonical=expansion_query,
                             ),
                             top_k=EXPANSION_RESULTS_PER_QUERY,
@@ -396,9 +459,16 @@ class GenerationService:
                                     "results": [
                                         _match_diagnostic(match) for match in result.matches
                                     ],
+                                    "fusion_trace": result.diagnostics.get("fusion_trace", []),
+                                    "context_assembly": result.diagnostics.get(
+                                        "context_assembly", {}
+                                    ),
                                 }
                                 for query, result in expansion_results
                             ],
+                            "merge_selection_by_query": round_diagnostics.get(
+                                "merge_selection_by_query", {}
+                            ),
                             "retrieved_count": sum(
                                 len(result.matches) for _, result in expansion_results
                             ),
@@ -451,6 +521,9 @@ class GenerationService:
                     retrieval_result.diagnostics["retrieval_rounds"][-1][
                         "assembled_source_count"
                     ] = len(assembled_material)
+                    retrieval_result.diagnostics["retrieval_rounds"][-1][
+                        "assembly_selection_trace"
+                    ] = expansion_assembly.get("selection_trace", [])
                     updated_metadata = dict(sourced_request.metadata)
                     updated_metadata["knowledge_retrieval"] = retrieval_result.model_dump(
                         mode="json"

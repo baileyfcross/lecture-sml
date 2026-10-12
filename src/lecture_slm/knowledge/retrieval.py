@@ -23,6 +23,9 @@ from lecture_slm.knowledge.source_focus import SourceFocusKind, classify_source_
 from lecture_slm.knowledge.storage import KnowledgeStore
 from lecture_slm.knowledge.vector import SQLiteCosineSearch, VectorSearch
 
+_MAX_FUSION_TRACE_CANDIDATES = 20
+_MAX_FUSION_TRACE_PER_RETRIEVER = _MAX_FUSION_TRACE_CANDIDATES // 2
+
 
 class Reranker(Protocol):
     """Optional reranker contract, applied only to the fused shortlist."""
@@ -306,16 +309,29 @@ class KnowledgeRetriever:
             for rank, chunk_id in enumerate(
                 sorted(lexical_ranks, key=lambda item: (lexical_ranks[item], item)), start=1
             )
-        ]
+        ][:_MAX_FUSION_TRACE_CANDIDATES]
         semantic_diagnostics = [
             _candidate_diagnostic(chunk_id, candidates[chunk_id], rank, "semantic", query_terms)
             for rank, chunk_id in enumerate(
                 sorted(semantic_ranks, key=lambda item: (semantic_ranks[item], item)), start=1
             )
-        ]
+        ][:_MAX_FUSION_TRACE_CANDIDATES]
         boost_diagnostics: dict[str, dict[str, Any]] = {}
         for chunk_id, candidate in candidates.items():
-            score = fused_scores[chunk_id]
+            rrf_score = fused_scores[chunk_id]
+            lexical_rank = candidate["lexical_rank"]
+            semantic_rank = candidate["semantic_rank"]
+            lexical_rrf = (
+                1.0 / (rrf_constant + int(lexical_rank))
+                if request.mode == "hybrid" and lexical_rank is not None
+                else 0.0
+            )
+            dense_rrf = (
+                1.0 / (rrf_constant + int(semantic_rank))
+                if request.mode == "hybrid" and semantic_rank is not None
+                else 0.0
+            )
+            score = rrf_score
             row = candidate["row"]
             boosts: list[str] = []
             source_boost = bool(resolved_source_id and row["source_id"] == resolved_source_id)
@@ -363,9 +379,14 @@ class KnowledgeRetriever:
             }
             if focus_boost:
                 boosts.append("source_focus")
+            candidate["rrf_score"] = rrf_score
+            candidate["lexical_rrf_contribution"] = lexical_rrf
+            candidate["dense_rrf_contribution"] = dense_rrf
             candidate["fused_score"] = score
             fused.append((score, chunk_id, candidate))
         fused.sort(key=lambda item: (-item[0], item[1]))
+        for rank, (_, _, candidate) in enumerate(fused, start=1):
+            candidate["fused_rank"] = rank
         shortlist = fused[: self.config.fused_candidates]
         fused_diagnostics = [
             {
@@ -385,6 +406,9 @@ class KnowledgeRetriever:
                 "lexical_rank": candidate["lexical_rank"],
                 "semantic_rank": candidate["semantic_rank"],
                 "fused_rank": rank,
+                "rrf_score": candidate["rrf_score"],
+                "lexical_rrf_contribution": candidate["lexical_rrf_contribution"],
+                "dense_rrf_contribution": candidate["dense_rrf_contribution"],
                 "fused_score": score,
                 "boosts": [
                     name
@@ -410,6 +434,7 @@ class KnowledgeRetriever:
                 match.rerank_rank = rank
             rerank_seconds = time.perf_counter() - rerank_started
         matches = matches[:top_k]
+        final_selected_ids = {match.chunk_id for match in matches}
         expansion = (
             self.config.neighbor_expansion
             if request.neighbor_expansion is None
@@ -417,6 +442,7 @@ class KnowledgeRetriever:
         )
         if expansion:
             matches = self._expand_neighbors(matches, expansion)
+        neighbor_ids = {match.chunk_id for match in matches if match.neighbor_of is not None}
         neighbor_additions = [
             {
                 "chunk_id": match.chunk_id,
@@ -435,6 +461,25 @@ class KnowledgeRetriever:
                 match.neighbor_of is not None,
             )
         )
+        trace_ids = _fusion_trace_ids(
+            lexical_ranks,
+            semantic_ranks,
+            candidates,
+        )
+        fusion_trace = [
+            _fusion_trace_entry(
+                chunk_id,
+                candidates[chunk_id],
+                self.config.fused_candidates,
+                selected=chunk_id in final_selected_ids,
+                neighbor_only=chunk_id in neighbor_ids,
+                rerank_rank=next(
+                    (match.rerank_rank for match in matches if match.chunk_id == chunk_id),
+                    None,
+                ),
+            )
+            for chunk_id in trace_ids
+        ]
 
         timings = RetrievalTimings(
             source_resolution_seconds=resolution_seconds,
@@ -488,6 +533,7 @@ class KnowledgeRetriever:
                 "lexical_candidates": lexical_diagnostics,
                 "semantic_candidates": semantic_diagnostics,
                 "fused_candidates": fused_diagnostics,
+                "fusion_trace": fusion_trace,
                 "metadata_boosts": boost_diagnostics,
                 "neighbor_additions": neighbor_additions,
                 "final_chunk_ids": [match.chunk_id for match in matches],
@@ -672,6 +718,76 @@ def _candidate_diagnostic(
             candidate["lexical_score"] if source == "lexical" else candidate["semantic_score"]
         ),
         "query_term_coverage": _candidate_term_coverage(query_terms, row),
+    }
+
+
+def _fusion_trace_ids(
+    lexical_ranks: dict[str, int],
+    semantic_ranks: dict[str, int],
+    candidates: dict[str, dict[str, Any]],
+) -> list[str]:
+    selected: list[str] = []
+    for ranks in (lexical_ranks, semantic_ranks):
+        for chunk_id in sorted(ranks, key=lambda item: (ranks[item], item))[
+            :_MAX_FUSION_TRACE_PER_RETRIEVER
+        ]:
+            if chunk_id not in selected:
+                selected.append(chunk_id)
+    fused_order = sorted(
+        candidates,
+        key=lambda item: (int(candidates[item]["fused_rank"]), item),
+    )
+    for chunk_id in fused_order:
+        if len(selected) >= _MAX_FUSION_TRACE_CANDIDATES:
+            break
+        if chunk_id not in selected:
+            selected.append(chunk_id)
+    return selected[:_MAX_FUSION_TRACE_CANDIDATES]
+
+
+def _fusion_trace_entry(
+    chunk_id: str,
+    candidate: dict[str, Any],
+    fused_candidate_limit: int,
+    *,
+    selected: bool,
+    neighbor_only: bool,
+    rerank_rank: int | None,
+) -> dict[str, Any]:
+    row = candidate["row"]
+    fused_rank = int(candidate["fused_rank"])
+    if selected:
+        rejection_reason = None
+        selection_outcome = "selected"
+    elif fused_rank > fused_candidate_limit:
+        rejection_reason = "below_fused_cutoff"
+        selection_outcome = "rejected"
+    elif neighbor_only:
+        rejection_reason = "neighbor_only"
+        selection_outcome = "neighbor_only"
+    else:
+        rejection_reason = "below_final_results_cutoff"
+        selection_outcome = "rejected"
+    return {
+        "chunk_id": chunk_id,
+        "source_id": str(row["source_id"]),
+        "source_title": str(row["title"]),
+        "relative_path": str(row["active_path"] or row["note_path"]),
+        "section": row["section_title"],
+        "role": str(row["role"]),
+        "lexical_rank": candidate["lexical_rank"],
+        "lexical_score": candidate["lexical_score"],
+        "dense_rank": candidate["semantic_rank"],
+        "dense_score": candidate["semantic_score"],
+        "lexical_rrf_contribution": candidate["lexical_rrf_contribution"],
+        "dense_rrf_contribution": candidate["dense_rrf_contribution"],
+        "rrf_score": candidate["rrf_score"],
+        "fused_rank": fused_rank,
+        "fused_score": candidate["fused_score"],
+        "rerank_rank": rerank_rank,
+        "selected": selected,
+        "selection_outcome": selection_outcome,
+        "rejection_reason": rejection_reason,
     }
 
 
