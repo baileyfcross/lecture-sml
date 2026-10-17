@@ -42,6 +42,7 @@ from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import (
     _factual_sentence_excerpts,
     _validate_claim_coverage,
+    build_grounding_reviewer_response_schema,
     grounding_review_output_budget,
     is_current_artifact_framing_claim,
     merge_grounding_review,
@@ -49,6 +50,7 @@ from lecture_slm.generation.reviewer import (
 )
 from lecture_slm.generation.router import GenerationRouter
 from lecture_slm.generation.source_scope import (
+    canonicalize_source_scope_payload,
     normalize_source_scope,
     normalize_source_scope_with_diagnostics,
     validate_plan_against_source_scope,
@@ -567,7 +569,7 @@ def test_standard_calls_planner_then_writer_with_structured_context(
     assert result.writer_result is not None
     assert result.writer_result.timing.generated_tokens == 64
     assert result.writer_result.timing.potentially_truncated is False
-    assert result.metadata["planner_prompt_version"] == "planner-standard-v4"
+    assert result.metadata["planner_prompt_version"] == "planner-standard-v5"
     assert result.metadata["writer_prompt_version"] == "writer-v11"
     assert [event.stage for event in events] == [
         GenerationStage.PREPARING,
@@ -692,7 +694,7 @@ def test_deep_uses_larger_planner_and_context_tiers(configs: tuple[Any, Any]) ->
     assert fake.requests[0]["options"]["temperature"] == 0.5
     assert result.planner_result is not None
     assert result.planner_result.timing.selected_context == 8192
-    assert result.planner_result.prompt_version == "planner-v3"
+    assert result.planner_result.prompt_version == "planner-v4"
     assert result.planner_result.timing.thinking_enabled is True
     assert result.planner_result.timing.output_budget == 3072
     assert result.planner_result.timing.thinking_reserve_tokens == 3072
@@ -1131,6 +1133,7 @@ def test_plan_scope_conflict_blocks_writer_before_start(configs: tuple[Any, Any]
             status=SourceScopeStatus.PARTIAL,
             supported_topics=["Interface implementation details", "Class libraries concept"],
             unsupported_requested_topics=["Generic classes syntax and usage"],
+            core_unsupported_topics=["Generic classes syntax and usage"],
         ),
         artifact_structure=[
             "Declaring Type Parameters on Classes",
@@ -1162,6 +1165,98 @@ def test_plan_scope_conflict_blocks_writer_before_start(configs: tuple[Any, Any]
     assert validation.get("core_scope_unavailable") is True
     assert validation.get("writer_blocked") is True
     assert validation.get("conflicts")
+
+
+def test_source_scope_canonicalization_applies_to_initial_and_reassessment(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    raw_plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["DNS name resolution"],
+        )
+    ).model_dump(mode="json")
+    raw_scope = raw_plan["source_scope"]
+    assert isinstance(raw_scope, dict)
+    raw_scope["unsupported_requested_topics"] = ["DNSSEC", "DNSSEC"]
+    raw_scope["optional_unsupported_topics"] = [
+        " DNSSEC ",
+        " Enrichment ",
+        "ENRICHMENT",
+    ]
+    raw_response = json.dumps(raw_plan)
+    planner_response = ChatResponse(
+        model="test-model",
+        content=raw_response,
+        prompt_tokens=1000,
+        completion_tokens=120,
+        total_duration_ns=1_000_000_000,
+        eval_duration_ns=500_000_000,
+        completion_reason="stop",
+    )
+    fake = FakeOllamaClient(
+        planner_responses={1: planner_response, 2: planner_response},
+    )
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={"instruction": "Explain DNS and DNSSEC."}
+    )
+    expansion_calls: list[SourceScopeStatus] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        scope: SourceScopeAssessment,
+    ) -> GenerationRequest:
+        expansion_calls.append(scope.status)
+        return sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="dnssec-expansion",
+                        title="Expanded DNSSEC source",
+                        text="Additional DNSSEC source material.",
+                    ),
+                ]
+            }
+        )
+
+    result = make_pipeline(model, profiles, fake).route(
+        request,
+        expand_retrieval=expand,
+    )
+
+    initial = result.planner_initial_result
+    reassessment = result.planner_reassessment_result
+    assert result.status is GenerationStatus.COMPLETED
+    assert expansion_calls == [SourceScopeStatus.PARTIAL]
+    assert initial is not None and reassessment is not None
+    assert initial.raw_response == raw_response
+    assert reassessment.raw_response == raw_response
+    assert initial.source_scope_canonicalization["applied"] is True
+    assert reassessment.source_scope_canonicalization == (initial.source_scope_canonicalization)
+    canonical_topics = initial.source_scope_canonicalization["canonical_topics"]
+    assert isinstance(canonical_topics, dict)
+    assert canonical_topics["unsupported_requested_topics"] == ["DNSSEC"]
+    assert canonical_topics["optional_unsupported_topics"] == ["Enrichment"]
+    planner_requests = [
+        item
+        for item in fake.requests
+        if item["format"] is not None and item["format"].get("title") == "LecturePlan"
+    ]
+    assert len(planner_requests) == 2
+
+    run_directory = tmp_path / "canonicalization-run"
+    save_generation_run(run_directory, request, result)
+    persisted = json.loads((run_directory / "result.json").read_text(encoding="utf-8"))
+    assert (
+        persisted["planner_initial_result"]["source_scope_canonicalization"]
+        == initial.source_scope_canonicalization
+    )
+    diagnostics = (run_directory / "diagnostics.md").read_text(encoding="utf-8")
+    assert "Source-scope canonicalization applied: yes" in diagnostics
+    assert "DNSSEC" in diagnostics
 
 
 @pytest.mark.parametrize(
@@ -1244,8 +1339,8 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
     assert result.planner_reassessment_result is not None
     assert result.planner_initial_result.timing is not None
     assert result.planner_reassessment_result.timing is not None
-    assert result.planner_initial_result.prompt_version == "planner-standard-v4"
-    assert result.planner_reassessment_result.prompt_version == "planner-reassessment-v2"
+    assert result.planner_initial_result.prompt_version == "planner-standard-v5"
+    assert result.planner_reassessment_result.prompt_version == "planner-reassessment-v3"
     assert planner_requests[0]["think"] is False
     assert planner_requests[1]["think"] is False
     assert planner_requests[1]["options"]["temperature"] == 0
@@ -1275,10 +1370,10 @@ def test_partial_scope_expands_once_and_uses_final_assessment(
     assert diagnostics["source_scope_assessments"]["final"]["status"] == final_status
     assert len(diagnostics["retrieval_rounds"]) == 2
     assert diagnostics["planner_stages"]["planner_initial"]["prompt_version"] == (
-        "planner-standard-v4"
+        "planner-standard-v5"
     )
     assert diagnostics["planner_stages"]["planner_reassessment"]["prompt_version"] == (
-        "planner-reassessment-v2"
+        "planner-reassessment-v3"
     )
     assert "planner_initial_source_scope_normalization" in diagnostics
     assert "planner_reassessment_source_scope_normalization" in diagnostics
@@ -1504,7 +1599,7 @@ def test_reassessment_truncation_fails_closed_and_persists_initial_plan(
     saved_prompt = json.loads(
         (run_dir / "planner_reassessment_prompt.json").read_text(encoding="utf-8")
     )
-    assert saved_prompt["prompt_version"] == "planner-reassessment-v2"
+    assert saved_prompt["prompt_version"] == "planner-reassessment-v3"
     assert saved_prompt["thinking_enabled"] is False
     assert saved_prompt["generation_budget"] == 3072
     diagnostic_text = (run_dir / "diagnostics.md").read_text(encoding="utf-8")
@@ -2910,6 +3005,77 @@ def test_workspace_continuity_claim_gate(text: str, expected: bool) -> None:
     assert is_workspace_continuity_claim(text) is expected
 
 
+def test_source_scope_payload_canonicalization_respects_topic_precedence() -> None:
+    payload = {
+        "task": "lecture",
+        "source_scope": {
+            "status": "partial",
+            "supported_topics": ["supported topic"],
+            "unsupported_requested_topics": [" Requested  Topic ", "requested topic", ""],
+            "core_unsupported_topics": ["Core Topic", " core   topic "],
+            "optional_unsupported_topics": [
+                "requested topic",
+                " core topic ",
+                " Enrichment ",
+                "ENRICHMENT",
+            ],
+            "scope_note": "preserved",
+        },
+    }
+
+    canonical, diagnostics = canonicalize_source_scope_payload(payload)
+
+    assert isinstance(canonical, dict)
+    scope = canonical["source_scope"]
+    assert isinstance(scope, dict)
+    assert scope["supported_topics"] == ["supported topic"]
+    assert scope["unsupported_requested_topics"] == ["Requested  Topic", "Core Topic"]
+    assert scope["core_unsupported_topics"] == ["Core Topic"]
+    assert scope["optional_unsupported_topics"] == ["Enrichment"]
+    assert scope["scope_note"] == "preserved"
+    assert diagnostics["applied"] is True
+    assert diagnostics["raw_topics"] == {
+        "unsupported_requested_topics": [" Requested  Topic ", "requested topic", ""],
+        "core_unsupported_topics": ["Core Topic", " core   topic "],
+        "optional_unsupported_topics": [
+            "requested topic",
+            " core topic ",
+            " Enrichment ",
+            "ENRICHMENT",
+        ],
+    }
+    assert diagnostics["canonical_topics"] == {
+        "unsupported_requested_topics": ["Requested  Topic", "Core Topic"],
+        "core_unsupported_topics": ["Core Topic"],
+        "optional_unsupported_topics": ["Enrichment"],
+    }
+    repairs = diagnostics["repairs"]
+    assert isinstance(repairs, list)
+    assert any(repair["action"] == "added_core_topic" for repair in repairs)
+    assert any(repair["action"] == "removed_higher_priority_topic" for repair in repairs)
+    assert any(repair["action"] == "deduplicated" for repair in repairs)
+
+
+def test_source_scope_canonicalization_does_not_hide_supported_conflicts() -> None:
+    payload = {
+        "source_scope": {
+            "status": "partial",
+            "supported_topics": ["Quantum gates"],
+            "unsupported_requested_topics": [" quantum  gates "],
+        }
+    }
+
+    canonical, diagnostics = canonicalize_source_scope_payload(payload)
+
+    assert isinstance(canonical, dict)
+    scope = canonical["source_scope"]
+    assert isinstance(scope, dict)
+    assert scope["supported_topics"] == ["Quantum gates"]
+    assert diagnostics["applied"] is True
+    with pytest.raises(ValidationError, match="supported_topics must not duplicate"):
+        SourceScopeAssessment.model_validate(scope)
+
+
 def test_source_scope_normalization_drops_irrelevant_requested_topics() -> None:
     request = sample_request(GenerationProfileName.STANDARD).model_copy(
         update={
@@ -2932,7 +3098,7 @@ def test_source_scope_normalization_drops_irrelevant_requested_topics() -> None:
         supported_topics=["generic methods"],
         unsupported_requested_topics=[
             "a source-derived topic copied from retrieved notes",
-            "generic methods",
+            "generic methods syntax",
         ],
     )
     assessment = normalize_source_scope(
@@ -2940,7 +3106,7 @@ def test_source_scope_normalization_drops_irrelevant_requested_topics() -> None:
         scope,
     )
     assert assessment is not None
-    assert assessment.unsupported_requested_topics == ["generic methods"]
+    assert assessment.unsupported_requested_topics == ["generic methods syntax"]
     assert assessment.supported_topics == ["generic methods"]
 
 
@@ -3049,6 +3215,139 @@ def test_source_scope_normalization_preserves_semantic_token_variant() -> None:
     assert assessment.unsupported_requested_topics == ["Task-Based Asynchronous Pattern"]
 
 
+def test_source_scope_normalization_preserves_core_topic_without_lexical_overlap() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION).model_copy(
+        update={"instruction": "Can you explain quantum computing for me?"}
+    )
+    core_topic = "fundamental qubit concepts and superposition"
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["quantum computing overview"],
+        unsupported_requested_topics=[core_topic],
+        core_unsupported_topics=[core_topic],
+        optional_unsupported_topics=["quantum error correction fundamentals"],
+    )
+
+    assessment, diagnostics = normalize_source_scope_with_diagnostics(request, scope)
+
+    assert assessment is not None
+    assert assessment.unsupported_requested_topics == [core_topic]
+    assert assessment.core_unsupported_topics == [core_topic]
+    assert assessment.optional_unsupported_topics == ["quantum error correction fundamentals"]
+    assert diagnostics["preserved_core_topics_without_lexical_overlap"] == [core_topic]
+    assert diagnostics["removed_unsupported_topics"] == []
+
+
+def test_optional_only_source_scope_is_sufficient_and_does_not_promote_enrichment() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.EXPLANATION).model_copy(
+        update={"instruction": "Explain quantum computing."}
+    )
+    scope = SourceScopeAssessment(
+        status=SourceScopeStatus.PARTIAL,
+        supported_topics=["qubits", "measurement"],
+        optional_unsupported_topics=["Shor's algorithm", "quantum error correction"],
+    )
+
+    assessment = normalize_source_scope(request, scope)
+
+    assert assessment is not None
+    assert assessment.status is SourceScopeStatus.SUFFICIENT
+    assert assessment.unsupported_requested_topics == []
+    assert assessment.core_unsupported_topics == []
+    assert assessment.optional_unsupported_topics == [
+        "Shor's algorithm",
+        "quantum error correction",
+    ]
+
+
+def test_final_core_gap_blocks_writer_even_when_plan_omits_missing_topic(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    core_topic = "fundamental qubit concepts and superposition"
+    plan = ExplanationPlan(
+        task=TaskType.EXPLANATION,
+        artifact_structure=["Supported quantum-computing overview"],
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["quantum computing overview"],
+            unsupported_requested_topics=[core_topic],
+            core_unsupported_topics=[core_topic],
+            optional_unsupported_topics=["quantum error correction"],
+        ),
+        concept="A source-grounded overview",
+        assumed_knowledge=[],
+        explanation_sequence=["Introduce supported material"],
+        example="A supported example",
+        misconceptions=[],
+        check_for_understanding=["Summarize the supported idea."],
+    )
+    planner_response = ChatResponse(
+        model="test-model",
+        content=plan.model_dump_json(),
+        prompt_tokens=1000,
+        completion_tokens=120,
+        total_duration_ns=1_000_000_000,
+        eval_duration_ns=500_000_000,
+        completion_reason="stop",
+    )
+    fake = FakeOllamaClient(
+        source_scope_statuses=["partial", "partial"],
+        planner_responses={1: planner_response, 2: planner_response},
+    )
+    request = GenerationRequest(
+        task=TaskType.EXPLANATION,
+        instruction="Can you explain quantum computing for me?",
+        source_material=[
+            SourceMaterial(
+                source_id="quantum-intro",
+                title="Quantum computing overview",
+                text="An introductory source about quantum computing.",
+            )
+        ],
+        metadata={
+            "knowledge_retrieval": {
+                "diagnostics": {"retrieval_rounds": [{"round": 1, "type": "initial"}]}
+            }
+        },
+    )
+    expanded_requests: list[GenerationRequest] = []
+
+    def expand(
+        sourced_request: GenerationRequest,
+        source_scope: SourceScopeAssessment,
+    ) -> GenerationRequest:
+        assert source_scope.core_unsupported_topics == [core_topic]
+        expanded = sourced_request.model_copy(
+            update={
+                "source_material": [
+                    *sourced_request.source_material,
+                    SourceMaterial(
+                        source_id="quantum-expanded",
+                        title="Expanded overview",
+                        text="Additional source material.",
+                    ),
+                ]
+            }
+        )
+        expanded_requests.append(expanded)
+        return expanded
+
+    result = make_pipeline(model, profiles, fake).route(request, expand_retrieval=expand)
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.planner_reassessment_result is not None
+    assert result.writer_result is None
+    assert len([item for item in fake.requests if item["format"] is not None]) == 2
+    validation = expanded_requests[0].metadata["source_scope_validation"]
+    assert validation["effective_status"] == "insufficient"
+    assert validation["core_scope_unavailable"] is True
+    assert validation["core_unsupported_topics"] == [core_topic]
+    assert validation["optional_unsupported_topics"] == ["quantum error correction"]
+    assert validation["writer_blocked"] is True
+    assert validation["conflicts"] == []
+
+
 def test_plan_scope_validation_rejects_generic_class_teaching_conflict() -> None:
     request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE).model_copy(
         update={"instruction": "Create a lecture on Generic Classes."}
@@ -3058,6 +3357,7 @@ def test_plan_scope_validation_rejects_generic_class_teaching_conflict() -> None
             status=SourceScopeStatus.PARTIAL,
             supported_topics=["Interface implementation details", "Class libraries concept"],
             unsupported_requested_topics=["Generic classes syntax and usage"],
+            core_unsupported_topics=["Generic classes syntax and usage"],
         ),
         artifact_structure=[
             "Declaring Type Parameters on Classes",
@@ -3118,6 +3418,88 @@ def test_plan_scope_validation_avoids_generic_term_false_positive() -> None:
             unsupported_requested_topics=["generic classes syntax"],
         ),
         artifact_structure=["Class libraries and namespaces"],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is True
+    assert validation.conflicts == []
+
+
+@pytest.mark.parametrize(
+    ("unsupported", "plan_fragment"),
+    [
+        (
+            "quantum error correction fundamentals",
+            "quantum annealing as a computational paradigm",
+        ),
+        ("general quantum algorithms", "quantum simulation for physical systems"),
+    ],
+)
+def test_plan_scope_validation_ignores_single_shared_domain_word(
+    unsupported: str,
+    plan_fragment: str,
+) -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE)
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["introductory concepts"],
+            unsupported_requested_topics=[unsupported],
+        ),
+        artifact_structure=[plan_fragment],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is True
+    assert validation.conflicts == []
+
+
+def test_plan_scope_validation_requires_two_meaningful_overlaps_for_multi_term_topic() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE)
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["introductory concepts"],
+            unsupported_requested_topics=["standard quantum gates and circuit models"],
+        ),
+        artifact_structure=["Compare quantum gate models and circuit execution"],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is False
+    assert any(len(conflict.overlap_terms) >= 2 for conflict in validation.conflicts)
+
+
+def test_plan_scope_validation_keeps_one_word_specific_topic_conflict() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE)
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["introductory concepts"],
+            unsupported_requested_topics=["entanglement"],
+        ),
+        artifact_structure=["Introduce entanglement"],
+    )
+
+    validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
+
+    assert validation.valid is False
+    assert any(conflict.overlap_terms == ["entanglement"] for conflict in validation.conflicts)
+
+
+def test_optional_topics_are_excluded_from_plan_conflict_validation() -> None:
+    request = sample_request(GenerationProfileName.STANDARD, TaskType.LECTURE)
+    plan = sample_lecture_plan(
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            supported_topics=["introductory concepts"],
+            unsupported_requested_topics=["hardware specifications"],
+            optional_unsupported_topics=["quantum error correction"],
+        ),
+        artifact_structure=["Quantum error correction principles"],
     )
 
     validation = validate_plan_against_source_scope(request, plan, raw_scope=plan.source_scope)
@@ -3652,8 +4034,9 @@ def test_final_grounding_review_recalculates_budget_after_revision(
         revision_output=revised_output,
         grounding_responses=[json.dumps({"claims": initial_claims})],
     )
+    request = sample_request(GenerationProfileName.DEEP)
 
-    result = make_pipeline(model, profiles, fake).route(sample_request(GenerationProfileName.DEEP))
+    result = make_pipeline(model, profiles, fake).route(request)
 
     assert result.status is GenerationStatus.COMPLETED
     assert result.initial_grounding_review is not None
@@ -3668,6 +4051,16 @@ def test_final_grounding_review_recalculates_budget_after_revision(
         if item["format"] is not None and item["format"].get("title") == "GroundingReviewerResponse"
     ]
     assert [item["options"]["num_predict"] for item in review_requests] == [8192, 4096]
+    assert len(review_requests) == 2
+    assert fake.grounding_response_count == 2
+    expected_evidence_ids = [span.evidence_id for span in build_evidence_ledger(request)]
+    for review_request in review_requests:
+        reviewer_schema = review_request["format"]
+        assert isinstance(reviewer_schema, dict)
+        supported_schema = reviewer_schema["$defs"]["SupportedReviewerClaim"]
+        assert (
+            supported_schema["properties"]["evidence_ids"]["items"]["enum"] == expected_evidence_ids
+        )
 
 
 @pytest.mark.parametrize(
@@ -3710,6 +4103,107 @@ def test_fabricated_or_uncited_reviewer_evidence_fails_closed(
     assert review.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
     assert review.evidence_validation_failures == 1
     assert review.issues[0].claim_id == "C001"
+
+
+def test_supported_reviewer_schema_uses_only_ids_from_the_current_ledger() -> None:
+    request = sample_request(GenerationProfileName.STANDARD).model_copy(
+        update={
+            "source_material": [
+                SourceMaterial(
+                    source_id="first-source",
+                    title="First source",
+                    text=(
+                        "First source establishes one fact. Second source establishes one fact. "
+                        "Third source establishes one fact."
+                    ),
+                ),
+                SourceMaterial(
+                    source_id="second-source",
+                    title="Second source",
+                    text=(
+                        "First second-source fact. Second second-source fact. "
+                        "Third second-source fact. Relevant evidence supports this claim."
+                    ),
+                ),
+            ]
+        }
+    )
+    evidence_ledger = build_evidence_ledger(request)
+    allowed_evidence_ids = [span.evidence_id for span in evidence_ledger]
+    assert allowed_evidence_ids == [
+        "S01-E001",
+        "S01-E002",
+        "S01-E003",
+        "S02-E001",
+        "S02-E002",
+        "S02-E003",
+        "S02-E004",
+    ]
+
+    schema = build_grounding_reviewer_response_schema(evidence_ledger)
+    supported_ids = schema["$defs"]["SupportedReviewerClaim"]["properties"]["evidence_ids"][
+        "items"
+    ]["enum"]
+    assert supported_ids == allowed_evidence_ids
+    assert "S02-E004" in supported_ids
+    assert "S01-E004" not in supported_ids
+
+    claim = GroundingClaimInput(
+        claim_id="C001",
+        text="Relevant evidence supports this claim.",
+    )
+
+    def merge_response(cited_ids: list[str]) -> GroundingReview:
+        response = GroundingReviewerResponse.model_validate(
+            {
+                "claims": [
+                    {
+                        "claim_id": "C001",
+                        "classification": "supported",
+                        "evidence_ids": cited_ids,
+                    }
+                ]
+            }
+        )
+        return merge_grounding_review([claim], [], response, evidence_ledger)
+
+    valid = merge_response(["S02-E004"])
+    assert valid.decision is GroundingDecision.PASS
+    assert valid.claim_assessments[0].classification is GroundingClaimClassification.SUPPORTED
+    assert valid.evidence_validation_failures == 0
+
+    multiple_valid = merge_response(["S01-E002", "S02-E004"])
+    assert multiple_valid.decision is GroundingDecision.PASS
+    assert multiple_valid.claim_assessments[0].evidence_ids == ["S01-E002", "S02-E004"]
+
+    fabricated = merge_response(["S01-E004"])
+    assert fabricated.decision is GroundingDecision.REVISION_REQUIRED
+    assert (
+        fabricated.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    )
+    assert fabricated.evidence_validation_failures == 1
+
+    mixed = merge_response(["S02-E004", "S99-E999"])
+    assert mixed.decision is GroundingDecision.REVISION_REQUIRED
+    assert mixed.claim_assessments[0].classification is GroundingClaimClassification.UNSUPPORTED
+    assert mixed.evidence_validation_failures == 1
+
+
+def test_empty_evidence_schema_disables_supported_claims_without_changing_other_branches() -> None:
+    schema = build_grounding_reviewer_response_schema([])
+    claims_schema = schema["properties"]["claims"]["items"]
+    references = [variant["$ref"] for variant in claims_schema["oneOf"]]
+
+    assert "#/$defs/SupportedReviewerClaim" not in references
+    assert "supported" not in claims_schema["discriminator"]["mapping"]
+    assert "SupportedReviewerClaim" not in schema["$defs"]
+    assert "#/$defs/PedagogicalReviewerClaim" in references
+    assert "#/$defs/UnsupportedReviewerClaim" in references
+    pedagogical_ids = schema["$defs"]["PedagogicalReviewerClaim"]["properties"]["evidence_ids"]
+    assert pedagogical_ids["minItems"] == pedagogical_ids["maxItems"] == 0
+    unsupported = schema["$defs"]["UnsupportedReviewerClaim"]["properties"]
+    assert unsupported["reason"]["minLength"] == 1
+    assert unsupported["evidence_ids"]["minItems"] == unsupported["evidence_ids"]["maxItems"] == 0
 
 
 def test_global_ledger_preserves_direct_supported_pedagogical_and_unsupported_claims() -> None:

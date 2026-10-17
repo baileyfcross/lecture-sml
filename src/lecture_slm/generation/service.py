@@ -407,6 +407,11 @@ class GenerationService:
                         if normalized_scope is None
                         else normalized_scope.unsupported_requested_topics,
                         domain_anchor=domain_anchor if isinstance(domain_anchor, str) else None,
+                        core_topics=(
+                            []
+                            if normalized_scope is None
+                            else normalized_scope.core_unsupported_topics
+                        ),
                     )
                     initial_diagnostics = dict(initial_retrieval_result.diagnostics)
                     initial_diagnostics["expansion_plan"] = plan.model_dump(mode="json")

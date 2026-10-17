@@ -178,6 +178,7 @@ def build_retrieval_expansion_plan(
     missing_topics: list[str],
     *,
     domain_anchor: str | None = None,
+    core_topics: list[str] | None = None,
 ) -> RetrievalExpansionPlan:
     """Build up to three compact factual variants from normalized unsupported topics."""
 
@@ -193,6 +194,10 @@ def build_retrieval_expansion_plan(
         if cleaned and key not in seen_topics:
             topics.append(cleaned)
             seen_topics.add(key)
+    core_keys = {
+        _clean_topic(topic).casefold() for topic in core_topics or [] if _clean_topic(topic)
+    }
+    topics.sort(key=lambda topic: topic.casefold() not in core_keys)
 
     candidates: list[str] = []
     for topic in topics:

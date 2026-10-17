@@ -136,6 +136,26 @@ def _stage_diagnostic(name: str, record: StageRecord | None, *, used: bool) -> l
         ]
     )
     lines.extend(f"- {label}: {value if value is not None else 'n/a'}" for label, value in values)
+    canonicalization = {} if record is None else record.source_scope_canonicalization
+    if canonicalization:
+        lines.extend(
+            [
+                "- Source-scope canonicalization applied: "
+                f"{'yes' if canonicalization.get('applied') else 'no'}",
+                "- Source-scope raw topic lists: `"
+                + json.dumps(canonicalization.get("raw_topics", {}), separators=(",", ":"))
+                + "`",
+                "- Source-scope canonical topic lists: `"
+                + json.dumps(
+                    canonicalization.get("canonical_topics", {}),
+                    separators=(",", ":"),
+                )
+                + "`",
+                "- Source-scope canonicalization repairs: `"
+                + json.dumps(canonicalization.get("repairs", []), separators=(",", ":"))
+                + "`",
+            ]
+        )
     return lines
 
 
@@ -371,6 +391,8 @@ def _write_diagnostics(
                     for topic_label, topic_key in (
                         ("supported", "supported_topics"),
                         ("unsupported", "unsupported_requested_topics"),
+                        ("core unsupported", "core_unsupported_topics"),
+                        ("optional unsupported", "optional_unsupported_topics"),
                     ):
                         topics = assessment.get(topic_key)
                         if isinstance(topics, list):
@@ -457,6 +479,16 @@ def _write_diagnostics(
         )
         if not source_scope.unsupported_requested_topics:
             source_scope_lines.append("  - none identified")
+        source_scope_lines.append("- Core unsupported topics:")
+        source_scope_lines.extend(f"  - {topic}" for topic in source_scope.core_unsupported_topics)
+        if not source_scope.core_unsupported_topics:
+            source_scope_lines.append("  - none identified")
+        source_scope_lines.append("- Optional unsupported topics:")
+        source_scope_lines.extend(
+            f"  - {topic}" for topic in source_scope.optional_unsupported_topics
+        )
+        if not source_scope.optional_unsupported_topics:
+            source_scope_lines.append("  - none identified")
         if source_scope.scope_note:
             source_scope_lines.append(f"- Scope note: {source_scope.scope_note}")
     if isinstance(retrieval_diagnostics, dict):
@@ -465,14 +497,30 @@ def _write_diagnostics(
             diagnostics.get("source_scope_normalization") if isinstance(diagnostics, dict) else None
         )
         if isinstance(normalization, dict):
+            raw_supported = normalization.get("raw_supported_topics", [])
             raw = normalization.get("raw_unsupported_requested_topics", [])
+            raw_core = normalization.get("raw_core_unsupported_topics", [])
+            raw_optional = normalization.get("raw_optional_unsupported_topics", [])
             normalized = normalization.get("normalized_unsupported_requested_topics", [])
+            normalized_core = normalization.get("normalized_core_unsupported_topics", [])
+            optional = normalization.get("optional_unsupported_topics", [])
             removed = normalization.get("removed_unsupported_topics", [])
-            source_scope_lines.append("- Raw unsupported requested topics:")
-            if isinstance(raw, list) and raw:
-                source_scope_lines.extend(f"  - {topic}" for topic in raw)
-            else:
-                source_scope_lines.append("  - none identified")
+            preserved_core = normalization.get("preserved_core_topics_without_lexical_overlap", [])
+            for label, topics in (
+                ("Raw supported topics", raw_supported),
+                ("Raw unsupported requested topics", raw),
+                ("Raw core unsupported topics", raw_core),
+                ("Raw optional unsupported topics", raw_optional),
+                ("Normalized unsupported requested topics", normalized),
+                ("Normalized core unsupported topics", normalized_core),
+                ("Optional unsupported topics", optional),
+                ("Core topics preserved without lexical overlap", preserved_core),
+            ):
+                source_scope_lines.append(f"- {label}:")
+                if isinstance(topics, list) and topics:
+                    source_scope_lines.extend(f"  - {topic}" for topic in topics)
+                else:
+                    source_scope_lines.append("  - none identified")
         validation = (
             diagnostics.get("source_scope_validation") if isinstance(diagnostics, dict) else None
         )
@@ -512,11 +560,6 @@ def _write_diagnostics(
                     )
             else:
                 source_scope_lines.append("    - none identified")
-            source_scope_lines.append("- Normalized unsupported requested topics:")
-            if isinstance(normalized, list) and normalized:
-                source_scope_lines.extend(f"  - {topic}" for topic in normalized)
-            else:
-                source_scope_lines.append("  - none identified")
             source_scope_lines.append("- Removed unsupported topics:")
             if isinstance(removed, list) and removed:
                 source_scope_lines.extend(

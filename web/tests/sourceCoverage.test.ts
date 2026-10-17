@@ -11,6 +11,8 @@ describe("renderSourceCoverage", () => {
       status: "partial",
       supported_topics: ["quantum annealing"],
       unsupported_requested_topics: ["error correction"],
+      core_unsupported_topics: [],
+      optional_unsupported_topics: [],
       scope_note:
         "The available materials support quantum annealing, but not a complete treatment of error correction.",
     };
@@ -39,6 +41,8 @@ describe("renderSourceCoverage", () => {
       status: "partial",
       supported_topics: ["quantum annealing"],
       unsupported_requested_topics: ["error correction"],
+      core_unsupported_topics: [],
+      optional_unsupported_topics: [],
       scope_note: null,
     };
 

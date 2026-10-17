@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from lecture_slm.generation.grounding_evidence import build_evidence_ledger
 from lecture_slm.generation.models import (
     ExplanationPlan,
@@ -204,8 +207,8 @@ def test_quick_writer_prompt_uses_same_source_grounding_policy() -> None:
 
 
 def test_sourced_planner_limits_factual_scope_and_allows_pedagogical_structure() -> None:
-    assert PLANNER_PROMPT_VERSION == "planner-v3"
-    assert STANDARD_PLANNER_PROMPT_VERSION == "planner-standard-v4"
+    assert PLANNER_PROMPT_VERSION == "planner-v4"
+    assert STANDARD_PLANNER_PROMPT_VERSION == "planner-standard-v5"
     for concise, expected_version in (
         (False, PLANNER_PROMPT_VERSION),
         (True, STANDARD_PLANNER_PROMPT_VERSION),
@@ -213,6 +216,13 @@ def test_sourced_planner_limits_factual_scope_and_allows_pedagogical_structure()
         prompt = build_planner_prompt(_request(), concise=concise)
 
         _contains_planner_source_policy(prompt.system_message)
+        assert "core_unsupported_topics" in prompt.system_message
+        assert "optional_unsupported_topics" in prompt.system_message
+        assert "useful as retrieval queries" in prompt.system_message
+        assert "Optional entries must not appear in unsupported_requested_topics" in (
+            prompt.system_message
+        )
+        assert "Optional gaps do not make scope partial or insufficient" in prompt.system_message
         assert "Supplied source material" in prompt.user_message
         assert prompt.version == expected_version
 
@@ -237,7 +247,7 @@ def test_planner_reassessment_prompt_preserves_plan_and_updates_scope_conservati
 
     prompt = build_planner_reassessment_prompt(request, initial_plan)
 
-    assert prompt.version == PLANNER_REASSESSMENT_PROMPT_VERSION == "planner-reassessment-v2"
+    assert prompt.version == PLANNER_REASSESSMENT_PROMPT_VERSION == "planner-reassessment-v3"
     assert "Workspace Context and History" in prompt.system_message
     assert "must not fill factual gaps identified by source_scope" in prompt.system_message
     assert "Only SourceMaterial may establish domain facts" in prompt.system_message
@@ -252,6 +262,12 @@ def test_planner_reassessment_prompt_preserves_plan_and_updates_scope_conservati
         prompt.system_message.lower()
     )
     assert "ignore irrelevant retrieved topics" in prompt.system_message.lower()
+    assert "core_unsupported_topics" in prompt.system_message
+    assert "optional_unsupported_topics" in prompt.system_message
+    assert "Optional gaps never make scope partial or insufficient" in prompt.system_message
+    assert "Optional entries must not appear in unsupported_requested_topics" in (
+        prompt.system_message
+    )
     assert "Previously unsupported requested topics" in prompt.user_message
     assert "Additional retrieval has now occurred" in prompt.user_message
     assert "complete updated TeachingPlan" in prompt.user_message
@@ -271,6 +287,32 @@ def test_source_scope_schema_and_serialization() -> None:
     }
     assert scope_schema["properties"]["supported_topics"]["type"] == "array"
     assert scope_schema["properties"]["unsupported_requested_topics"]["type"] == "array"
+    assert scope_schema["properties"]["core_unsupported_topics"]["type"] == "array"
+    assert scope_schema["properties"]["optional_unsupported_topics"]["type"] == "array"
+    assert "exactly match" in scope_schema["properties"]["core_unsupported_topics"]["description"]
+
+    old_scope = SourceScopeAssessment.model_validate(
+        {
+            "status": "partial",
+            "supported_topics": ["DNS"],
+            "unsupported_requested_topics": ["DNSSEC"],
+            "scope_note": "DNSSEC is not covered.",
+        }
+    )
+    assert old_scope.core_unsupported_topics == []
+    assert old_scope.optional_unsupported_topics == []
+    with pytest.raises(ValidationError, match="core_unsupported_topics must match"):
+        SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            unsupported_requested_topics=["entanglement"],
+            core_unsupported_topics=["quantum error correction"],
+        )
+    with pytest.raises(ValidationError, match="must not duplicate"):
+        SourceScopeAssessment(
+            status=SourceScopeStatus.PARTIAL,
+            unsupported_requested_topics=["qubits"],
+            optional_unsupported_topics=["QUBITS"],
+        )
 
     plan = ExplanationPlan(
         task=TaskType.EXPLANATION,

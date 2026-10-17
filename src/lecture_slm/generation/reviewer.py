@@ -4,7 +4,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import ValidationError
 
@@ -60,6 +60,28 @@ def grounding_review_output_budget(unresolved_claim_count: int) -> int:
     if unresolved_claim_count > GROUNDING_REVIEW_LARGE_CLAIM_THRESHOLD:
         return GROUNDING_REVIEW_LARGE_OUTPUT_TOKENS
     return GROUNDING_REVIEW_NORMAL_OUTPUT_TOKENS
+
+
+def build_grounding_reviewer_response_schema(
+    evidence_ledger: list[EvidenceSpan],
+) -> dict[str, Any]:
+    """Constrain supported claims to IDs in this review's deterministic evidence ledger."""
+    schema = GroundingReviewerResponse.model_json_schema()
+    claims_schema = schema["properties"]["claims"]["items"]
+    allowed_evidence_ids = list(dict.fromkeys(span.evidence_id for span in evidence_ledger))
+    if allowed_evidence_ids:
+        schema["$defs"]["SupportedReviewerClaim"]["properties"]["evidence_ids"]["items"]["enum"] = (
+            allowed_evidence_ids
+        )
+    else:
+        claims_schema["oneOf"] = [
+            variant
+            for variant in claims_schema["oneOf"]
+            if variant.get("$ref") != "#/$defs/SupportedReviewerClaim"
+        ]
+        claims_schema["discriminator"]["mapping"].pop("supported")
+        schema["$defs"].pop("SupportedReviewerClaim")
+    return schema
 
 
 @dataclass(frozen=True)
@@ -856,7 +878,7 @@ class GroundingStageRunner:
                 },
                 think=False,
                 keep_alive=self.model_config.inference.keep_alive,
-                format=GroundingReviewerResponse.model_json_schema(),
+                format=build_grounding_reviewer_response_schema(evidence_ledger),
             )
             reviewer_response = _normalize_grounding_review(response.content)
             review = merge_grounding_review(

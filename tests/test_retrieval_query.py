@@ -109,6 +109,38 @@ def test_expansion_query_count_is_bounded_to_three() -> None:
     ]
 
 
+def test_expansion_queries_prioritize_core_topics_over_optional_and_noncore_gaps() -> None:
+    plan = build_retrieval_expansion_plan(
+        "quantum computing",
+        [
+            "quantum error correction",
+            "hardware overview",
+            "qubits and superposition",
+            "measurement and entanglement",
+            "gates and circuit models",
+        ],
+        core_topics=[
+            "qubits and superposition",
+            "measurement and entanglement",
+            "gates and circuit models",
+        ],
+    )
+
+    assert plan.missing_topics == [
+        "qubits superposition",
+        "measurement entanglement",
+        "gates circuit models",
+        "quantum error correction",
+        "hardware overview",
+    ]
+    assert plan.expansion_queries == [
+        "quantum computing qubits superposition",
+        "quantum computing measurement entanglement",
+        "quantum computing gates circuit models",
+    ]
+    assert len(plan.expansion_queries) == MAX_RETRIEVAL_EXPANSION_QUERIES
+
+
 def test_empty_canonical_query_cannot_be_expanded() -> None:
     with pytest.raises(ValueError, match="empty canonical retrieval query"):
         build_retrieval_expansion_plan("  ", ["topic"])

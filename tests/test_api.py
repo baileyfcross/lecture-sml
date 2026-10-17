@@ -353,6 +353,8 @@ def test_generate_response_includes_source_coverage_assessment() -> None:
         "status": "partial",
         "supported_topics": ["quantum annealing"],
         "unsupported_requested_topics": ["error correction"],
+        "core_unsupported_topics": [],
+        "optional_unsupported_topics": [],
         "scope_note": (
             "The available materials support quantum annealing, but not a complete "
             "treatment of error correction."

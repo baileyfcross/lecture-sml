@@ -21,6 +21,7 @@ from lecture_slm.generation.prompts.planner import (
     build_planner_prompt,
     build_planner_reassessment_prompt,
 )
+from lecture_slm.generation.source_scope import canonicalize_source_scope_payload
 from lecture_slm.generation.timing import detect_output_limit
 from lecture_slm.inference.ollama_client import ChatResponse, OllamaClient, OllamaError
 
@@ -144,6 +145,7 @@ class Planner:
         last_error: Exception | None = None
         last_timing: StageTiming | None = None
         last_response: ChatResponse | None = None
+        last_source_scope_canonicalization: dict[str, object] = {}
         plan_schema = plan_schema_for_task(request.task)
 
         for _attempt in range(settings.retry_count + 1):
@@ -182,16 +184,30 @@ class Planner:
                     thinking_enabled=settings.think,
                 )
                 last_timing = attempt_timing
-                plan = validate_plan_for_task(
-                    request.task,
-                    response.content,
-                    require_source_scope=bool(request.source_material),
-                )
+                last_source_scope_canonicalization = {}
+                try:
+                    parsed_payload = json.loads(response.content)
+                except json.JSONDecodeError:
+                    plan = validate_plan_for_task(
+                        request.task,
+                        response.content,
+                        require_source_scope=bool(request.source_material),
+                    )
+                else:
+                    canonical_payload, last_source_scope_canonicalization = (
+                        canonicalize_source_scope_payload(parsed_payload)
+                    )
+                    plan = validate_plan_for_task(
+                        request.task,
+                        json.dumps(canonical_payload, ensure_ascii=False),
+                        require_source_scope=bool(request.source_material),
+                    )
                 return StageRecord(
                     status=GenerationStatus.COMPLETED,
                     timing=last_timing,
                     raw_response=last_raw,
                     plan=plan,
+                    source_scope_canonicalization=last_source_scope_canonicalization,
                     prompt_version=prompt.version,
                 )
             except (OllamaError, ValidationError, json.JSONDecodeError, ValueError) as error:
@@ -250,6 +266,7 @@ class Planner:
                 generation_budget=generation_budget,
             ),
             raw_response=last_raw,
+            source_scope_canonicalization=last_source_scope_canonicalization,
             prompt_version=prompt.version,
             error_type=type(last_error).__name__ if last_error else "PlannerError",
             error_message=str(last_error) if last_error else "Planner failed without details",

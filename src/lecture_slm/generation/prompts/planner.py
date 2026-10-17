@@ -5,9 +5,9 @@ import json
 from lecture_slm.generation.models import GenerationRequest, TaskTeachingPlan
 from lecture_slm.generation.prompts.base import PromptPackage, request_blocks
 
-PLANNER_PROMPT_VERSION = "planner-v3"
-STANDARD_PLANNER_PROMPT_VERSION = "planner-standard-v4"
-PLANNER_REASSESSMENT_PROMPT_VERSION = "planner-reassessment-v2"
+PLANNER_PROMPT_VERSION = "planner-v4"
+STANDARD_PLANNER_PROMPT_VERSION = "planner-standard-v5"
+PLANNER_REASSESSMENT_PROMPT_VERSION = "planner-reassessment-v3"
 
 PLANNER_SYSTEM_PROMPT = (
     "You are the instructional planner for Lecture SLM. Reason about pedagogy, prerequisites, "
@@ -41,7 +41,20 @@ SOURCE_GROUNDING_INSTRUCTIONS = (
     "constraints such as format, audience, duration, and requested number of slides where "
     "feasible. You may create pedagogical structures such as an introduction, worked example, "
     "guided practice, check for understanding, summary, transitions, and hypothetical examples "
-    "that teach supported concepts without adding unsupported facts."
+    "that teach supported concepts without adding unsupported facts. In source_scope, "
+    "supported_topics lists facts established by SourceMaterial; unsupported_requested_topics "
+    "lists only missing facts "
+    "needed for the user's actual request; core_unsupported_topics is the indispensable subset; "
+    "copy core entries exactly from unsupported_requested_topics and mark a topic core only if "
+    "the artifact would be inadequate without it; "
+    "optional_unsupported_topics lists useful but unnecessary enrichment. Core topics may be "
+    "foundational even when not literally named, while explicitly requested major topics are "
+    "requested and generally core. Optional entries must not appear in "
+    "unsupported_requested_topics. "
+    "Do not broaden requested scope from retrieved sources or optional teaching ideas. Keep topic "
+    "strings concise, self-contained, factual, and useful as retrieval queries. Optional gaps do "
+    "not "
+    "make scope partial or insufficient."
 )
 
 
@@ -77,7 +90,17 @@ PLANNER_REASSESSMENT_SYSTEM_PROMPT = (
     "mechanisms, or implementation details unless explicitly promoted to Reference and supplied "
     "as SourceMaterial. Keep unsupported requested topics unsupported when expanded "
     "SourceMaterial does not establish them. Do not claim that course continuity supplies "
-    "missing factual details. "
+    "missing factual details. In source_scope, keep supported_topics grounded in SourceMaterial; "
+    "unsupported_requested_topics contains only missing facts needed for the user's actual "
+    "request; "
+    "core_unsupported_topics contains only exact entries from unsupported_requested_topics that "
+    "are indispensable; optional_unsupported_topics is useful but unnecessary enrichment. Preserve "
+    "foundational core topics even if not literally named; explicitly requested major topics are "
+    "requested and generally core. Optional entries must not appear in "
+    "unsupported_requested_topics. "
+    "Do not broaden scope from retrieved sources or optional teaching ideas. Keep topic strings "
+    "concise, self-contained, factual, and useful as retrieval queries. Optional gaps never make "
+    "scope partial or insufficient. "
     "Return the complete updated task-specific TeachingPlan JSON only. Do not explain your "
     "reasoning."
 )

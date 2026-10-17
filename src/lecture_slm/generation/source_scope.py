@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TypeGuard
 
 from lecture_slm.generation.models import (
     GenerationRequest,
@@ -114,6 +115,8 @@ class SourceScopePlanValidation:
     raw_status: SourceScopeStatus | None
     normalized_status: SourceScopeStatus | None
     effective_status: SourceScopeStatus | None
+    core_unsupported_topics: list[str]
+    optional_unsupported_topics: list[str]
 
     def diagnostics(self) -> dict[str, object]:
         return {
@@ -126,6 +129,8 @@ class SourceScopePlanValidation:
             ),
             "valid": self.valid,
             "core_scope_unavailable": self.core_scope_unavailable,
+            "core_unsupported_topics": self.core_unsupported_topics,
+            "optional_unsupported_topics": self.optional_unsupported_topics,
             "conflicts": [
                 {
                     "unsupported_topic": conflict.unsupported_topic,
@@ -136,6 +141,114 @@ class SourceScopePlanValidation:
                 for conflict in self.conflicts
             ],
         }
+
+
+_SOURCE_SCOPE_TOPIC_LISTS = (
+    "unsupported_requested_topics",
+    "core_unsupported_topics",
+    "optional_unsupported_topics",
+)
+
+
+def _is_string_list(value: object) -> TypeGuard[list[str]]:
+    return isinstance(value, list) and all(isinstance(topic, str) for topic in value)
+
+
+def _source_topic_key(topic: str) -> str:
+    return " ".join(topic.split()).casefold()
+
+
+def _canonicalize_topic_list(
+    field: str,
+    topics: list[str],
+) -> tuple[list[str], list[dict[str, str]]]:
+    canonical: list[str] = []
+    repairs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for topic in topics:
+        trimmed = topic.strip()
+        if not trimmed:
+            repairs.append({"list": field, "topic": topic, "action": "removed_blank"})
+            continue
+        if trimmed != topic:
+            repairs.append({"list": field, "topic": topic, "action": "trimmed"})
+        key = _source_topic_key(trimmed)
+        if key in seen:
+            repairs.append({"list": field, "topic": topic, "action": "deduplicated"})
+            continue
+        seen.add(key)
+        canonical.append(trimmed)
+    return canonical, repairs
+
+
+def canonicalize_source_scope_payload(
+    payload: object,
+) -> tuple[object, dict[str, object]]:
+    """Repair only hierarchy and list-shape conflicts in a Planner JSON payload."""
+    if not isinstance(payload, dict):
+        return payload, {}
+    source_scope = payload.get("source_scope")
+    if not isinstance(source_scope, dict):
+        return payload, {}
+
+    raw_topics = {field: source_scope.get(field, []) for field in _SOURCE_SCOPE_TOPIC_LISTS}
+    if not all(_is_string_list(topics) for topics in raw_topics.values()):
+        return payload, {
+            "applied": False,
+            "raw_topics": raw_topics,
+            "canonical_topics": raw_topics,
+            "repairs": [],
+        }
+
+    canonical_lists: dict[str, list[str]] = {}
+    repairs: list[dict[str, str]] = []
+    for field in _SOURCE_SCOPE_TOPIC_LISTS:
+        topics = raw_topics[field]
+        if _is_string_list(topics):
+            canonical_lists[field], field_repairs = _canonicalize_topic_list(field, topics)
+            repairs.extend(field_repairs)
+
+    canonical_requested = canonical_lists["unsupported_requested_topics"]
+    requested_keys = {_source_topic_key(topic) for topic in canonical_requested}
+    for topic in canonical_lists["core_unsupported_topics"]:
+        key = _source_topic_key(topic)
+        if key not in requested_keys:
+            canonical_requested.append(topic)
+            requested_keys.add(key)
+            repairs.append(
+                {
+                    "list": "unsupported_requested_topics",
+                    "topic": topic,
+                    "action": "added_core_topic",
+                }
+            )
+
+    canonical_optional: list[str] = []
+    for topic in canonical_lists["optional_unsupported_topics"]:
+        if _source_topic_key(topic) in requested_keys:
+            repairs.append(
+                {
+                    "list": "optional_unsupported_topics",
+                    "topic": topic,
+                    "action": "removed_higher_priority_topic",
+                }
+            )
+            continue
+        canonical_optional.append(topic)
+    canonical_lists["optional_unsupported_topics"] = canonical_optional
+
+    canonical_scope = dict(source_scope)
+    for field, topics in canonical_lists.items():
+        if field in source_scope or topics:
+            canonical_scope[field] = topics
+    canonical_payload = dict(payload)
+    canonical_payload["source_scope"] = canonical_scope
+    return canonical_payload, {
+        "applied": bool(repairs),
+        "raw_topics": raw_topics,
+        "canonical_topics": canonical_lists,
+        "repairs": repairs,
+    }
 
 
 def _normalize_text(text: str) -> str:
@@ -237,30 +350,61 @@ def normalize_source_scope_with_diagnostics(
 ) -> tuple[SourceScopeAssessment | None, dict[str, object]]:
     if source_scope is None:
         return None, {
+            "raw_supported_topics": [],
             "raw_unsupported_requested_topics": [],
+            "raw_core_unsupported_topics": [],
+            "raw_optional_unsupported_topics": [],
             "normalized_unsupported_requested_topics": [],
+            "normalized_core_unsupported_topics": [],
+            "optional_unsupported_topics": [],
             "removed_unsupported_topics": [],
+            "preserved_core_topics_without_lexical_overlap": [],
         }
 
     scope = build_requested_scope_terms(request)
     raw_topics = list(source_scope.unsupported_requested_topics)
+    raw_core_topics = list(source_scope.core_unsupported_topics)
+    core_keys = {topic.strip().casefold() for topic in raw_core_topics}
     kept_topics: list[str] = []
     removed_topics: list[dict[str, str]] = []
+    preserved_core_topics: list[str] = []
     for topic in raw_topics:
-        if _topic_matches_requested_scope(topic, scope):
+        is_core = topic.strip().casefold() in core_keys
+        if is_core:
+            if not _topic_matches_requested_scope(topic, scope):
+                preserved_core_topics.append(topic)
             kept_topics.append(topic)
-            continue
-        removed_topics.append(
-            {
-                "topic": topic,
-                "reason": "No overlap with authoritative requested/course scope.",
-            }
-        )
-    normalized = source_scope.model_copy(update={"unsupported_requested_topics": kept_topics})
+        elif _topic_matches_requested_scope(topic, scope):
+            kept_topics.append(topic)
+        else:
+            removed_topics.append(
+                {
+                    "topic": topic,
+                    "reason": "No overlap with authoritative requested/course scope.",
+                }
+            )
+    kept_keys = {topic.strip().casefold() for topic in kept_topics}
+    kept_core_topics = [topic for topic in raw_core_topics if topic.strip().casefold() in kept_keys]
+    status = source_scope.status
+    if not kept_topics and source_scope.optional_unsupported_topics:
+        status = SourceScopeStatus.SUFFICIENT
+    normalized = source_scope.model_copy(
+        update={
+            "status": status,
+            "unsupported_requested_topics": kept_topics,
+            "core_unsupported_topics": kept_core_topics,
+        }
+    )
     return normalized, {
+        "raw_supported_topics": list(source_scope.supported_topics),
         "raw_unsupported_requested_topics": raw_topics,
+        "raw_core_unsupported_topics": raw_core_topics,
+        "raw_optional_unsupported_topics": list(source_scope.optional_unsupported_topics),
         "normalized_unsupported_requested_topics": kept_topics,
+        "normalized_core_unsupported_topics": kept_core_topics,
+        "optional_unsupported_topics": list(source_scope.optional_unsupported_topics),
         "removed_unsupported_topics": removed_topics,
+        "preserved_core_topics_without_lexical_overlap": preserved_core_topics,
     }
 
 
@@ -339,47 +483,15 @@ def _topic_plan_overlap(topic: str, fragment_text: str) -> list[str]:
         return sorted(overlap or (topic_terms & fragment_terms))
 
     overlap = _meaningful_terms(topic_terms) & _meaningful_terms(fragment_terms)
-    if overlap:
-        return sorted(overlap)
-
     generic_class_overlap = _generic_class_scope_conflict(topic_terms, fragment_text)
     if generic_class_overlap:
         return generic_class_overlap
+    meaningful_topic_terms = _meaningful_terms(topic_terms)
+    if len(meaningful_topic_terms) == 1:
+        return sorted(overlap)
+    if len(overlap) >= 2:
+        return sorted(overlap)
     return []
-
-
-def _is_core_scope_unavailable(
-    request: GenerationRequest,
-    plan: TaskTeachingPlan,
-    conflicts: list[SourceScopePlanConflict],
-) -> bool:
-    if not conflicts:
-        return False
-    instruction_terms = _meaningful_terms(_normalized_tokens(request.instruction))
-    conflicted_topics = {conflict.unsupported_topic for conflict in conflicts}
-    for topic in conflicted_topics:
-        topic_terms = _meaningful_terms(_normalized_tokens(topic))
-        if topic_terms and topic_terms & instruction_terms:
-            return True
-
-    substantial_fragments = [
-        fragment
-        for path, fragment in _iter_plan_text_fragments(plan.model_dump(mode="json"))
-        if path.startswith("plan.artifact_structure")
-        or path.startswith("plan.objectives")
-        or path.startswith("plan.concept_sequence")
-        or path.startswith("plan.slide_sequence")
-        or path.startswith("plan.steps")
-        or path.startswith("plan.questions")
-    ]
-    if not substantial_fragments:
-        substantial_fragments = [
-            fragment for _, fragment in _iter_plan_text_fragments(plan.model_dump(mode="json"))
-        ]
-    if not substantial_fragments:
-        return False
-    conflict_ratio = len(conflicts) / len(substantial_fragments)
-    return len(conflicts) >= 2 and conflict_ratio >= 0.3
 
 
 def validate_plan_against_source_scope(
@@ -391,11 +503,7 @@ def validate_plan_against_source_scope(
     raw_status = None if raw_scope is None else raw_scope.status
     normalized_scope = plan.source_scope
     normalized_status = None if normalized_scope is None else normalized_scope.status
-    if (
-        normalized_scope is None
-        or normalized_scope.status is not SourceScopeStatus.PARTIAL
-        or not normalized_scope.unsupported_requested_topics
-    ):
+    if normalized_scope is None:
         effective_status = normalized_status
         return SourceScopePlanValidation(
             valid=True,
@@ -404,40 +512,48 @@ def validate_plan_against_source_scope(
             raw_status=raw_status,
             normalized_status=normalized_status,
             effective_status=effective_status,
+            core_unsupported_topics=[],
+            optional_unsupported_topics=[],
         )
 
-    fragments = _iter_plan_text_fragments(plan.model_dump(mode="json"))
+    core_scope_unavailable = bool(normalized_scope.core_unsupported_topics)
     conflicts: list[SourceScopePlanConflict] = []
     seen_conflicts: set[tuple[str, str, str]] = set()
-    for location, fragment_text in fragments:
-        if _is_deferral_fragment(fragment_text):
-            continue
-        for topic in normalized_scope.unsupported_requested_topics:
-            overlap_terms = _topic_plan_overlap(topic, fragment_text)
-            if not overlap_terms:
+    if (
+        normalized_scope.status is SourceScopeStatus.PARTIAL
+        and normalized_scope.unsupported_requested_topics
+    ):
+        fragments = _iter_plan_text_fragments(plan.model_dump(mode="json"))
+        for location, fragment_text in fragments:
+            if _is_deferral_fragment(fragment_text):
                 continue
-            key = (topic, location, fragment_text.casefold())
-            if key in seen_conflicts:
-                continue
-            seen_conflicts.add(key)
-            conflicts.append(
-                SourceScopePlanConflict(
-                    unsupported_topic=topic,
-                    plan_location=location,
-                    plan_text=fragment_text,
-                    overlap_terms=overlap_terms,
+            for topic in normalized_scope.unsupported_requested_topics:
+                overlap_terms = _topic_plan_overlap(topic, fragment_text)
+                if not overlap_terms:
+                    continue
+                key = (topic, location, fragment_text.casefold())
+                if key in seen_conflicts:
+                    continue
+                seen_conflicts.add(key)
+                conflicts.append(
+                    SourceScopePlanConflict(
+                        unsupported_topic=topic,
+                        plan_location=location,
+                        plan_text=fragment_text,
+                        overlap_terms=overlap_terms,
+                    )
                 )
-            )
 
-    core_scope_unavailable = _is_core_scope_unavailable(request, plan, conflicts)
     effective_status = (
         SourceScopeStatus.INSUFFICIENT if core_scope_unavailable else normalized_scope.status
     )
     return SourceScopePlanValidation(
-        valid=not conflicts,
+        valid=not conflicts and not core_scope_unavailable,
         conflicts=conflicts,
         core_scope_unavailable=core_scope_unavailable,
         raw_status=raw_status,
         normalized_status=normalized_status,
         effective_status=effective_status,
+        core_unsupported_topics=list(normalized_scope.core_unsupported_topics),
+        optional_unsupported_topics=list(normalized_scope.optional_unsupported_topics),
     )

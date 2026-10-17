@@ -122,6 +122,8 @@ export interface SourceCoverage {
   status: "sufficient" | "partial" | "insufficient";
   supported_topics: string[];
   unsupported_requested_topics: string[];
+  core_unsupported_topics: string[];
+  optional_unsupported_topics: string[];
   scope_note: string | null;
 }
 

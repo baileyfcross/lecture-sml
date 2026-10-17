@@ -104,7 +104,38 @@ class SourceScopeAssessment(BaseModel):
     status: SourceScopeStatus
     supported_topics: list[str] = Field(default_factory=list)
     unsupported_requested_topics: list[str] = Field(default_factory=list)
+    core_unsupported_topics: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Indispensable topics; each entry must exactly match unsupported_requested_topics."
+        ),
+    )
+    optional_unsupported_topics: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Useful enrichment only; entries must not appear in unsupported_requested_topics."
+        ),
+    )
     scope_note: str | None = None
+
+    @model_validator(mode="after")
+    def validate_topic_categories(self) -> Self:
+        def topic_key(topic: str) -> str:
+            return " ".join(topic.split()).casefold()
+
+        supported = {topic_key(topic) for topic in self.supported_topics}
+        requested = {topic_key(topic) for topic in self.unsupported_requested_topics}
+        core = {topic_key(topic) for topic in self.core_unsupported_topics}
+        optional = {topic_key(topic) for topic in self.optional_unsupported_topics}
+        if supported & requested:
+            raise ValueError("supported_topics must not duplicate unsupported_requested_topics")
+        if not core.issubset(requested):
+            raise ValueError("core_unsupported_topics must match unsupported_requested_topics")
+        if optional & requested:
+            raise ValueError(
+                "optional_unsupported_topics must not duplicate unsupported_requested_topics"
+            )
+        return self
 
 
 class GenerationRequest(BaseModel):
@@ -283,6 +314,7 @@ class StageRecord(BaseModel):
     timing: StageTiming | None = None
     raw_response: str | None = None
     plan: TaskTeachingPlan | None = None
+    source_scope_canonicalization: dict[str, object] = Field(default_factory=dict)
     prompt_version: str | None = None
     error_type: str | None = None
     error_message: str | None = None
