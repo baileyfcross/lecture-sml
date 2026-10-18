@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from lecture_slm.generation.models import (
     GenerationRequest,
     GenerationStage,
     GenerationStatus,
+    GroundingClaimAssessment,
     GroundingClaimClassification,
     GroundingClaimInput,
     GroundingDecision,
@@ -40,11 +42,13 @@ from lecture_slm.generation.prompts.planner import (
 )
 from lecture_slm.generation.prompts.writer import build_writer_prompt
 from lecture_slm.generation.reviewer import (
+    GroundingStageRunner,
     _factual_sentence_excerpts,
     _validate_claim_coverage,
     build_grounding_reviewer_response_schema,
     grounding_review_output_budget,
     is_current_artifact_framing_claim,
+    is_current_artifact_metadata_claim,
     merge_grounding_review,
     prepare_grounding_claims,
 )
@@ -467,6 +471,20 @@ def make_pipeline(model: Any, profiles: Any, fake: FakeOllamaClient) -> Generati
         model_config=model,
         profiles=profiles,
         client_factory=client_factory,  # type: ignore[arg-type]
+    )
+
+
+def make_grounding_runner(
+    model: Any,
+    profiles: Any,
+    fake: FakeOllamaClient,
+) -> GroundingStageRunner:
+    return GroundingStageRunner(
+        client=fake,  # type: ignore[arg-type]
+        model=model.ollama_name,
+        model_config=model,
+        profiles=profiles,
+        settings=profiles.profiles[GenerationProfileName.DEEP].writer,
     )
 
 
@@ -2091,6 +2109,158 @@ def test_mixed_current_artifact_and_factual_claim_does_not_bypass_grounding() ->
     assert direct == []
     assert len(unresolved) == 1
     assert unresolved[0].text == artifact
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            "This explanation is designed for learners with basic knowledge of classical "
+            "computation and linear algebra."
+        ),
+        (
+            "This explanation is designed for learners with basic knowledge of classical "
+            "computation and linear algebra (vectors, matrices)."
+        ),
+        "This lecture is intended for introductory students.",
+        "This lab is designed for beginners.",
+        "This explanation serves as a foundational overview of quantum computing concepts.",
+        "This lecture provides an introductory overview of the topic.",
+        "This section is intended as a brief review.",
+        (
+            "This explanation serves as a foundational overview of quantum computing concepts, "
+            "avoiding unsupported claims about historical dates or vendor specifics."
+        ),
+        "Approximately 10-15 minutes for reading and initial reflection.",
+        "Approximately 10\u201315 minutes for reading and initial reflection.",
+        "Estimated time: 20 minutes.",
+        "Time required for reading and reflection.",
+        "In this lab, you will explore these layers by constructing simple quantum circuits.",
+        "In this activity, you will compare the examples.",
+    ],
+)
+def test_current_artifact_metadata_claims_are_deterministically_pedagogical(text: str) -> None:
+    request = sample_request(GenerationProfileName.STANDARD)
+
+    claims, direct, unresolved = prepare_grounding_claims(request, text)
+
+    assert is_current_artifact_metadata_claim(text)
+    assert [claim.claim_id for claim in claims] == ["C001"]
+    assert unresolved == []
+    assert len(direct) == 1
+    assert direct[0].classification is GroundingClaimClassification.PEDAGOGICAL
+    assert direct[0].support_method is GroundingSupportMethod.PEDAGOGICAL
+    assert direct[0].evidence_ids == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        ("This explanation covers quantum entanglement, which provides exponential speedup."),
+        (
+            "This explanation is foundational because quantum computers outperform "
+            "classical computers."
+        ),
+        "In this lab, you will prove that entanglement enables exponential speedup.",
+        (
+            "This lecture demonstrates that quantum computers are always faster than "
+            "classical computers."
+        ),
+        "In this lab, you will explore quantum entanglement, which enables exponential speedup.",
+        "Qubits can exist in superposition.",
+        "Next lab will explore quantum optimization.",
+        "In the next lecture, we will study Shor's algorithm.",
+        "Last week's lab introduced entanglement.",
+        "Lecture 8 will cover quantum error correction.",
+    ],
+)
+def test_mixed_factual_domain_and_course_sequence_claims_are_not_metadata(
+    text: str,
+) -> None:
+    request = sample_request(GenerationProfileName.STANDARD)
+
+    claims, direct, unresolved = prepare_grounding_claims(request, text)
+
+    assert not is_current_artifact_metadata_claim(text)
+    assert [claim.claim_id for claim in claims] == ["C001"]
+    assert direct == []
+    assert unresolved == claims
+
+
+def test_next_lab_metadata_candidate_remains_a_continuity_claim() -> None:
+    text = "Next lab will explore quantum optimization."
+
+    assert not is_current_artifact_metadata_claim(text)
+    assert is_workspace_continuity_claim(text)
+
+
+def test_pipeline_does_not_review_current_artifact_metadata(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    plan = ExplanationPlan(
+        task=TaskType.EXPLANATION,
+        artifact_structure=["overview", "check"],
+        source_scope=SourceScopeAssessment(
+            status=SourceScopeStatus.SUFFICIENT,
+            supported_topics=["quantum states", "measurement"],
+        ),
+        concept="Quantum information and measurement",
+        assumed_knowledge=[],
+        explanation_sequence=["Represent information", "Measure outcomes"],
+        example="Read out a result.",
+        misconceptions=[],
+        check_for_understanding=["What does measurement produce?"],
+    )
+    writer_output = (
+        "A quantum computer represents information in quantum states. "
+        "Measurement returns classical outcomes. "
+        "This explanation is designed for learners with basic knowledge of classical "
+        "computation and linear algebra. "
+        "Approximately 10-15 minutes for reading and initial reflection."
+    )
+    fake = FakeOllamaClient(
+        planner_response=ChatResponse(
+            model=model.ollama_name,
+            content=plan.model_dump_json(),
+            prompt_tokens=1000,
+            completion_tokens=120,
+            total_duration_ns=1_000_000_000,
+            eval_duration_ns=500_000_000,
+            completion_reason="stop",
+        ),
+        writer_output=writer_output,
+    )
+    request = sample_request(GenerationProfileName.DEEP, TaskType.EXPLANATION).model_copy(
+        update={
+            "instruction": "Write out an introduction to quantum computing.",
+            "source_material": [
+                SourceMaterial(
+                    source_id="quantum-notes",
+                    title="Quantum notes",
+                    text=(
+                        "A quantum computer represents information in quantum states. "
+                        "Measurement returns classical outcomes."
+                    ),
+                )
+            ],
+        }
+    )
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.final_output == writer_output
+    assert result.revision_result is None
+    assert result.initial_grounding_review is not None
+    initial_review = result.initial_grounding_review
+    assert initial_review.current_artifact_pedagogical_count == 2
+    assert initial_review.direct_supported_claim_count == 2
+    assert initial_review.unresolved_claim_count == 0
+    assert initial_review.review is not None
+    assert initial_review.review.decision is GroundingDecision.PASS
+    assert fake.grounding_response_count == 0
+    assert len(fake.requests) == 2
 
 
 def test_evidence_ledger_is_deterministic_and_ordered() -> None:
@@ -4061,6 +4231,290 @@ def test_final_grounding_review_recalculates_budget_after_revision(
         assert (
             supported_schema["properties"]["evidence_ids"]["items"]["enum"] == expected_evidence_ids
         )
+
+
+def test_revision_reuses_duplicate_unchanged_claims_once_without_final_reviewer_call(
+    configs: tuple[Any, Any],
+    tmp_path: Path,
+) -> None:
+    model, profiles = configs
+    repeated_claim = "Predicate logic uses predicates over a domain."
+    initial_artifact = f"{repeated_claim} {repeated_claim}"
+    revised_artifact = (
+        f"DNS maps a human-readable domain name to an IP address. {repeated_claim} {repeated_claim}"
+    )
+    initial_response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "evidence_ids": ["S01-E001"],
+                },
+                {
+                    "claim_id": "C002",
+                    "classification": "unsupported",
+                    "reason": "The source does not establish this claim.",
+                    "category": "unsupported_fact",
+                    "evidence_ids": [],
+                },
+            ]
+        }
+    )
+    fake = FakeOllamaClient(
+        writer_output=initial_artifact,
+        revision_output=revised_artifact,
+        grounding_responses=[initial_response],
+    )
+    request = sample_request(GenerationProfileName.STANDARD)
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.FAILED
+    assert result.final_grounding_review is not None
+    assert result.final_grounding_review.review is not None
+    final_claims = result.final_grounding_review.review.claim_assessments
+    assert [(claim.claim_id, claim.classification) for claim in final_claims] == [
+        ("C001", GroundingClaimClassification.DIRECT_SUPPORTED),
+        ("C002", GroundingClaimClassification.SUPPORTED),
+        ("C003", GroundingClaimClassification.UNSUPPORTED),
+    ]
+    assert result.final_grounding_review.unresolved_claim_count == 0
+    assert result.final_grounding_review.review_output_budget is None
+    assert result.final_grounding_review.raw_response is None
+    assert fake.grounding_response_count == 1
+    assert request.metadata["grounding_revision_reuse"] == {
+        "initial_claim_count": 2,
+        "final_claim_count": 3,
+        "exact_match_count": 2,
+        "carried_claim_count": 2,
+        "carried_supported_count": 1,
+        "carried_pedagogical_count": 0,
+        "carried_unsupported_count": 1,
+        "final_review_claim_count": 0,
+        "evidence_ledger_unchanged": True,
+        "final_review_skipped": True,
+    }
+    assert "_reviewed_claim_ids" not in result.model_dump_json()
+
+    run_directory = tmp_path / "generation-run"
+    save_generation_run(run_directory, request, result)
+    diagnostics = (run_directory / "diagnostics.md").read_text(encoding="utf-8")
+    final_prompt = json.loads(
+        (run_directory / "grounding_review_final_prompt.json").read_text(encoding="utf-8")
+    )
+    assert "- Carried forward: 2" in diagnostics
+    assert "- Claims sent to final reviewer: 0" in diagnostics
+    assert "- Final reviewer call skipped: yes" in diagnostics
+    assert final_prompt["unresolved_claim_count"] == 0
+    assert final_prompt["review_call_skipped"] is True
+    assert "Predicate logic uses predicates over a domain." not in final_prompt["user_message"]
+
+
+def test_changed_claim_is_sent_to_final_reviewer(configs: tuple[Any, Any]) -> None:
+    model, profiles = configs
+    initial_artifact = (
+        "Predicate logic uses predicates over a domain. "
+        "The primary motivation for predicate logic was to simplify the web."
+    )
+    revised_artifact = "Predicate logic uses predicates over a larger domain."
+    initial_response = json.dumps(
+        {
+            "claims": [
+                {
+                    "claim_id": "C001",
+                    "classification": "supported",
+                    "evidence_ids": ["S01-E001"],
+                },
+                {
+                    "claim_id": "C002",
+                    "classification": "unsupported",
+                    "reason": "The source does not establish this claim.",
+                    "category": "unsupported_fact",
+                    "evidence_ids": [],
+                },
+            ]
+        }
+    )
+    fake = FakeOllamaClient(
+        writer_output=initial_artifact,
+        revision_output=revised_artifact,
+        grounding_responses=[initial_response, _passing_review()],
+    )
+    request = sample_request(GenerationProfileName.STANDARD)
+
+    result = make_pipeline(model, profiles, fake).route(request)
+
+    assert result.status is GenerationStatus.COMPLETED
+    assert result.final_grounding_review is not None
+    assert result.final_grounding_review.unresolved_claim_count == 1
+    assert result.final_grounding_review.review_output_budget == 4096
+    assert fake.grounding_response_count == 2
+    diagnostics = request.metadata["grounding_revision_reuse"]
+    assert diagnostics["carried_claim_count"] == 0
+    assert diagnostics["final_review_claim_count"] == 1
+    assert diagnostics["final_review_skipped"] is False
+
+
+@pytest.mark.parametrize(
+    ("final_artifact", "change_ledger"),
+    [
+        ("Predicate logic uses predicates over a larger domain.", False),
+        ("Predicate logic uses predicates over a domain.", True),
+    ],
+)
+def test_revision_reuse_requires_exact_text_and_unchanged_factual_ledger(
+    configs: tuple[Any, Any],
+    final_artifact: str,
+    change_ledger: bool,
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient()
+    runner = make_grounding_runner(model, profiles, fake)
+    request = sample_request(GenerationProfileName.DEEP)
+    initial_artifact = "Predicate logic uses predicates over a domain."
+    initial_preparation = runner.prepare_review(request, initial_artifact)
+    initial_claim = initial_preparation.all_claims[0]
+    initial_review = GroundingReview(
+        decision=GroundingDecision.PASS,
+        claim_assessments=[
+            GroundingClaimAssessment.model_validate(
+                _assessment(
+                    initial_claim.claim_id,
+                    initial_claim.text,
+                    evidence_ids=["S01-E001"],
+                )
+            )
+        ],
+        evidence_ledger=initial_preparation.evidence_ledger,
+    )
+    prior_preparation = initial_preparation
+    if change_ledger:
+        changed_spans = [
+            span.model_copy(update={"text": span.text + " Changed."})
+            for span in initial_preparation.evidence_ledger
+        ]
+        prior_preparation = replace(initial_preparation, evidence_ledger=changed_spans)
+
+    revised_preparation = runner.prepare_revision_review(
+        request,
+        final_artifact,
+        prior_preparation,
+        initial_review,
+    )
+
+    assert revised_preparation.carried_claims == []
+    assert revised_preparation.unresolved_claim_count == 1
+    assert revised_preparation.output_budget == 4096
+    assert revised_preparation.revision_reuse_diagnostics["evidence_ledger_unchanged"] is (
+        not change_ledger
+    )
+
+
+def test_carried_evidence_ids_are_revalidated_without_a_reviewer_call(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    fake = FakeOllamaClient()
+    runner = make_grounding_runner(model, profiles, fake)
+    request = sample_request(GenerationProfileName.DEEP)
+    artifact = "Predicate logic uses predicates over a domain."
+    initial_preparation = runner.prepare_review(request, artifact)
+    claim = initial_preparation.all_claims[0]
+    initial_review = GroundingReview(
+        decision=GroundingDecision.PASS,
+        claim_assessments=[
+            GroundingClaimAssessment.model_validate(
+                _assessment(
+                    claim.claim_id,
+                    claim.text,
+                    evidence_ids=["S99-E999"],
+                )
+            )
+        ],
+        evidence_ledger=initial_preparation.evidence_ledger,
+    )
+    final_preparation = runner.prepare_revision_review(
+        request,
+        artifact,
+        initial_preparation,
+        initial_review,
+    )
+
+    final_record = runner.review(request, artifact, preparation=final_preparation)
+
+    assert final_record.status is GenerationStatus.COMPLETED
+    assert final_record.review is not None
+    assert final_record.review.decision is GroundingDecision.REVISION_REQUIRED
+    assert final_record.review.evidence_validation_failures == 1
+    assert final_record.review.claim_assessments[0].classification is (
+        GroundingClaimClassification.UNSUPPORTED
+    )
+    assert fake.requests == []
+
+
+def test_revision_reuses_pedagogical_but_not_direct_or_continuity_assessments(
+    configs: tuple[Any, Any],
+) -> None:
+    model, profiles = configs
+    runner = make_grounding_runner(model, profiles, FakeOllamaClient())
+    request = sample_request(GenerationProfileName.DEEP)
+    artifact = (
+        "Predicate logic expresses properties with predicates. "
+        "Graph theory models relations between vertices. "
+        "Number theory studies integer properties. "
+        "Set theory organizes mathematical objects."
+    )
+    initial_preparation = runner.prepare_review(request, artifact)
+    assert len(initial_preparation.all_claims) == 4
+    claims = initial_preparation.all_claims
+    initial_review = GroundingReview(
+        decision=GroundingDecision.PASS,
+        claim_assessments=[
+            GroundingClaimAssessment.model_validate(
+                _assessment(claims[0].claim_id, claims[0].text, evidence_ids=["S01-E001"])
+            ),
+            GroundingClaimAssessment.model_validate(
+                _assessment(
+                    claims[1].claim_id,
+                    claims[1].text,
+                    classification="pedagogical",
+                )
+            ),
+            GroundingClaimAssessment(
+                claim_id=claims[2].claim_id,
+                text=claims[2].text,
+                classification=GroundingClaimClassification.DIRECT_SUPPORTED,
+                support_method=GroundingSupportMethod.NORMALIZED_DIRECT_MATCH,
+                evidence_ids=["S01-E001"],
+                reason="Previously classified as a direct source match.",
+            ),
+            GroundingClaimAssessment(
+                claim_id=claims[3].claim_id,
+                text=claims[3].text,
+                classification=GroundingClaimClassification.CONTINUITY_SUPPORTED,
+                support_method=GroundingSupportMethod.WORKSPACE_CONTINUITY,
+                continuity_ids=["W01-C001"],
+                reason="Previously classified as workspace continuity.",
+            ),
+        ],
+        evidence_ledger=initial_preparation.evidence_ledger,
+    )
+
+    final_preparation = runner.prepare_revision_review(
+        request,
+        artifact,
+        initial_preparation,
+        initial_review,
+    )
+
+    assert [claim.claim_id for claim in final_preparation.carried_claims] == ["C001", "C002"]
+    assert [claim.classification for claim in final_preparation.carried_claims] == [
+        GroundingClaimClassification.SUPPORTED,
+        GroundingClaimClassification.PEDAGOGICAL,
+    ]
+    assert [claim.claim_id for claim in final_preparation.unresolved_claims] == ["C003", "C004"]
+    assert final_preparation.revision_reuse_diagnostics["carried_pedagogical_count"] == 1
 
 
 @pytest.mark.parametrize(

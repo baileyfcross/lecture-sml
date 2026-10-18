@@ -569,6 +569,24 @@ def _write_diagnostics(
                 )
             else:
                 source_scope_lines.append("  - none identified")
+    revision_reuse = request.metadata.get("grounding_revision_reuse")
+    revision_reuse_lines: list[str] = []
+    if isinstance(revision_reuse, dict):
+        revision_reuse_lines = [
+            "## Revision-aware grounding",
+            f"- Initial claims: {revision_reuse.get('initial_claim_count', 0)}",
+            f"- Final claims: {revision_reuse.get('final_claim_count', 0)}",
+            f"- Exact normalized matches: {revision_reuse.get('exact_match_count', 0)}",
+            f"- Carried forward: {revision_reuse.get('carried_claim_count', 0)}",
+            f"- Carried supported: {revision_reuse.get('carried_supported_count', 0)}",
+            f"- Carried pedagogical: {revision_reuse.get('carried_pedagogical_count', 0)}",
+            f"- Carried unsupported: {revision_reuse.get('carried_unsupported_count', 0)}",
+            f"- Claims sent to final reviewer: {revision_reuse.get('final_review_claim_count', 0)}",
+            "- Factual evidence ledger unchanged: "
+            f"{'yes' if revision_reuse.get('evidence_ledger_unchanged') else 'no'}",
+            "- Final reviewer call skipped: "
+            f"{'yes' if revision_reuse.get('final_review_skipped') else 'no'}",
+        ]
     lines = [
         "# Generation Diagnostics",
         "",
@@ -620,6 +638,7 @@ def _write_diagnostics(
         "",
         *_grounding_diagnostic("Final grounding review", result.final_grounding_review),
         "",
+        *revision_reuse_lines,
         "## Files",
     ]
     lines.extend(f"- {path.name}" for path in sorted(directory.iterdir()) if path.is_file())
@@ -881,6 +900,11 @@ def save_generation_run(
             else ""
         )
         _, _, unresolved_claims = prepare_grounding_claims(request, final_candidate or "")
+        if "grounding_revision_reuse" in request.metadata:
+            reviewed_claim_ids = set(final_review._reviewed_claim_ids)
+            unresolved_claims = [
+                claim for claim in unresolved_claims if claim.claim_id in reviewed_claim_ids
+            ]
         review_prompt = build_grounding_review_prompt(request, unresolved_claims)
         final_timing = final_review.timing
         _write_json(
@@ -900,6 +924,10 @@ def save_generation_run(
                 "claims_extracted": final_review.claims_extracted,
                 "direct_supported_claim_count": final_review.direct_supported_claim_count,
                 "unresolved_claim_count": final_review.unresolved_claim_count,
+                "review_call_skipped": (
+                    final_review.review_output_budget is None
+                    and final_review.unresolved_claim_count == 0
+                ),
             },
         )
 

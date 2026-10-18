@@ -21,6 +21,13 @@ from lecture_slm.knowledge.query import (
         ("Give me an explanation of Boolean algebra.", "Boolean algebra"),
         ("Create a lecture about DNS.", "DNS"),
         ("Create a lecture on DNS.", "DNS"),
+        ("Write out an introduction to quantum computing", "quantum computing"),
+        ("Write an introduction to quantum computing", "quantum computing"),
+        ("Create an introduction to quantum computing", "quantum computing"),
+        ("Give me an introduction to quantum computing", "quantum computing"),
+        ("Create a lecture introducing quantum computing", "quantum computing"),
+        ("Teach me about quantum computing", "quantum computing"),
+        ("Explain Introduction to Quantum Computing", "Introduction to Quantum Computing"),
         ("Make slides about predicate logic.", "predicate logic"),
         ("Make slides on section 1.5 deduction.", "section 1.5 deduction"),
         ("Create a lab about Flexbox.", "Flexbox"),
@@ -184,6 +191,64 @@ def test_self_contained_factual_request_does_not_use_unrelated_workspace_anchor(
     }
 
 
+def test_workspace_overlap_preserves_self_contained_quantum_topics() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Write out an introduction to quantum computing",
+        workspace_name="Quantum",
+    )
+
+    assert query.canonical == "quantum computing"
+    assert diagnostics["raw_instruction"] == "Write out an introduction to quantum computing"
+    assert diagnostics["canonical_factual_query"] == "quantum computing"
+    assert diagnostics["query_terms"] == ["quantum", "computing"]
+    assert diagnostics["workspace_history_topics_used"] == []
+    assert diagnostics["workspace_anchor"] == {
+        "considered": True,
+        "applied": False,
+        "value": None,
+        "reason": "Request contains a self-contained factual topic.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("instruction", "expected"),
+    [
+        ("Explain quantum computing", "quantum computing"),
+        ("Write an introduction to quantum gates", "quantum gates"),
+        ("Create a lecture introducing quantum computing", "quantum computing"),
+    ],
+)
+def test_workspace_name_does_not_remove_self_contained_topic(
+    instruction: str,
+    expected: str,
+) -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        instruction,
+        workspace_name="Quantum",
+    )
+
+    assert query.canonical == expected
+    assert diagnostics["workspace_anchor"]["applied"] is False
+    assert diagnostics["workspace_anchor"]["reason"] == (
+        "Request contains a self-contained factual topic."
+    )
+
+
+def test_ambiguous_single_topic_still_uses_workspace_anchor() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Explain methods",
+        workspace_name="C# Course",
+    )
+
+    assert query.canonical == "C# methods"
+    assert diagnostics["workspace_anchor"] == {
+        "considered": True,
+        "applied": True,
+        "value": "C#",
+        "reason": "Request topic is ambiguous without the active course domain.",
+    }
+
+
 def test_referential_request_uses_course_domain_and_recent_history_title() -> None:
     query, diagnostics = build_factual_retrieval_query(
         "Create the next lecture.",
@@ -192,6 +257,18 @@ def test_referential_request_uses_course_domain_and_recent_history_title() -> No
     )
 
     assert query.canonical == "C# Generic Methods"
+    assert diagnostics["workspace_anchor"]["applied"] is True
+
+
+def test_course_relative_request_retains_csc_workspace_history_fallback() -> None:
+    query, diagnostics = build_factual_retrieval_query(
+        "Create the next lecture",
+        workspace_name="CSC 220",
+        history_titles=["Lecture 3\n# CSC 220: Lecture 3 – Quantum gates"],
+    )
+
+    assert query.canonical == "CSC 220 Quantum gates"
+    assert diagnostics["workspace_history_topics_used"] == ["Quantum gates"]
     assert diagnostics["workspace_anchor"]["applied"] is True
 
 

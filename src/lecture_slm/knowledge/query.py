@@ -4,15 +4,24 @@ import re
 
 from lecture_slm.knowledge.models import RetrievalExpansionPlan, RetrievalQuery
 
+_INTRODUCTION_REQUEST_PREFIX = re.compile(
+    r"^(?:create|generate|make|write(?:\s+out)?|build|prepare|produce|develop|give\s+me)\s+"
+    r"(?:(?:an\s+)?introduction\s+to|(?:(?:the|a|an)\s+)?"
+    r"(?:(?:next|following|previous|last|current)\s+)?"
+    r"(?:lecture|slides?|slide\s+deck|lab|activity|assignment|homework|"
+    r"instructor\s+guide|assessment)\s+introducing)\s+",
+    re.IGNORECASE,
+)
 _LEADING_REQUEST_PHRASES = (
     re.compile(r"^(?:can|could|would)\s+you(?:\s+please)?\s+", re.IGNORECASE),
     re.compile(r"^please\s+", re.IGNORECASE),
+    _INTRODUCTION_REQUEST_PREFIX,
     re.compile(
-        r"^(?:create|generate|make|write|build|prepare|produce|develop)\s+",
+        r"^(?:create|generate|make|write(?:\s+out)?|build|prepare|produce|develop)\s+",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^(?:explain|teach|tell\s+me\s+about|what\s+is|what\s+are|"
+        r"^(?:explain|teach(?:\s+me\s+about)?|tell\s+me\s+about|what\s+is|what\s+are|"
         r"give\s+me\s+(?:an?\s+)?explanation\s+of)\s+",
         re.IGNORECASE,
     ),
@@ -112,12 +121,10 @@ def build_factual_retrieval_query(
     considered = bool(workspace_name and workspace_name.strip())
     course_relative = _COURSE_REFERENCE.search(original) is not None
 
-    topic_without_workspace = _remove_phrase(raw_topic, workspace_name or "")
-    if course_relative and anchor:
-        topic_without_workspace = _remove_course_label(topic_without_workspace, anchor)
-    topic_terms = _normalized_terms(topic_without_workspace)
+    self_contained_topic_terms = _normalized_terms(raw_topic)
     ambiguous_topic = (
-        len(topic_terms) == 1 and topic_terms[0].casefold() in _AMBIGUOUS_SINGLE_TOPICS
+        len(self_contained_topic_terms) == 1
+        and self_contained_topic_terms[0].casefold() in _AMBIGUOUS_SINGLE_TOPICS
     )
 
     applied = False
@@ -126,15 +133,22 @@ def build_factual_retrieval_query(
         if course_relative:
             applied = True
             reason = "Request depends on the active course sequence."
-        elif not topic_terms or ambiguous_topic:
+        elif not self_contained_topic_terms or ambiguous_topic:
             applied = True
             reason = (
                 "Request has no self-contained factual topic."
-                if not topic_terms
+                if not self_contained_topic_terms
                 else "Request topic is ambiguous without the active course domain."
             )
         else:
             reason = "Request contains a self-contained factual topic."
+
+    topic_for_query = raw_topic
+    if applied:
+        topic_for_query = _remove_phrase(raw_topic, workspace_name or "")
+        if course_relative and anchor:
+            topic_for_query = _remove_course_label(topic_for_query, anchor)
+    topic_terms = _normalized_terms(topic_for_query)
 
     parts: list[str] = []
     if applied and anchor:
@@ -149,10 +163,10 @@ def build_factual_retrieval_query(
                 break
         parts.extend(history_topics)
     if not applied:
-        canonical = _clean_query(topic_without_workspace)
+        canonical = _clean_query(topic_for_query)
     else:
-        if topic_without_workspace.strip():
-            parts.append(topic_without_workspace)
+        if topic_for_query.strip():
+            parts.append(topic_for_query)
         canonical = _join_unique_terms(parts)
     if not canonical:
         canonical = _join_unique_terms([anchor] if applied else []) or original

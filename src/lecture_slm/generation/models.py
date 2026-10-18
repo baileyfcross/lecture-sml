@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from lecture_slm.evaluation.rubric import EvaluationDimension
 from lecture_slm.schemas.course import CourseProfile
@@ -541,6 +541,8 @@ class GroundingReview(BaseModel):
 
 
 class GroundingReviewRecord(BaseModel):
+    _reviewed_claim_ids: list[str] = PrivateAttr(default_factory=list)
+
     status: GenerationStatus
     review: GroundingReview | None = None
     timing: StageTiming | None = None

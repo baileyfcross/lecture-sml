@@ -3,7 +3,8 @@
 import json
 import re
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -27,6 +28,7 @@ from lecture_slm.generation.models import (
     GroundingReviewRecord,
     GroundingSupportMethod,
     PedagogicalReviewerClaim,
+    ReviewerClaimAssessment,
     ReviewFeedback,
     StageRecord,
     StageTiming,
@@ -96,6 +98,8 @@ class GroundingReviewPreparation:
     continuity_diagnostics: dict[str, object]
     current_artifact_framing_claim_ids: list[str]
     output_budget: int | None
+    carried_claims: list[ReviewerClaimAssessment] = field(default_factory=list)
+    revision_reuse_diagnostics: dict[str, int | bool] = field(default_factory=dict)
 
     @property
     def claims_extracted(self) -> int:
@@ -168,6 +172,15 @@ def _sentence_key(text: str) -> str:
     text = re.sub(r"""(?<!\w)["']|["'](?!\w)""", "", text)
     text = text.strip().strip("\"'.,;:!?")
     return " ".join(text.split()).casefold()
+
+
+def _evidence_ledger_key(
+    evidence_ledger: list[EvidenceSpan],
+) -> tuple[tuple[str, str, str, str, int], ...]:
+    return tuple(
+        (span.evidence_id, span.source_id, span.source_title, span.text, span.order)
+        for span in evidence_ledger
+    )
 
 
 def _factual_sentence_excerpts(artifact: str) -> list[str]:
@@ -266,6 +279,37 @@ _MIXED_FACTUAL_DISQUALIFIERS = (
     r"`[^`]+`",
 )
 
+_CURRENT_ARTIFACT_METADATA_PATTERNS = (
+    r"^this (?:explanation|lecture|lab|section|lesson|activity|guide) "
+    r"is (?:designed|intended|aimed) for "
+    r"(?:(?:introductory|beginning|advanced) )?"
+    r"(?:learners?|students?|beginners?)"
+    r"(?: with (?:(?:basic|prior|some|no) )?knowledge of [\w\s,()/&\-]+)?\.?$",
+    r"^this (?:explanation|lecture|lab|section|lesson|activity|guide) "
+    r"(?:serves as|provides|offers|is intended as) "
+    r"(?:a|an) (?:(?:foundational|introductory|brief|high-level|concise|basic|general|short) )*"
+    r"(?:overview|introduction|review|summary|orientation)"
+    r"(?: of [\w\s&/()\-]+)?"
+    r"(?:, avoiding unsupported claims about [\w\s,()/&\-]+)?\.?$",
+    r"^(?:approximately )?\d+ ?(?:[-\u2013] ?\d+ )?(?:minutes?|hours?)"
+    r"(?: for (?:reading|reflection|review|practice|completion|discussion)"
+    r"(?: and (?:initial )?(?:reading|reflection|review|practice|completion|discussion))*)?\.?$",
+    r"^estimated time: \d+ ?(?:[-\u2013] ?\d+ )?(?:minutes?|hours?)\.?$",
+    r"^time required for (?:reading|reflection|review|practice|completion|discussion)"
+    r"(?: and (?:initial )?(?:reading|reflection|review|practice|completion|discussion))*\.?$",
+    r"^in this (?:lab|activity|exercise|lecture|lesson|section), you will "
+    r"(?:explore|compare|construct|identify|practice|review|examine|analyze|analyse|trace|"
+    r"build|test|use|work through|investigate)\b[\w\s()/&\-]*\.?$",
+)
+
+_CURRENT_ARTIFACT_METADATA_MIXED_FACTUAL_DISQUALIFIERS = (
+    r",\s*(?:which|that|because|since)\b",
+    r"\b(?:that|which|because|since|therefore|consequently|why)\b",
+    r"\b(?:proves?|demonstrates?|shows?|establishes?)\s+that\b",
+    r"\b(?:always|never|outperform(?:s|ed|ing)?|speedup|enables?|can|could|must|may|might)\b",
+    r"\b(?:faster|slower|more powerful|exponential(?:ly)? faster)\b",
+)
+
 
 def is_current_artifact_framing_claim(text: str) -> bool:
     normalized = " ".join(text.split()).strip()
@@ -288,6 +332,27 @@ def is_current_artifact_framing_claim(text: str) -> bool:
     ):
         return False
     return True
+
+
+def is_current_artifact_metadata_claim(text: str) -> bool:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return False
+    lowered = normalized.casefold()
+    if any(
+        re.search(pattern, lowered, flags=re.IGNORECASE)
+        for pattern in _COURSE_SEQUENCE_DISQUALIFIERS
+    ):
+        return False
+    if any(
+        re.search(pattern, lowered, flags=re.IGNORECASE)
+        for pattern in _CURRENT_ARTIFACT_METADATA_MIXED_FACTUAL_DISQUALIFIERS
+    ):
+        return False
+    return any(
+        re.fullmatch(pattern, lowered, flags=re.IGNORECASE)
+        for pattern in _CURRENT_ARTIFACT_METADATA_PATTERNS
+    )
 
 
 def _split_grounding_sentences(line: str) -> list[str]:
@@ -449,7 +514,9 @@ def _prepare_grounding_claims(
     current_artifact_framing_claim_ids: list[str] = []
     unresolved: list[GroundingClaimInput] = []
     for claim in inputs:
-        if is_current_artifact_framing_claim(claim.text):
+        if is_current_artifact_framing_claim(claim.text) or is_current_artifact_metadata_claim(
+            claim.text
+        ):
             current_artifact_framing_claim_ids.append(claim.claim_id)
             direct.append(
                 GroundingClaimAssessment(
@@ -458,8 +525,8 @@ def _prepare_grounding_claims(
                     classification=GroundingClaimClassification.PEDAGOGICAL,
                     support_method=GroundingSupportMethod.PEDAGOGICAL,
                     reason=(
-                        "Deterministic current-artifact framing: this claim describes the "
-                        "organization or agenda of the current artifact."
+                        "Deterministic current-artifact framing or instructional metadata: "
+                        "this claim describes the current artifact rather than a domain fact."
                     ),
                 )
             )
@@ -780,6 +847,106 @@ class GroundingStageRunner:
             ),
         )
 
+    def prepare_revision_review(
+        self,
+        request: GenerationRequest,
+        artifact: str,
+        initial_preparation: GroundingReviewPreparation,
+        initial_review: GroundingReview,
+    ) -> GroundingReviewPreparation:
+        """Reuse safe decisions for exact unchanged claims after the bounded revision."""
+        prepared = self.prepare_review(request, artifact)
+        prior_claims_by_key: dict[str, deque[GroundingClaimAssessment]] = {}
+        for assessment in initial_review.claim_assessments:
+            key = _sentence_key(assessment.text)
+            if key:
+                prior_claims_by_key.setdefault(key, deque()).append(assessment)
+
+        evidence_ledger_unchanged = _evidence_ledger_key(
+            initial_preparation.evidence_ledger
+        ) == _evidence_ledger_key(prepared.evidence_ledger)
+        direct_claim_ids = {claim.claim_id for claim in prepared.direct_claims}
+        carried_claims: list[ReviewerClaimAssessment] = []
+        unresolved_claims: list[GroundingClaimInput] = []
+        exact_match_count = 0
+        carried_supported_count = 0
+        carried_pedagogical_count = 0
+        carried_unsupported_count = 0
+
+        for claim in prepared.all_claims:
+            key = _sentence_key(claim.text)
+            prior_claims = prior_claims_by_key.get(key) if key else None
+            previous = prior_claims.popleft() if prior_claims else None
+            if previous is not None:
+                exact_match_count += 1
+            if claim.claim_id in direct_claim_ids:
+                continue
+            if previous is None:
+                unresolved_claims.append(claim)
+                continue
+
+            if (
+                previous.classification is GroundingClaimClassification.SUPPORTED
+                and evidence_ledger_unchanged
+            ):
+                carried_claims.append(
+                    SupportedReviewerClaim(
+                        claim_id=claim.claim_id,
+                        classification=GroundingClaimClassification.SUPPORTED,
+                        evidence_ids=previous.evidence_ids,
+                    )
+                )
+                carried_supported_count += 1
+            elif previous.classification is GroundingClaimClassification.PEDAGOGICAL:
+                carried_claims.append(
+                    PedagogicalReviewerClaim(
+                        claim_id=claim.claim_id,
+                        classification=GroundingClaimClassification.PEDAGOGICAL,
+                        evidence_ids=[],
+                    )
+                )
+                carried_pedagogical_count += 1
+            elif (
+                previous.classification is GroundingClaimClassification.UNSUPPORTED
+                and evidence_ledger_unchanged
+            ):
+                carried_claims.append(
+                    UnsupportedReviewerClaim(
+                        claim_id=claim.claim_id,
+                        classification=GroundingClaimClassification.UNSUPPORTED,
+                        reason=previous.reason,
+                        evidence_ids=[],
+                        category=previous.category,
+                    )
+                )
+                carried_unsupported_count += 1
+            else:
+                unresolved_claims.append(claim)
+
+        diagnostics: dict[str, int | bool] = {
+            "initial_claim_count": len(initial_preparation.all_claims),
+            "final_claim_count": len(prepared.all_claims),
+            "exact_match_count": exact_match_count,
+            "carried_claim_count": len(carried_claims),
+            "carried_supported_count": carried_supported_count,
+            "carried_pedagogical_count": carried_pedagogical_count,
+            "carried_unsupported_count": carried_unsupported_count,
+            "final_review_claim_count": len(unresolved_claims),
+            "evidence_ledger_unchanged": evidence_ledger_unchanged,
+            "final_review_skipped": not unresolved_claims,
+        }
+        return replace(
+            prepared,
+            unresolved_claims=unresolved_claims,
+            output_budget=(
+                grounding_review_output_budget(len(unresolved_claims))
+                if unresolved_claims
+                else None
+            ),
+            carried_claims=carried_claims,
+            revision_reuse_diagnostics=diagnostics,
+        )
+
     def review(
         self,
         request: GenerationRequest,
@@ -795,10 +962,15 @@ class GroundingStageRunner:
         continuity_reviewable_claim_ids = set(prepared.continuity_reviewable_claim_ids)
         if not unresolved_claims:
             try:
+                carried_response = (
+                    GroundingReviewerResponse(claims=prepared.carried_claims)
+                    if prepared.carried_claims
+                    else None
+                )
                 direct_review = merge_grounding_review(
                     all_claims,
                     direct_claims,
-                    None,
+                    carried_response,
                     evidence_ledger,
                     continuity_ledger,
                     continuity_reviewable_claim_ids,
@@ -881,10 +1053,16 @@ class GroundingStageRunner:
                 format=build_grounding_reviewer_response_schema(evidence_ledger),
             )
             reviewer_response = _normalize_grounding_review(response.content)
+            complete_reviewer_response = GroundingReviewerResponse(
+                claims=[
+                    *prepared.carried_claims,
+                    *reviewer_response.claim_assessments,
+                ]
+            )
             review = merge_grounding_review(
                 all_claims,
                 direct_claims,
-                reviewer_response,
+                complete_reviewer_response,
                 evidence_ledger,
                 continuity_ledger,
                 continuity_reviewable_claim_ids,

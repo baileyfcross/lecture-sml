@@ -698,9 +698,14 @@ class GenerationPipeline:
                         )
                     else:
                         revised_output = revision_record.raw_response or ""
-                        final_review_preparation = grounding_runner.prepare_review(
+                        final_review_preparation = grounding_runner.prepare_revision_review(
                             request,
                             revised_output,
+                            initial_review_preparation,
+                            review,
+                        )
+                        request.metadata["grounding_revision_reuse"] = (
+                            final_review_preparation.revision_reuse_diagnostics
                         )
                         self._emit_stage_start(
                             progress,
@@ -714,6 +719,9 @@ class GenerationPipeline:
                             revised_output,
                             preparation=final_review_preparation,
                         )
+                        final_grounding_review._reviewed_claim_ids = [
+                            claim.claim_id for claim in final_review_preparation.unresolved_claims
+                        ]
                         self._emit_stage_complete(
                             progress,
                             GenerationStage.REVIEWING,
